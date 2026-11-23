@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 APP_NAME = "HexHelper"
 _COMPILED_EDITION = "commercial"
 
