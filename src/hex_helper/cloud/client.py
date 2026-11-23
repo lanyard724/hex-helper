@@ -677,6 +677,54 @@ class CloudGatewayClient:
             raise CloudCoachError(code, resp.status_code, msg, wallet, extra)
         return _safe_json(resp)
 
+    def submit_feedback(
+        self,
+        *,
+        category: str,
+        message: str,
+        contact: str = "",
+        dataset_patch: str = "",
+        dataset_mode: str = "",
+        os_info: str = "",
+        match_count: int = 0,
+        diag: dict[str, Any] | None = None,
+        log_gzip_b64: str = "",
+        log_text: str = "",
+    ) -> dict[str, Any]:
+        """Submit user feedback with optional gzip-compressed sanitized rolling runtime logs.
+
+        Works both when signed in (automatically attaches Bearer token) and anonymously
+        (so players can still report login or startup issues).
+        """
+        payload: dict[str, Any] = {
+            "category": (category or "other").strip() or "other",
+            "message": (message or "").strip(),
+            "contact": (contact or "").strip()[:128],
+            "client_version": APP_VERSION,
+            "dataset_patch": (dataset_patch or "").strip()[:32],
+            "dataset_mode": (dataset_mode or "").strip()[:32],
+            "os_info": (os_info or platform.platform()).strip()[:128],
+            "match_count": max(0, min(20, int(match_count or 0))),
+            "diag": dict(diag) if isinstance(diag, dict) else {},
+        }
+        if log_gzip_b64:
+            payload["log_gzip_b64"] = log_gzip_b64
+        elif log_text:
+            payload["log_text"] = log_text
+
+        headers = self._auth_headers()
+        resp = self._request(
+            "POST",
+            "/v1/feedback",
+            json=payload,
+            headers=headers or None,
+            timeout=18.0,
+        )
+        if resp.status_code not in (200, 201):
+            code, msg, wallet, extra = _parse_error_payload(resp)
+            raise CloudCoachError(code, resp.status_code, msg, wallet, extra)
+        return _safe_json(resp)
+
 
 @dataclass
 class _PendingCloudJob:

@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 from hex_helper.game.lcu_client import LcuClient
 from hex_helper.game.live_client import LiveClientReader
 from hex_helper.game.models import ChampSelectState, LiveMatchSnapshot
+from hex_helper.logging_ring import install_match_log_handler
 from hex_helper.scoring.augment_combo import (
     ComboPlan,
     PickerComboVerdict,
@@ -76,6 +77,7 @@ from hex_helper.ui.augment_overlay import AugmentBadgeRenderItem, AugmentBadgesO
 from hex_helper.ui.calibration_ui import CalibrationOverlay
 from hex_helper.ui.champ_select_ui import ChampSelectOverlay
 from hex_helper.ui.edge_drawer import EdgeBuildDrawer
+from hex_helper.ui.feedback_dialog import FeedbackDialog
 from hex_helper.ui.hotkey_settings import HotkeySettingsDialog, format_hotkeys_summary
 from hex_helper.ui.lookup_window import LookupWindow
 from hex_helper.ui.match_recap_card import MatchRecapData, MatchRecapDialog
@@ -562,6 +564,7 @@ class HexHelperController:
         self.qt_app = qt_app
         self._commercial = is_commercial_edition()
         self.data_dir = get_app_data_dir()
+        self.log_ring = install_match_log_handler(data_dir=self.data_dir)
         self.cfg: AppConfig = load_config()
         if self._commercial:
             self.cfg.proxy_url = ""
@@ -785,6 +788,7 @@ class HexHelperController:
             on_unseal_complete=self._on_lobby_unseal_complete,
             on_dismiss_newbie_banner=self._on_dismiss_newbie_banner,
             on_open_hotkeys=self.open_hotkey_settings_dialog,
+            on_open_feedback=self.open_feedback_dialog,
         )
         self.calibrator = CalibrationOverlay(
             initial_title_roi=self.cfg.title_band_roi,
@@ -889,6 +893,8 @@ class HexHelperController:
         self._tray_act_cal.triggered.connect(self.open_calibrator)
         self._tray_act_hotkeys = QAction("自定义全局快捷键...", menu)
         self._tray_act_hotkeys.triggered.connect(self.open_hotkey_settings_dialog)
+        self._tray_act_feedback = QAction("问题反馈与日志上报...", menu)
+        self._tray_act_feedback.triggered.connect(self.open_feedback_dialog)
         act_sync = QAction("检查 26.23 数据更新", menu)
         act_sync.triggered.connect(self.start_async_sync)
         act_quit = QAction("退出 HexHelper", menu)
@@ -901,6 +907,7 @@ class HexHelperController:
             self._tray_act_coach,
             self._tray_act_cal,
             self._tray_act_hotkeys,
+            self._tray_act_feedback,
             act_sync,
         ):
             menu.addAction(a)
@@ -984,6 +991,56 @@ class HexHelperController:
             save_config(self.cfg)
             self._reload_hotkeys()
             self._refresh_diagnostics()
+
+    def _build_feedback_diag_snapshot(self) -> dict[str, Any]:
+        ring_stats = self.log_ring.summary_stats()
+        return {
+            "state": self.sm.state.value,
+            "edition": "commercial" if self._commercial else "dev",
+            "dataset_patch": self.store.descriptor.patch if self.store.descriptor else "",
+            "dataset_mode": self.store.active_match_mode if self.store.descriptor else "",
+            "lcu_connected": bool(self.lcu.creds is not None),
+            "lcu_source": str(self.lcu.creds.source) if self.lcu.creds else "",
+            "live_active": bool(self._last_live is not None),
+            "capture_backend": str(self.capturer.backend),
+            "black_frames": int(self.capturer.consecutive_black_frames),
+            "ocr_ready": bool(self.ocr_engine is not None),
+            "coach_mode": str(self.cfg.coach_mode),
+            "coach_tier": str(self.cfg.coach_tier),
+            "logged_in": bool(self.cloud_client is not None and self.cloud_client.is_logged_in),
+            "log_ring_matches": int(ring_stats.get("match_count", 0)),
+            "log_ring_max": int(ring_stats.get("max_matches", 20)),
+            "log_ring_errors": int(ring_stats.get("total_errors", 0)),
+            "log_ring_warns": int(ring_stats.get("total_warns", 0)),
+        }
+
+    def open_feedback_dialog(self) -> None:
+        username = (
+            self.cloud_client.current_username
+            if (self.cloud_client is not None and self.cloud_client.is_logged_in)
+            else ""
+        )
+        diag = self._build_feedback_diag_snapshot()
+
+        def _submit(payload: dict[str, Any]) -> dict[str, Any]:
+            if self.cloud_client is not None:
+                return self.cloud_client.submit_feedback(**payload)
+            temp_client = CloudGatewayClient(base_url=self.cfg.resolved_cloud_api_base())
+            try:
+                return temp_client.submit_feedback(**payload)
+            finally:
+                temp_client.close()
+
+        dlg = FeedbackDialog(
+            log_ring=self.log_ring,
+            submit_fn=_submit,
+            diag_snapshot=diag,
+            dataset_patch=self.store.descriptor.patch if self.store.descriptor else "",
+            dataset_mode=self.store.active_match_mode if self.store.descriptor else "",
+            username=username,
+            parent=self._modal_dialog_parent(),
+        )
+        dlg.exec()
 
     def _toggle_sidebars_hotkey(self) -> None:
         right_expanded = self.edge_drawer.isVisible() and self.edge_drawer.is_expanded
@@ -2619,6 +2676,7 @@ class HexHelperController:
                 if self.store.active_match_mode != "first-prismatic":
                     if self.store.switch_match_mode("first-prismatic"):
                         self._auto_switched_first_prismatic = True
+                        self.log_ring.update_match_meta(dataset_mode="first-prismatic")
                         logger.info(
                             "Round 1 all-prismatic detected -> auto-switched dataset mode to first-prismatic"
                         )
@@ -3252,9 +3310,29 @@ class HexHelperController:
                 self.transmute_watcher.reset()
             self._active_match_key = self._compute_match_key(live_snap, resolved_hid)
             self._restore_match_state_if_matching(self._active_match_key)
+            _hero_obj = self.store.get_hero(resolved_hid) if resolved_hid else None
+            self.log_ring.begin_match(
+                self._active_match_key,
+                hero_id=resolved_hid or "",
+                hero_name=_hero_obj.name if _hero_obj is not None else (
+                    live_snap.my_player.champion_name if live_snap.my_player else ""
+                ),
+                dataset_patch=self.store.descriptor.patch if self.store.descriptor else "",
+                dataset_mode=self.store.active_match_mode if self.store.descriptor else "",
+            )
         elif self.sm.state in (GameState.IN_GAME, GameState.AUGMENT_PICKING) and not self._active_match_key:
             self._active_match_key = self._compute_match_key(live_snap, resolved_hid)
             self._restore_match_state_if_matching(self._active_match_key)
+            _hero_obj = self.store.get_hero(resolved_hid) if resolved_hid else None
+            self.log_ring.begin_match(
+                self._active_match_key,
+                hero_id=resolved_hid or "",
+                hero_name=_hero_obj.name if _hero_obj is not None else (
+                    live_snap.my_player.champion_name if live_snap.my_player else ""
+                ),
+                dataset_patch=self.store.descriptor.patch if self.store.descriptor else "",
+                dataset_mode=self.store.active_match_mode if self.store.descriptor else "",
+            )
 
         self._match_max_game_time_s = max(self._match_max_game_time_s, float(live_snap.game_time or 0.0))
         if live_snap.game_end_result in (0, 1):
@@ -3272,6 +3350,7 @@ class HexHelperController:
             h_info = self.store.get_hero(active_hid)
             if h_info is not None:
                 self._match_last_hero_name = h_info.name
+                self.log_ring.update_match_meta(hero_id=active_hid, hero_name=h_info.name)
 
         self.lookup_window.set_game_active(True)
         self.edge_drawer.set_live_vital_state(
@@ -3345,6 +3424,10 @@ class HexHelperController:
                     resolved_won = -1
             self._maybe_submit_match_telemetry(won=resolved_won)
             self._capture_post_match_recap(won=resolved_won)
+            self.log_ring.end_match(
+                won=resolved_won,
+                duration_s=int(self._match_max_game_time_s),
+            )
             self._cancel_picker_coach_debounce()
             self._cancel_death_coach_defer()
             self._cancel_pending_icon_verify()
@@ -4284,10 +4367,12 @@ class HexHelperController:
                         else "未登录（本地 5ms 大数据引擎正常运作）"
                     )
             mode_tag = f"{self.store.active_match_mode}{'（首棱彩局自动）' if self._auto_switched_first_prismatic else ''}" if self.store.descriptor else "-"
+            rs = self.log_ring.summary_stats()
             lines = [
                 f"状态机阶段：{self.sm.state.value}",
                 f"当前数据集：{format_display_patch(self.store.descriptor.patch) if self.store.descriptor else '未加载'} / {mode_tag}",
                 f"缓存目录：{self.data_dir}",
+                f"滚动运行日志：{rs['match_count']} / {rs['max_matches']} 局（超出自动覆盖最旧 · 约 {rs['total_bytes'] / 1024:.1f} KB）",
                 f"LCU 连接：{'已连接 port=' + str(self.lcu.creds.port) + ' (' + self.lcu.creds.source + ')' if self.lcu.creds else '未连接 (' + (self.lcu.last_error or '等待客户端') + ')'}",
                 f"2999 局内接口：{'活跃' if self._last_live else '未在对局中'}",
                 f"截屏后端：{self.capturer.backend}（连续黑帧={self.capturer.consecutive_black_frames}）",
@@ -4313,10 +4398,12 @@ class HexHelperController:
         elif self.gemini_coach is not None and self.gemini_coach.last_error:
             gemini_state += f" · 最近异常={self.gemini_coach.last_error[:60]}"
         mode_tag = f"{self.store.active_match_mode}{'（首棱彩局自动）' if self._auto_switched_first_prismatic else ''}" if self.store.descriptor else "-"
+        rs = self.log_ring.summary_stats()
         lines = [
             f"状态机阶段：{self.sm.state.value}",
             f"当前数据集：{format_display_patch(self.store.descriptor.patch) if self.store.descriptor else '未加载'} / {mode_tag}",
             f"缓存目录：{self.data_dir}",
+            f"滚动运行日志：{rs['match_count']} / {rs['max_matches']} 局（超出自动覆盖最旧 · 约 {rs['total_bytes'] / 1024:.1f} KB）",
             f"LCU 连接：{'已连接 port=' + str(self.lcu.creds.port) + ' (' + self.lcu.creds.source + ')' if self.lcu.creds else '未连接 (' + (self.lcu.last_error or '等待客户端') + ')'}",
             f"2999 局内接口：{'活跃' if self._last_live else '未在对局中'}",
             f"截屏后端：{self.capturer.backend}（连续黑帧={self.capturer.consecutive_black_frames}）",

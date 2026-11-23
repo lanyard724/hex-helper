@@ -12,13 +12,15 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from hex_helper.config import get_app_data_dir, load_config, save_config
+from hex_helper.logging_ring import install_match_log_handler
 from hex_helper.setup.preflight import run_windows_preflight
 
 ERROR_ALREADY_EXISTS = 183
 
 
 def _setup_logging() -> None:
-    log_dir = get_app_data_dir() / "logs"
+    data_dir = get_app_data_dir()
+    log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
         RotatingFileHandler(
@@ -35,6 +37,7 @@ def _setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
     )
+    install_match_log_handler(data_dir=data_dir)
     # Silence noisy per-second 2999/LCU httpx request logs so hex_helper.log stays clean & actionable
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

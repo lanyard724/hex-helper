@@ -223,6 +223,7 @@ class LookupWindow(QWidget):
         on_unseal_complete: Callable[[], None] | None = None,
         on_dismiss_newbie_banner: Callable[[], None] | None = None,
         on_open_hotkeys: Callable[[], None] | None = None,
+        on_open_feedback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         init_hextech_fonts()
@@ -247,6 +248,7 @@ class LookupWindow(QWidget):
         self._on_unseal_complete = on_unseal_complete
         self._on_dismiss_newbie_banner = on_dismiss_newbie_banner
         self._on_open_hotkeys = on_open_hotkeys
+        self._on_open_feedback = on_open_feedback
         self.tab2_push_btn: HextechActionButton | None = None
         self.hotkeys_summary_lbl: QLabel | None = None
         self.open_hotkeys_btn: HextechActionButton | None = None
@@ -487,6 +489,9 @@ class LookupWindow(QWidget):
         self.cal_btn.clicked.connect(lambda: self._on_open_calibration and self._on_open_calibration())
         sync_btn = HextechActionButton("同步最新数据", variant="gold", height=34)
         sync_btn.clicked.connect(lambda: self._on_sync_now and self._on_sync_now())
+        self.feedback_btn = HextechActionButton("问题反馈", variant="gold", height=34)
+        self.feedback_btn.setToolTip("遇到识别异常或报错？点击一键反馈并附带最近 20 局脱敏运行日志")
+        self.feedback_btn.clicked.connect(lambda: self._on_open_feedback and self._on_open_feedback())
         self.footer_coach_btn = HextechActionButton("呼叫参谋推演 F6", variant="cyan", pointed_right=True, height=36)
         self.footer_coach_btn.setMinimumWidth(172)
         self.footer_coach_btn.clicked.connect(lambda: self._on_test_coach and self._on_test_coach())
@@ -499,6 +504,7 @@ class LookupWindow(QWidget):
 
         fl.addWidget(self.cal_btn)
         fl.addWidget(sync_btn)
+        fl.addWidget(self.feedback_btn)
         fl.addStretch(1)
         fl.addWidget(self.footer_coach_btn)
         fl.addSpacing(14)
@@ -1930,12 +1936,21 @@ class LookupWindow(QWidget):
         dl = QVBoxLayout(diag_card)
         dl.setContentsMargins(16, 12, 16, 12)
         dl.setSpacing(6)
+        diag_hdr_row = QHBoxLayout()
+        diag_hdr_row.setContentsMargins(0, 0, 0, 0)
+        diag_hdr_row.setSpacing(8)
         self.diag_hdr_lbl = QLabel(f"◈ 实时系统诊断与热键（{format_hotkeys_summary(self._cfg.hotkeys)}）")
         self.diag_hdr_lbl.setFont(display_font(10, bold=True, letter_spacing=0.8))
         self.diag_hdr_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E;")
+        self.diag_feedback_btn = HextechActionButton("问题反馈 & 上报日志", variant="cyan", height=26)
+        self.diag_feedback_btn.setMinimumWidth(148)
+        self.diag_feedback_btn.setToolTip("打开问题反馈窗，自动打包最近 20 局滚动脱敏日志回传开发后台")
+        self.diag_feedback_btn.clicked.connect(lambda: self._on_open_feedback and self._on_open_feedback())
+        diag_hdr_row.addWidget(self.diag_hdr_lbl, 1)
+        diag_hdr_row.addWidget(self.diag_feedback_btn)
         self.diag_text = QTextEdit()
         self.diag_text.setReadOnly(True)
-        dl.addWidget(self.diag_hdr_lbl)
+        dl.addLayout(diag_hdr_row)
         dl.addWidget(self.diag_text, 1)
         lay.addWidget(diag_card, 1)
 
