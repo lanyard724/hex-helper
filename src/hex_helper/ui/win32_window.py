@@ -14,6 +14,20 @@ from PySide6.QtWidgets import QWidget
 logger = logging.getLogger(__name__)
 
 _user32 = ctypes.windll.user32
+_user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongW.restype = wintypes.LONG
+_user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+_user32.SetWindowLongW.restype = wintypes.LONG
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND,
+    wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.UINT,
+]
+_user32.SetWindowPos.restype = wintypes.BOOL
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -25,7 +39,7 @@ SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 SW_SHOWNOACTIVATE = 4
-HWND_TOPMOST = -1
+HWND_TOPMOST = wintypes.HWND(-1)
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -148,19 +162,34 @@ def get_ex_style(hwnd: int) -> int:
     return int(_user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE))
 
 
-def apply_overlay_styles(widget: QWidget, click_through: bool = False) -> int:
-    """Apply non-activating topmost Win32 overlay styles (and optional full mouse pass-through)."""
+def apply_overlay_styles(
+    widget: QWidget,
+    click_through: bool = False,
+    *,
+    force: bool = True,
+) -> int:
+    """Apply non-activating topmost Win32 overlay styles (and optional full mouse pass-through).
+
+    When force=False and GWL_EXSTYLE already carries all required bits (including WS_EX_TOPMOST),
+    skip SetWindowLongW & SetWindowPos(SWP_FRAMECHANGED) to avoid forcing DWM surface recomposition.
+    """
     hwnd = int(widget.winId())
     if not hwnd:
         return 0
-    ex_style = get_ex_style(hwnd)
-    ex_style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+    current = get_ex_style(hwnd)
+    desired = current | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
     if click_through:
-        ex_style |= WS_EX_TRANSPARENT
+        desired |= WS_EX_TRANSPARENT
     else:
-        ex_style &= ~WS_EX_TRANSPARENT
+        desired &= ~WS_EX_TRANSPARENT
 
-    _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style)
+    changed = desired != current
+    if not force and not changed:
+        return current
+
+    if changed:
+        _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, desired)
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | (SWP_FRAMECHANGED if changed else 0)
     _user32.SetWindowPos(
         hwnd,
         HWND_TOPMOST,
@@ -168,7 +197,7 @@ def apply_overlay_styles(widget: QWidget, click_through: bool = False) -> int:
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        flags,
     )
     return get_ex_style(hwnd)
 
@@ -227,11 +256,17 @@ def clamp_to_screen_rect(
 
 
 def show_no_activate(widget: QWidget, click_through: bool = False) -> None:
-    """Show a QWidget on top without stealing focus from the game window."""
+    """Show a QWidget on top without stealing focus from the game window.
+
+    No-ops Win32 frame-change calls when widget is already visible with matching extended styles.
+    """
     widget.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-    apply_overlay_styles(widget, click_through=click_through)
+    if widget.isVisible():
+        apply_overlay_styles(widget, click_through=click_through, force=False)
+        return
+    apply_overlay_styles(widget, click_through=click_through, force=False)
     widget.show()
-    apply_overlay_styles(widget, click_through=click_through)
+    apply_overlay_styles(widget, click_through=click_through, force=True)
 
 
 class _MSG(ctypes.Structure):

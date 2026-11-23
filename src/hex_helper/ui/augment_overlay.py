@@ -1,10 +1,10 @@
-"""In-game 3-card augment picker passive overlay styled in LoL Hextech Client gold/cyan bevels with 60fps micro-motion."""
+"""In-game 3/4-card augment picker passive overlay styled in LoL Hextech Client gold/cyan bevels (tight-bbox, zero-60fps)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, Qt, QVariantAnimation
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QRectF, Qt, QVariantAnimation
 from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
@@ -155,7 +155,7 @@ class _SingleBadgeCard(QFrame):
 
 
 class AugmentBadgesOverlay(QWidget):
-    """Full-width transparent click-through layer placing rating cards directly above in-game cards."""
+    """Tight-cropped transparent click-through layer placing rating cards directly above in-game cards."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -178,6 +178,7 @@ class AugmentBadgesOverlay(QWidget):
         self._coach_banner_shimmer: HextechShimmerBar | None = None
         self._exclude_rects: list[tuple[int, int, int, int]] = []
         self._last_card_sig: tuple[tuple[int, str, bool], ...] = ()
+        self._last_render_sig: tuple | None = None
 
     def get_exclude_rects(self) -> list[tuple[int, int, int, int]]:
         if not self.isVisible():
@@ -189,12 +190,16 @@ class AugmentBadgesOverlay(QWidget):
             anim.stop()
         self._card_anims.clear()
         for w in self._badges:
+            w.hide()
+            w.setParent(None)
             w.deleteLater()
         self._badges.clear()
         if self._coach_banner_shimmer is not None:
             self._coach_banner_shimmer.set_active(False)
             self._coach_banner_shimmer = None
         if self._coach_banner is not None:
+            self._coach_banner.hide()
+            self._coach_banner.setParent(None)
             self._coach_banner.deleteLater()
             self._coach_banner = None
             self._coach_banner_lbl = None
@@ -202,6 +207,7 @@ class AugmentBadgesOverlay(QWidget):
 
     def hideEvent(self, event) -> None:  # noqa: N802
         self._last_card_sig = ()
+        self._last_render_sig = None
         if self._coach_banner_shimmer is not None:
             self._coach_banner_shimmer.set_active(False)
         super().hideEvent(event)
@@ -223,16 +229,43 @@ class AugmentBadgesOverlay(QWidget):
         reroll_banner: str = "",
         gate_skipped_hint: str = "",
     ) -> None:
+        render_sig = (
+            screen_rect,
+            coach_augment_tip,
+            bool(coach_pending),
+            reroll_banner,
+            gate_skipped_hint,
+            tuple(
+                (
+                    it.slot_index,
+                    it.score.augment_id,
+                    it.score.tier,
+                    round(it.score.delta, 4),
+                    round(it.score.raw_win_rate, 4),
+                    it.score.games,
+                    it.score.rarity,
+                    it.screen_box,
+                    it.is_best,
+                    tuple((d.item_id, round(d.delta, 4)) for d in it.destiny_items),
+                    it.uncertain,
+                    it.archetype_hint,
+                    it.is_transmute,
+                )
+                for it in items
+            ),
+        )
+        if self.isVisible() and render_sig == self._last_render_sig:
+            return
+
         new_sig = tuple((it.slot_index, it.score.augment_id, it.is_best) for it in items)
-        animate_entrance = new_sig != self._last_card_sig
         self._last_card_sig = new_sig
+        self._last_render_sig = render_sig
 
         self.clear_badges()
         sl, st, sw, sh = screen_rect
         log_rect, dpr = physical_rect_to_logical(screen_rect)
         log_w = max(320, log_rect.width())
         log_h = max(240, log_rect.height())
-        self.setGeometry(log_rect)
 
         badge_w = self.compute_badge_width(log_w)
         # Auto-tighten badge width on 4-card layouts (or narrow spacing) so adjacent badges never overlap
@@ -245,9 +278,11 @@ class AugmentBadgesOverlay(QWidget):
             if len(items) >= 4 or min_gap_log < badge_w + 10:
                 badge_w = min(badge_w, max(168, int(min_gap_log) - 10))
         min_badge_top = log_h
+        placed: list[tuple[QWidget, int, int, int, int]] = []
 
         for item in items:
-            card = _SingleBadgeCard(item, animate_sheen=animate_entrance, card_width=badge_w)
+            # Zero 60fps sheen/slide animation on in-game layered overlay -> zero DWM UpdateLayeredWindow flood
+            card = _SingleBadgeCard(item, animate_sheen=False, card_width=badge_w)
             card.setParent(self)
             card.adjustSize()
 
@@ -258,20 +293,7 @@ class AugmentBadgesOverlay(QWidget):
             y_log = max(12, int(round(top_y_phys / dpr)) - card.height() - 18)
             x_log = max(8, min(log_w - card.width() - 8, cx_log - card.width() // 2))
 
-            if animate_entrance:
-                card.move(x_log, y_log + 10)
-                card.show()
-                anim = QPropertyAnimation(card, b"pos", self)
-                anim.setDuration(145)
-                anim.setStartValue(QPoint(x_log, y_log + 10))
-                anim.setEndValue(QPoint(x_log, y_log))
-                anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-                anim.start()
-                self._card_anims.append(anim)
-            else:
-                card.move(x_log, y_log)
-                card.show()
-
+            placed.append((card, x_log, y_log, card.width(), card.height()))
             self._badges.append(card)
             min_badge_top = min(min_badge_top, y_log)
 
@@ -348,7 +370,8 @@ class AugmentBadgesOverlay(QWidget):
             bl.addWidget(lbl)
 
             if show_shimmer:
-                shimmer = HextechShimmerBar(height=2, accent="#0AC8B9")
+                # Static accent bar (animated=False) eliminates 60fps UpdateLayeredWindow GPU/DWM upload flood
+                shimmer = HextechShimmerBar(height=2, accent="#0AC8B9", animated=False)
                 shimmer.set_active(True)
                 bl.addWidget(shimmer)
                 self._coach_banner_shimmer = shimmer
@@ -356,8 +379,7 @@ class AugmentBadgesOverlay(QWidget):
             banner.adjustSize()
             bx = max(12, min(log_w - banner.width() - 12, (log_w - banner.width()) // 2))
             by = max(10, min_badge_top - banner.height() - 10)
-            banner.move(bx, by)
-            banner.show()
+            placed.append((banner, bx, by, banner.width(), banner.height()))
             self._coach_banner = banner
             self._coach_banner_lbl = lbl
             self._exclude_rects.append(
@@ -368,5 +390,28 @@ class AugmentBadgesOverlay(QWidget):
                     int(st + (by + banner.height()) * dpr) + 4,
                 )
             )
+
+        if not placed:
+            self._last_render_sig = None
+            self.hide()
+            return
+
+        # Tight-crop layered surface strictly around rendered badges + banner (shrinks 2560x1440 14MB -> ~1.5MB!)
+        pad = 6
+        min_x = max(0, min(px for _, px, _, _, _ in placed) - pad)
+        min_y = max(0, min(py for _, _, py, _, _ in placed) - pad)
+        max_x = min(log_w, max(px + pw for _, px, _, pw, _ in placed) + pad)
+        max_y = min(log_h, max(py + ph for _, _, py, _, ph in placed) + pad)
+        bbox = QRect(
+            log_rect.left() + min_x,
+            log_rect.top() + min_y,
+            max(16, max_x - min_x),
+            max(16, max_y - min_y),
+        )
+        if self.geometry() != bbox:
+            self.setGeometry(bbox)
+        for widget, px, py, _pw, _ph in placed:
+            widget.move(px - min_x, py - min_y)
+            widget.show()
 
         show_no_activate(self, click_through=True)

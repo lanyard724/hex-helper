@@ -816,19 +816,10 @@ class ChampSelectOverlay(QWidget):
 
     def show_overlay(self) -> None:
         self.ensure_on_screen()
-        was_hidden = not self.isVisible()
-        if was_hidden:
-            self.setWindowOpacity(0.15)
+        if self.windowOpacity() < 0.99:
+            self.setWindowOpacity(1.0)
         show_no_activate(self, click_through=False)
         self._layout_corner_grips()
-        if was_hidden:
-            anim = QPropertyAnimation(self, b"windowOpacity", self)
-            anim.setDuration(155)
-            anim.setStartValue(0.15)
-            anim.setEndValue(1.0)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.start()
-            self._fade_anim = anim
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:

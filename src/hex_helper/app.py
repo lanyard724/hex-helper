@@ -3561,7 +3561,7 @@ class HexHelperController:
                 self.click_tracker.mark_reroll(rslot, now_mono=ts)
 
     def _tick_click_sample(self) -> None:
-        """33Hz lightweight read-only cursor + 16Hz fast visual vanish sampler active only during AUGMENT_PICKING."""
+        """33Hz lightweight read-only cursor + 8.3Hz fast visual vanish sampler active only during AUGMENT_PICKING."""
         if self.sm.state != GameState.AUGMENT_PICKING or not self.sm.active_cards:
             self._click_timer.stop()
             return
@@ -3576,7 +3576,7 @@ class HexHelperController:
             chosen_name = next((c.augment.name for c in self.sm.active_cards if c.slot_index == slot), str(slot))
             logger.info("Augment picker click tracked: slot=%s (%s) pos=%s", slot, chosen_name, self.click_tracker.last_click_pos)
         self._click_sample_counter += 1
-        if (self._click_sample_counter % 2) == 0:
+        if (self._click_sample_counter % 4) == 0:
             self._check_fast_picker_vanish(ts)
 
     def _tick_vision(self, force: bool = False) -> None:

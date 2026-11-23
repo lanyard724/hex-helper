@@ -120,6 +120,7 @@ class AugmentComboOverlay(QWidget):
         self._full_locked: bool = False
         self._last_plan: ComboPlan | None = None
         self._last_verdict: PickerComboVerdict | None = None
+        self._last_verdict_sig: tuple | None = None
         self._picker_rows: list[QWidget] = []
         self._last_combo_pulse_sig: str = ""
         self._slide_anim = QVariantAnimation(self)
@@ -530,14 +531,13 @@ class AugmentComboOverlay(QWidget):
             )
         else:
             w = self.COLLAPSED_W
-        self.setFixedWidth(w)
         if self._expanded:
             self._apply_header_density(w)
-            self.panel.setMinimumHeight(0)
-            self.panel.setMaximumHeight(self._QWIDGETSIZE_MAX)
-            self.panel.setFixedWidth(w)
+            if self.panel.width() != w:
+                self.panel.setFixedWidth(w)
             inner_w = max(180, w - 22)
-            self.panel_body.setFixedWidth(inner_w)
+            if self.panel_body.width() != inner_w:
+                self.panel_body.setFixedWidth(inner_w)
             for row_w in self._picker_rows:
                 rl = row_w.layout()
                 if rl is not None:
@@ -577,19 +577,23 @@ class AugmentComboOverlay(QWidget):
                 body_hint_h = max(body_h_for_w if body_h_for_w > 0 else 0, self.panel_body.sizeHint().height(), active_hint)
                 chrome_h = 62  # header + footer + vertical margins/spacing
                 h = min(geo.height() - 64, max(self.EXPANDED_MIN_H, chrome_h + body_hint_h + 12))
-            self.panel.setFixedHeight(h)
+            if self.panel.height() != h or self.panel.minimumHeight() != h or self.panel.maximumHeight() != h:
+                self.panel.setFixedHeight(h)
         else:
-            self.pill.setMinimumHeight(0)
-            self.pill.setMaximumHeight(self._QWIDGETSIZE_MAX)
-            self.pill.setFixedWidth(w)
+            if self.pill.width() != w:
+                self.pill.setFixedWidth(w)
             play = self.pill.layout()
             if play is not None:
                 play.invalidate()
                 play.activate()
+            saved_min_h, saved_max_h = self.pill.minimumHeight(), self.pill.maximumHeight()
+            if saved_min_h == saved_max_h and saved_min_h > 0:
+                self.pill.setMinimumHeight(0)
+                self.pill.setMaximumHeight(self._QWIDGETSIZE_MAX)
             hint_h = max(self.COLLAPSED_MIN_H, self.pill.sizeHint().height())
             h = min(geo.height() - 64, hint_h + 4)
-            self.pill.setFixedHeight(h)
-        self.setFixedHeight(h)
+            if self.pill.height() != h or self.pill.minimumHeight() != h or self.pill.maximumHeight() != h:
+                self.pill.setFixedHeight(h)
 
         if self._custom_pos is not None and not self._anchor_left:
             x = max(geo.left(), min(geo.right() - w + 1, self._custom_pos.x()))
@@ -602,7 +606,13 @@ class AugmentComboOverlay(QWidget):
             )
             y = max(geo.top() + 16, min(geo.bottom() - h - 16, y_base))
             x = geo.left()
-        self.setGeometry(x, y, w, h)
+        target_rect = QRect(x, y, w, h)
+        if self.minimumWidth() != w or self.maximumWidth() != w:
+            self.setFixedWidth(w)
+        if self.minimumHeight() != h or self.maximumHeight() != h:
+            self.setFixedHeight(h)
+        if self.geometry() != target_rect:
+            self.setGeometry(target_rect)
         if self._expanded:
             self._layout_corner_grips()
 
@@ -633,18 +643,14 @@ class AugmentComboOverlay(QWidget):
 
     def set_expanded(self, expanded: bool) -> None:
         was_visible = self.isVisible()
-        start_w = self.width() if was_visible else (self.COLLAPSED_W if expanded else self._resolved_expanded_width())
-        target_w = self._resolved_expanded_width() if expanded else self.COLLAPSED_W
+        if self._slide_anim.state() == QVariantAnimation.State.Running:
+            self._slide_anim.stop()
         self._expanded = bool(expanded)
         self.pill.setVisible(not self._expanded)
         self.panel.setVisible(self._expanded)
+        # Single-frame snap avoids 60fps WS_EX_LAYERED resize DWM stalls
         self._reposition()
         if was_visible:
-            if start_w != target_w:
-                self._slide_anim.stop()
-                self._slide_anim.setStartValue(start_w)
-                self._slide_anim.setEndValue(target_w)
-                self._slide_anim.start()
             show_no_activate(self, click_through=False)
 
     def toggle_expanded(self) -> None:
@@ -888,8 +894,30 @@ class AugmentComboOverlay(QWidget):
             self._picker_rows.append(row)
 
     def enter_picker_mode(self, verdict: PickerComboVerdict) -> None:
-        """Switch to 3-card live combo/downgrade diagnosis and auto-expand without stealing focus."""
+        """Switch to 3/4-card live combo/downgrade diagnosis and auto-expand without stealing focus."""
+        verdict_sig = (
+            verdict.profile.direction_label,
+            verdict.best_slot_index,
+            verdict.reroll_advice,
+            tuple(
+                (
+                    c.slot_index,
+                    c.augment_id,
+                    c.verdict,
+                    c.verdict_label,
+                    round(c.combo_delta, 2),
+                    c.reason,
+                    c.combo_name,
+                    c.gamble,
+                )
+                for c in verdict.cards
+            ),
+        )
+        if self._mode == "picker" and self._expanded and verdict_sig == self._last_verdict_sig:
+            return
+
         self._last_verdict = verdict
+        self._last_verdict_sig = verdict_sig
         if self._mode != "picker":
             self._pre_picker_expanded = self._expanded
             self._mode = "picker"
@@ -916,6 +944,7 @@ class AugmentComboOverlay(QWidget):
 
     def exit_picker_mode(self) -> None:
         """Return cleanly to plan mode and restore prior collapsed/expanded preference."""
+        self._last_verdict_sig = None
         if self._mode != "picker":
             return
         self._mode = "plan"

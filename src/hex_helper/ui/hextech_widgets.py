@@ -7,6 +7,7 @@ from PySide6.QtCore import (
     QPointF,
     QRectF,
     Qt,
+    QTimer,
     QVariantAnimation,
 )
 from PySide6.QtGui import (
@@ -537,13 +538,21 @@ class HextechInteractiveCard(QFrame):
 
 
 class HextechShimmerBar(QFrame):
-    """Lightweight 60fps Hextech cyan-gold diagonal sweep progress bar (auto-stops when inactive/hidden)."""
+    """Lightweight Hextech cyan-gold accent progress bar (static zero-flush by default for game overlays)."""
 
-    def __init__(self, height: int = 3, accent: str = "#0AC8B9", parent=None) -> None:
+    def __init__(
+        self,
+        height: int = 3,
+        accent: str = "#0AC8B9",
+        parent=None,
+        *,
+        animated: bool = False,
+    ) -> None:
         super().__init__(parent)
         self._accent = QColor(accent)
-        self._phase: float = -0.35
+        self._phase: float = 0.50
         self._active = False
+        self._animated = bool(animated)
         self.setFixedHeight(height)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
@@ -563,14 +572,16 @@ class HextechShimmerBar(QFrame):
         return self._active
 
     def set_active(self, active: bool) -> None:
+        active = bool(active)
         if self._active == active:
             return
         self._active = active
-        if active:
+        if active and self._animated:
             self._anim.start()
         else:
-            self._anim.stop()
-            self._phase = -0.35
+            if self._anim.state() == QVariantAnimation.State.Running:
+                self._anim.stop()
+            self._phase = 0.50 if active else -0.35
         self.update()
 
     def hideEvent(self, event) -> None:  # noqa: N802
@@ -579,7 +590,7 @@ class HextechShimmerBar(QFrame):
         super().hideEvent(event)
 
     def showEvent(self, event) -> None:  # noqa: N802
-        if self._active and self._anim.state() != QVariantAnimation.State.Running:
+        if self._active and self._animated and self._anim.state() != QVariantAnimation.State.Running:
             self._anim.start()
         super().showEvent(event)
 
@@ -590,6 +601,19 @@ class HextechShimmerBar(QFrame):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = float(self.width()), float(self.height())
         p.fillRect(QRectF(0.0, 0.0, w, h), QColor(10, 42, 58, 120))
+        if not self._animated:
+            grad = QLinearGradient(0.0, 0.0, w, 0.0)
+            c0 = QColor(self._accent.red(), self._accent.green(), self._accent.blue(), 40)
+            c1 = QColor(self._accent.red(), self._accent.green(), self._accent.blue(), 220)
+            c2 = QColor(240, 230, 210, 235)
+            grad.setColorAt(0.0, c0)
+            grad.setColorAt(0.28, c1)
+            grad.setColorAt(0.50, c2)
+            grad.setColorAt(0.72, c1)
+            grad.setColorAt(1.0, c0)
+            p.fillRect(QRectF(0.0, 0.0, w, h), QBrush(grad))
+            p.end()
+            return
         cx = w * self._phase
         band = max(48.0, w * 0.34)
         grad = QLinearGradient(cx - band, 0.0, cx + band, 0.0)
@@ -606,29 +630,45 @@ class HextechShimmerBar(QFrame):
 
 
 class HextechPulseFrame(QFrame):
-    """QFrame capable of firing a crisp one-shot metallic rim pulse on live state updates."""
+    """QFrame capable of firing a crisp low-overhead stepped rim pulse on live state updates."""
+
+    _PULSE_STEPS = (0.65, 0.30, 0.0)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._pulse_t: float = 0.0
         self._pulse_color = QColor("#0AC8B9")
-        self._anim = QVariantAnimation(self)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.valueChanged.connect(self._on_val)
+        self._pulse_step_idx: int = 0
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(75)
+        self._pulse_timer.timeout.connect(self._on_pulse_step)
 
-    def _on_val(self, val) -> None:
-        self._pulse_t = float(val)
+    def _on_pulse_step(self) -> None:
+        if self._pulse_step_idx >= len(self._PULSE_STEPS):
+            self._pulse_timer.stop()
+            self._pulse_t = 0.0
+            self.update()
+            return
+        self._pulse_t = self._PULSE_STEPS[self._pulse_step_idx]
+        self._pulse_step_idx += 1
+        if self._pulse_t <= 0.0:
+            self._pulse_timer.stop()
         self.update()
 
-    def trigger_pulse(self, color_hex: str = "#0AC8B9", duration_ms: int = 580) -> None:
+    def trigger_pulse(self, color_hex: str = "#0AC8B9", duration_ms: int = 240) -> None:
         self._pulse_color = QColor(color_hex)
         self._pulse_t = 1.0
-        self._anim.stop()
-        self._anim.setDuration(max(100, int(duration_ms)))
-        self._anim.setStartValue(1.0)
-        self._anim.setEndValue(0.0)
-        self._anim.start()
+        self._pulse_step_idx = 0
+        step_ms = max(40, int(max(120, int(duration_ms)) / (len(self._PULSE_STEPS) + 1)))
+        self._pulse_timer.setInterval(step_ms)
+        self._pulse_timer.start()
         self.update()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        if self._pulse_timer.isActive():
+            self._pulse_timer.stop()
+            self._pulse_t = 0.0
+        super().hideEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -647,7 +687,7 @@ class HextechPulseFrame(QFrame):
 
 
 class HextechGoldRingIcon(QFrame):
-    """Compact item icon ringed by a live gold-readiness progress arc (emerald pulse when affordable)."""
+    """Compact item icon ringed by a live gold-readiness progress arc (zero idle 60fps repaints)."""
 
     def __init__(self, size: int = 34, parent=None) -> None:
         super().__init__(parent)
@@ -658,18 +698,15 @@ class HextechGoldRingIcon(QFrame):
         self.ready: bool = False
         self._fallback: str = "?"
         self._breath_t: float = 0.0
+        self._state_sig: tuple[int, float, bool, str] | None = None
 
+        # Retained idle for API compatibility; never runs continuously on translucent overlays
         self._breath_anim = QVariantAnimation(self)
         self._breath_anim.setDuration(1400)
         self._breath_anim.setStartValue(0.0)
         self._breath_anim.setEndValue(1.0)
         self._breath_anim.setLoopCount(-1)
         self._breath_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self._breath_anim.valueChanged.connect(self._on_breath)
-
-    def _on_breath(self, val) -> None:
-        self._breath_t = float(val)
-        self.update()
 
     def set_state(
         self,
@@ -678,28 +715,19 @@ class HextechGoldRingIcon(QFrame):
         ready: bool,
         fallback_text: str = "?",
     ) -> None:
+        clamped = max(0.0, min(1.0, float(progress)))
+        is_ready = bool(ready)
+        fb = (fallback_text or "?")[:1]
+        pm_key = int(pixmap.cacheKey()) if (pixmap is not None and not pixmap.isNull()) else 0
+        sig = (pm_key, round(clamped, 2), is_ready, fb)
         self._pixmap = pixmap
-        self.progress = max(0.0, min(1.0, float(progress)))
-        self.ready = bool(ready)
-        self._fallback = (fallback_text or "?")[:1]
-        if self.ready and self.isVisible():
-            if self._breath_anim.state() != QVariantAnimation.State.Running:
-                self._breath_anim.start()
-        else:
-            if self._breath_anim.state() == QVariantAnimation.State.Running:
-                self._breath_anim.stop()
-            self._breath_t = 0.0
+        self.progress = clamped
+        self.ready = is_ready
+        self._fallback = fb
+        if sig == self._state_sig:
+            return
+        self._state_sig = sig
         self.update()
-
-    def hideEvent(self, event) -> None:  # noqa: N802
-        if self._breath_anim.state() == QVariantAnimation.State.Running:
-            self._breath_anim.stop()
-        super().hideEvent(event)
-
-    def showEvent(self, event) -> None:  # noqa: N802
-        if self.ready and self._breath_anim.state() != QVariantAnimation.State.Running:
-            self._breath_anim.start()
-        super().showEvent(event)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -729,13 +757,8 @@ class HextechGoldRingIcon(QFrame):
         p.drawEllipse(ring_rect)
 
         if self.ready:
-            pulse = 1.0 - abs(self._breath_t * 2.0 - 1.0)
-            arc_c = QColor(
-                int(9 + (110 - 9) * pulse),
-                int(194 + (231 - 194) * pulse),
-                int(105 + (183 - 105) * pulse),
-            )
-            p.setPen(QPen(arc_c, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            # Crisp static emerald highlight ring (zero 60fps DWM layered-window thrash)
+            p.setPen(QPen(QColor("#10B981"), 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawEllipse(ring_rect)
         elif self.progress > 0.02:
             p.setPen(QPen(QColor("#C89B3C"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))

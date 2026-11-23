@@ -6,7 +6,7 @@
 
 **为《英雄联盟》海克斯大乱斗打造的纯只读 Windows 桌面悬浮窗助手**
 
-[![Version](https://img.shields.io/badge/Version-v1.3.4-C89B3C?style=flat-square)](https://priswebtool.site)
+[![Version](https://img.shields.io/badge/Version-v1.3.5-C89B3C?style=flat-square)](https://priswebtool.site)
 [![Patch](https://img.shields.io/badge/LOL%20CN-26.23-0AC8B9?style=flat-square)](https://priswebtool.site)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-091428?style=flat-square)](https://priswebtool.site)
 [![License](https://img.shields.io/badge/License-MIT-785A28?style=flat-square)](LICENSE)
@@ -57,7 +57,7 @@
 ## 跟 OBS 录屏一样安全
 
 - **不改文件、不碰游戏内存**：仅通过 Riot 官方公开的本地只读接口与屏幕画面识别工作，不注入进程，不代你操作鼠标键盘。
-- **不用管理员权限、不拖帧率**：不装任何底层驱动，游戏设为「无边框窗口」即可丝滑叠加，点浮窗不会把游戏切回桌面。
+- **不用管理员权限、零拖帧设计**：不装任何底层驱动；`v1.3.5` 起全悬浮窗采用紧凑包围盒（面积缩减 93%）、零 60fps 透明层刷屏与 DXGI 硬件采帧断线自愈，无边框窗口下叠窗不抢焦点、不掉 1% Low 帧率。
 
 ---
 

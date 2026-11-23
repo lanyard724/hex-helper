@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -131,7 +132,9 @@ def is_black_frame(frame_bgr: np.ndarray | None) -> tuple[bool, float]:
 
 
 class ScreenCapturer:
-    """DXGI Desktop Duplication (dxcam) primary screen capturer with MSS fallback (lazy-initialized)."""
+    """DXGI Desktop Duplication (dxcam) primary screen capturer with frame-cache + non-sticky MSS fallback."""
+
+    _DXCAM_MAX_INIT_FAILS = 5
 
     def __init__(self, prefer_dxcam: bool = True, lazy: bool = True) -> None:
         self._prefer_dxcam = prefer_dxcam
@@ -140,32 +143,46 @@ class ScreenCapturer:
         self._backend = "lazy"
         self._initialized = False
         self._consecutive_black = 0
+        self._dx_fail_count = 0
+        self._dx_retry_after_mono = 0.0
+        self._last_dx_frame: np.ndarray | None = None
+        self._last_dx_region: tuple[int, int, int, int] | None = None
+        self._last_dx_full: np.ndarray | None = None
+        self._last_dx_full_bbox: tuple[int, int, int, int] | None = None
+        self._cached_hits = 0
         if not lazy:
             self._init_backends()
+
+    def _try_create_dxcam(self) -> bool:
+        try:
+            import dxcam
+
+            cam = dxcam.create(output_color="BGR")
+            if cam is not None:
+                self._dx_cam = cam
+                self._backend = "dxcam"
+                self._dx_fail_count = 0
+                return True
+        except Exception as exc:
+            logger.debug("dxcam init unavailable: %s", exc)
+        self._dx_cam = None
+        return False
 
     def _init_backends(self) -> None:
         if self._initialized:
             return
         self._initialized = True
-        if self._prefer_dxcam:
-            try:
-                import dxcam
+        if self._prefer_dxcam and self._try_create_dxcam():
+            return
+        self._ensure_mss(set_active=True)
 
-                self._dx_cam = dxcam.create(output_color="BGR")
-                if self._dx_cam is not None:
-                    self._backend = "dxcam"
-                    return
-            except Exception as exc:
-                logger.debug("dxcam init unavailable, falling back to mss: %s", exc)
-                self._dx_cam = None
-        self._ensure_mss()
-
-    def _ensure_mss(self) -> None:
+    def _ensure_mss(self, *, set_active: bool = True) -> None:
         if self._mss is None:
             import mss
 
             self._mss = mss.mss()
-        self._backend = "mss"
+        if set_active:
+            self._backend = "mss"
 
     @property
     def backend(self) -> str:
@@ -175,29 +192,109 @@ class ScreenCapturer:
     def consecutive_black_frames(self) -> int:
         return self._consecutive_black
 
+    @property
+    def cached_frame_hits(self) -> int:
+        return self._cached_hits
+
+    def _store_dx_cache(self, frame: np.ndarray, region: tuple[int, int, int, int] | None) -> None:
+        self._last_dx_frame = frame
+        self._last_dx_region = region
+        fh, fw = frame.shape[:2]
+        bbox = (0, 0, fw, fh) if region is None else region
+        if fw >= 800 and fh >= 480:
+            self._last_dx_full = frame
+            self._last_dx_full_bbox = bbox
+
+    def _lookup_dx_cache(self, region: tuple[int, int, int, int] | None) -> np.ndarray | None:
+        if self._last_dx_frame is not None and region == self._last_dx_region:
+            self._cached_hits += 1
+            return self._last_dx_frame
+        if region is not None and self._last_dx_full is not None and self._last_dx_full_bbox is not None:
+            fl, ft, fr, fb = self._last_dx_full_bbox
+            rl, rt, rr, rb = region
+            if rl >= fl and rt >= ft and rr <= fr and rb <= fb and rr > rl and rb > rt:
+                x0, y0 = rl - fl, rt - ft
+                x1, y1 = rr - fl, rb - ft
+                fh, fw = self._last_dx_full.shape[:2]
+                if 0 <= x0 < x1 <= fw and 0 <= y0 < y1 <= fh:
+                    self._cached_hits += 1
+                    return self._last_dx_full[y0:y1, x0:x1]
+        return None
+
+    def _region_fits_dxcam(self, region: tuple[int, int, int, int] | None) -> bool:
+        if region is None or self._dx_cam is None:
+            return True
+        rl, rt, rr, rb = region
+        if rr <= rl or rb <= rt or rl < 0 or rt < 0:
+            return False
+        cam_w = int(getattr(self._dx_cam, "width", 0) or 0)
+        cam_h = int(getattr(self._dx_cam, "height", 0) or 0)
+        if cam_w > 0 and cam_h > 0 and (rr > cam_w or rb > cam_h):
+            return False
+        return True
+
     def grab(self, region: tuple[int, int, int, int] | None = None) -> CaptureResult:
         """Capture region=(left, top, right, bottom) as BGR ndarray with black-frame validation."""
         if not self._initialized:
             self._init_backends()
+
+        # Auto-recover DXGI dxcam after transient Alt-Tab / mode-switch ACCESS_LOST once cooldown expires
+        if (
+            self._prefer_dxcam
+            and self._dx_cam is None
+            and self._backend == "dxcam"
+            and self._dx_fail_count < self._DXCAM_MAX_INIT_FAILS
+            and time.monotonic() >= self._dx_retry_after_mono
+        ):
+            if not self._try_create_dxcam():
+                self._dx_fail_count += 1
+                self._dx_retry_after_mono = time.monotonic() + min(30.0, 2.5 * self._dx_fail_count)
+                if self._dx_fail_count >= self._DXCAM_MAX_INIT_FAILS:
+                    self._ensure_mss(set_active=True)
+
         frame: np.ndarray | None = None
         used = self._backend
 
         if self._backend == "dxcam" and self._dx_cam is not None:
-            try:
-                frame = self._dx_cam.grab(region=region)
-                # dxcam returns None when desktop has not changed since last frame -> fall back to mss for static frame
-                if frame is None:
-                    self._ensure_mss()
-                    frame = self._grab_mss(region)
-                    used = "mss"
-            except Exception as exc:
-                logger.debug("dxcam grab failed, switching to mss: %s", exc)
-                self._dx_cam = None
-                self._ensure_mss()
+            if not self._region_fits_dxcam(region):
+                # Multi-monitor / out-of-primary bounds: grab single frame via mss without killing dxcam
+                self._ensure_mss(set_active=False)
                 frame = self._grab_mss(region)
                 used = "mss"
+            else:
+                try:
+                    frame = self._dx_cam.grab(region=region)
+                    if frame is not None:
+                        self._store_dx_cache(frame, region)
+                        used = "dxcam"
+                    else:
+                        # dxcam returns None when desktop has NOT flipped since last frame -> reuse cache (0ms, zero GDI!)
+                        cached = self._lookup_dx_cache(region)
+                        if cached is not None:
+                            frame = cached
+                            used = "dxcam"
+                        else:
+                            # Cold static desktop before first flip: one-shot mss without overwriting self._backend!
+                            self._ensure_mss(set_active=False)
+                            frame = self._grab_mss(region)
+                            used = "mss"
+                            if frame is not None and not is_black_frame(frame)[0]:
+                                self._store_dx_cache(frame, region)
+                except Exception as exc:
+                    logger.debug("dxcam grab failed transiently, single-frame mss fallback: %s", exc)
+                    try:
+                        del self._dx_cam
+                    except Exception:
+                        pass
+                    self._dx_cam = None
+                    self._dx_fail_count += 1
+                    self._dx_retry_after_mono = time.monotonic() + min(30.0, 2.5 * self._dx_fail_count)
+                    sticky = self._dx_fail_count >= self._DXCAM_MAX_INIT_FAILS
+                    self._ensure_mss(set_active=sticky)
+                    frame = self._grab_mss(region)
+                    used = "mss"
         else:
-            self._ensure_mss()
+            self._ensure_mss(set_active=(self._backend != "dxcam"))
             frame = self._grab_mss(region)
             used = "mss"
 
@@ -206,7 +303,7 @@ class ScreenCapturer:
             self._consecutive_black += 1
             # Auto-switch backend after consecutive black frames
             if self._consecutive_black >= 3 and used == "dxcam":
-                self._ensure_mss()
+                self._ensure_mss(set_active=True)
                 frame2 = self._grab_mss(region)
                 black2, mean2 = is_black_frame(frame2)
                 if not black2:
