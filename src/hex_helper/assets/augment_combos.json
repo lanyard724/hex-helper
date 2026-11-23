@@ -1,0 +1,2058 @@
+{
+  "patch": "26.23",
+  "updated_at": "2026-11-22",
+  "combos": [
+    {
+      "id": "big_shot_jeweled",
+      "name": "大腕珠光核爆",
+      "gamble": true,
+      "profile": "CRIT_SPELL",
+      "core_augments": [
+        "3018",
+        "1048",
+        "3123"
+      ],
+      "follow_ups": [
+        "1047",
+        "1336",
+        "1019",
+        "1349",
+        "1092",
+        "1325",
+        "1328"
+      ],
+      "hero_bonus": [
+        "236",
+        "360",
+        "21",
+        "202",
+        "51",
+        "81",
+        "42",
+        "498"
+      ],
+      "anti_axes": [
+        "TANK_HP",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "大腕强化技能/大招爆发再叠加珠光技能暴击，一波扫射瞬间蒸发后排（高上限赌狗天花板）",
+      "reroll_hint": "已拿大腕/珠光核心，留骰子赌珠光护手、珠光手镯或关键暴击拉满暴击乘区",
+      "required_anchor": "3018"
+    },
+    {
+      "id": "lucian_dashing_crit",
+      "name": "滑步枪神连射",
+      "gamble": true,
+      "profile": "AD",
+      "core_augments": [
+        "1019",
+        "1058"
+      ],
+      "follow_ups": [
+        "3018",
+        "1048",
+        "1047",
+        "1328",
+        "1027",
+        "1073",
+        "1116"
+      ],
+      "hero_bonus": [
+        "236",
+        "81",
+        "145",
+        "360",
+        "157",
+        "777",
+        "67"
+      ],
+      "anti_axes": [
+        "TANK_HP",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "全凭身法或秘术冲拳把 E 位移冷却压至接近零，配合大腕与暴击全程无缝滑步输出",
+      "reroll_hint": "追全凭身法、秘术冲拳或大腕，位移刷技能直接质变"
+    },
+    {
+      "id": "infinite_recursion_ap_loop",
+      "name": "无限循环 AP 轰炸",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1388",
+        "1045",
+        "1133"
+      ],
+      "follow_ups": [
+        "1068",
+        "1030",
+        "1048",
+        "3123",
+        "1390",
+        "2087",
+        "1311",
+        "1092",
+        "3055",
+        "2054",
+        "2072"
+      ],
+      "hero_bonus": [
+        "21",
+        "63",
+        "99",
+        "101",
+        "145",
+        "81",
+        "42",
+        "910",
+        "143",
+        "147",
+        "1",
+        "112",
+        "134"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "无限循环往复把高频率法术技能压到极短 CD，配炼狱导管/魔法飞弹无限刷灼烧与飞弹，全面放弃普攻物理系",
+      "reroll_hint": "已锁定 AP 技能循环流，留骰子追炼狱导管、魔法飞弹、尤里卡或珠光护手，跳过纯攻击海克斯",
+      "required_anchor": "1388"
+    },
+    {
+      "id": "recursion_haste_spam",
+      "name": "循环极速技能雨",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1068",
+        "1030",
+        "1388"
+      ],
+      "follow_ups": [
+        "1103",
+        "1150",
+        "1151",
+        "2100",
+        "1045",
+        "1133",
+        "3059",
+        "1390",
+        "2087"
+      ],
+      "hero_bonus": [
+        "21",
+        "13",
+        "69",
+        "99",
+        "101",
+        "61",
+        "910",
+        "134",
+        "112",
+        "8",
+        "147"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "循环往复叠尤里卡/面包系列极速，让核心输出技能几乎无真空期，压低普攻系海克斯优先级",
+      "reroll_hint": "继续补尤里卡、炼狱导管、魔法飞弹或法术暴击放大高频施法收益"
+    },
+    {
+      "id": "infernal_burn_nuke",
+      "name": "炼狱灼烧核弹",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1045",
+        "1133",
+        "1092"
+      ],
+      "follow_ups": [
+        "1388",
+        "1068",
+        "1030",
+        "1036",
+        "1048",
+        "3123",
+        "2078",
+        "1028",
+        "1390",
+        "1046"
+      ],
+      "hero_bonus": [
+        "63",
+        "876",
+        "143",
+        "90",
+        "17",
+        "136",
+        "21",
+        "30",
+        "50",
+        "910"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "炼狱导管持续灼烧减全技能 CD，联动魔法飞弹与易损让 DoT 跳出暴击并高频触发飞弹雨",
+      "reroll_hint": "已拿灼烧核心，优先追魔法飞弹、易损、无限循环往复或珠光护手",
+      "required_anchor": "1045"
+    },
+    {
+      "id": "spell_crit_witchcap",
+      "name": "珠光巫师帽秒杀",
+      "gamble": true,
+      "profile": "CRIT_SPELL",
+      "core_augments": [
+        "1048",
+        "1156",
+        "3123"
+      ],
+      "follow_ups": [
+        "1047",
+        "1336",
+        "1092",
+        "1325",
+        "1390",
+        "1030",
+        "2087",
+        "1311",
+        "3018"
+      ],
+      "hero_bonus": [
+        "30",
+        "9",
+        "134",
+        "112",
+        "99",
+        "101",
+        "21",
+        "131",
+        "517",
+        "1",
+        "61",
+        "910"
+      ],
+      "anti_axes": [
+        "AUTO_ONHIT",
+        "TANK_HP"
+      ],
+      "synergy_reason": "珠光护手/手镯赋予技能暴击，搭配巫师帽或无尽/关键暴击把法强与暴伤双乘区拉满",
+      "reroll_hint": "手握珠光系可赌关键暴击、升级无尽之刃、沃格勒特的巫师帽或玻璃大炮"
+    },
+    {
+      "id": "ultimate_awakening_nuke",
+      "name": "终极唤醒连环大招",
+      "gamble": true,
+      "profile": "AP",
+      "core_augments": [
+        "1349",
+        "1088",
+        "3055"
+      ],
+      "follow_ups": [
+        "1048",
+        "3123",
+        "3018",
+        "1211",
+        "1112",
+        "1011",
+        "2131",
+        "1388"
+      ],
+      "hero_bonus": [
+        "21",
+        "30",
+        "9",
+        "54",
+        "131",
+        "32",
+        "517",
+        "147",
+        "236",
+        "1",
+        "61"
+      ],
+      "anti_axes": [
+        "AUTO_ONHIT"
+      ],
+      "synergy_reason": "终极唤醒与终极刷新/终极循环把团战大招变成常规技能，单波团可连续倾泻两次大招",
+      "reroll_hint": "留骰子追终极刷新、珠光护手、大腕或杀戮时间到了"
+    },
+    {
+      "id": "vulnerability_dot_crit",
+      "name": "易损暴击灼烧流",
+      "gamble": false,
+      "profile": "CRIT_SPELL",
+      "core_augments": [
+        "1092",
+        "1045",
+        "1048"
+      ],
+      "follow_ups": [
+        "3123",
+        "1047",
+        "1336",
+        "1133",
+        "2099",
+        "1036",
+        "1325"
+      ],
+      "hero_bonus": [
+        "63",
+        "876",
+        "90",
+        "143",
+        "17",
+        "30",
+        "50",
+        "136",
+        "21"
+      ],
+      "anti_axes": [
+        "TANK_HP",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "易损让装备特效与持续伤害全部可以暴击，叠关键暴击/无尽与炼狱导管伤害指数级放大",
+      "reroll_hint": "追炼狱导管、关键暴击、珠光护手或升级无尽之刃",
+      "required_anchor": "1092"
+    },
+    {
+      "id": "dual_wield_machinegun",
+      "name": "双刀流特效机关枪",
+      "gamble": true,
+      "profile": "AD",
+      "core_augments": [
+        "1225",
+        "2005",
+        "2010"
+      ],
+      "follow_ups": [
+        "1079",
+        "1081",
+        "1087",
+        "1115",
+        "1071",
+        "1022",
+        "1036",
+        "2055",
+        "3058",
+        "1058"
+      ],
+      "hero_bonus": [
+        "67",
+        "96",
+        "29",
+        "222",
+        "145",
+        "10",
+        "22",
+        "110",
+        "11",
+        "523"
+      ],
+      "anti_axes": [
+        "AP_SPELL",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "双刀流叠双发快射/扳机炼狱/台风把普攻特效频率翻倍，配合战争交响乐或踢踏舞攻速突破天际",
+      "reroll_hint": "已拿特效核心，留骰子追双刀流、最万用瞄准镜、双发快射或战争交响乐",
+      "required_anchor": "1225"
+    },
+    {
+      "id": "scoped_sniper_adc",
+      "name": "超远瞄准镜白嫖流",
+      "gamble": false,
+      "profile": "AD",
+      "core_augments": [
+        "1115",
+        "1071",
+        "1170"
+      ],
+      "follow_ups": [
+        "1225",
+        "1087",
+        "1047",
+        "1328",
+        "2010",
+        "3052",
+        "1195",
+        "1336",
+        "1022"
+      ],
+      "hero_bonus": [
+        "51",
+        "222",
+        "96",
+        "29",
+        "22",
+        "67",
+        "10",
+        "15",
+        "523",
+        "119",
+        "498"
+      ],
+      "anti_axes": [
+        "AP_SPELL",
+        "TANK_HP"
+      ],
+      "synergy_reason": "瞄准镜系列叠加射程压制让射手在安全距离无伤点人，配双刀流或暴击律动直接接管团战",
+      "reroll_hint": "继续叠加万用瞄准镜系列或补双刀流、暴击律动、巨人杀手"
+    },
+    {
+      "id": "crit_sustain_carry",
+      "name": "满暴吸血永动射手",
+      "gamble": false,
+      "profile": "AD",
+      "core_augments": [
+        "1047",
+        "1328",
+        "1336"
+      ],
+      "follow_ups": [
+        "1077",
+        "1080",
+        "3018",
+        "1225",
+        "1115",
+        "2010",
+        "1195",
+        "1320"
+      ],
+      "hero_bonus": [
+        "222",
+        "51",
+        "119",
+        "202",
+        "498",
+        "15",
+        "523",
+        "360",
+        "236",
+        "157",
+        "777"
+      ],
+      "anti_axes": [
+        "AP_SPELL",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "关键暴击配暴击律动/无尽快速满暴，叠加灵魂虹吸与会心防御实现高暴击同时吸血减伤",
+      "reroll_hint": "追升级无尽之刃、暴击律动、灵魂虹吸或大腕补齐暴击闭环"
+    },
+    {
+      "id": "tickle_monster_ad_speed",
+      "name": "嗡嗡怪兽纯 AD 极速",
+      "gamble": true,
+      "profile": "AD",
+      "core_augments": [
+        "3058",
+        "1007",
+        "1225"
+      ],
+      "follow_ups": [
+        "1336",
+        "1320",
+        "1047",
+        "1115",
+        "2010",
+        "1077",
+        "1206"
+      ],
+      "hero_bonus": [
+        "202",
+        "119",
+        "51",
+        "222",
+        "29",
+        "67",
+        "236",
+        "498",
+        "15"
+      ],
+      "anti_axes": [
+        "AP_SPELL",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "嗡嗡怪兽把高额攻击力转化为攻速收益，搭配大力/无尽/双刀流直接拉爆 DPS 上限",
+      "reroll_hint": "优先补大力、双刀流、升级无尽之刃等高 AD/暴击强化",
+      "required_anchor": "3058"
+    },
+    {
+      "id": "mystic_punch_infinite_cd",
+      "name": "秘术冲拳无限刷技能",
+      "gamble": true,
+      "profile": "HYBRID",
+      "core_augments": [
+        "1058",
+        "1225",
+        "1029"
+      ],
+      "follow_ups": [
+        "1079",
+        "1019",
+        "1022",
+        "2010",
+        "1081",
+        "1388",
+        "1134"
+      ],
+      "hero_bonus": [
+        "11",
+        "157",
+        "777",
+        "236",
+        "81",
+        "67",
+        "887",
+        "233",
+        "10",
+        "145"
+      ],
+      "anti_axes": [
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "秘术冲拳普攻直减全技能剩余冷却，配双刀流/虚幻武器/高攻速达成无限 QWE 控场与收割",
+      "reroll_hint": "已拿秘术冲拳，留骰子追双刀流、战争交响乐、全凭身法或虚幻武器",
+      "required_anchor": "1058"
+    },
+    {
+      "id": "ethereal_weapon_onhit_mage",
+      "name": "虚幻武器技能挂特效",
+      "gamble": true,
+      "profile": "HYBRID",
+      "core_augments": [
+        "1029",
+        "1058",
+        "1045"
+      ],
+      "follow_ups": [
+        "1129",
+        "1036",
+        "1054",
+        "1388",
+        "1133",
+        "1996",
+        "3094"
+      ],
+      "hero_bonus": [
+        "81",
+        "55",
+        "145",
+        "69",
+        "10",
+        "887",
+        "131",
+        "245",
+        "105",
+        "63"
+      ],
+      "anti_axes": [
+        "TANK_HP"
+      ],
+      "synergy_reason": "虚幻武器让技能直接触发纳什/巫妖/秘术冲拳等攻击特效，技能与普攻特效双向滚雪球",
+      "reroll_hint": "追秘术冲拳、炼狱导管、神射法师或升级耀光",
+      "required_anchor": "1029"
+    },
+    {
+      "id": "tank_engine_steel_heart",
+      "name": "钢神坦克引擎叠血",
+      "gamble": true,
+      "profile": "TANK",
+      "core_augments": [
+        "1353",
+        "1152",
+        "1041"
+      ],
+      "follow_ups": [
+        "1002",
+        "1013",
+        "1018",
+        "1181",
+        "1361",
+        "1319",
+        "3049",
+        "1149",
+        "2139"
+      ],
+      "hero_bonus": [
+        "36",
+        "14",
+        "31",
+        "516",
+        "223",
+        "154",
+        "3",
+        "32",
+        "89",
+        "412",
+        "54"
+      ],
+      "anti_axes": [
+        "AP_SPELL",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "坦克引擎 + 钢化你心 + 歌利亚巨人三重最大生命乘区叠穿屏幕，再配重量级打击手/艾卡西亚秒杀后排",
+      "reroll_hint": "已进钢神路线，留骰子追钢化你心、歌利亚巨人、尖端发明家或重量级打击手"
+    },
+    {
+      "id": "apex_inventor_item_haste",
+      "name": "尖端发明家装备连发",
+      "gamble": false,
+      "profile": "TANK",
+      "core_augments": [
+        "1002",
+        "1152",
+        "1353"
+      ],
+      "follow_ups": [
+        "1041",
+        "1361",
+        "1319",
+        "1318",
+        "2143",
+        "1018",
+        "1420"
+      ],
+      "hero_bonus": [
+        "36",
+        "14",
+        "31",
+        "223",
+        "516",
+        "154",
+        "82",
+        "50",
+        "131",
+        "8"
+      ],
+      "anti_axes": [
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "尖端发明家暴降心之钢/无终恨意/焚天/中娅冷却，单波团多敲数次心之钢直接把血量拉爆",
+      "reroll_hint": "优先追钢化你心、坦克引擎、歌利亚巨人或升级焚天/献祭",
+      "required_anchor": "1002"
+    },
+    {
+      "id": "colossus_cc_shield_wall",
+      "name": "巨像控制无限护盾",
+      "gamble": false,
+      "profile": "TANK",
+      "core_augments": [
+        "1018",
+        "1149",
+        "3049"
+      ],
+      "follow_ups": [
+        "1323",
+        "1041",
+        "1353",
+        "1314",
+        "2144",
+        "1329",
+        "1392",
+        "1136"
+      ],
+      "hero_bonus": [
+        "89",
+        "32",
+        "3",
+        "516",
+        "412",
+        "53",
+        "14",
+        "154",
+        "54",
+        "223"
+      ],
+      "anti_axes": [
+        "CRIT_ATTACK",
+        "AUTO_ONHIT"
+      ],
+      "synergy_reason": "巨像的勇气配不动如山/残忍/装甲冲击，每次控制同时套厚盾并炸范围伤，越打越肉",
+      "reroll_hint": "追不动如山、残忍、装甲冲击或坦克引擎放大开团护盾",
+      "required_anchor": "1018"
+    },
+    {
+      "id": "enchanter_butterfly_circle",
+      "name": "蝴蝶死亡之环软辅核爆",
+      "gamble": true,
+      "profile": "SUPPORT",
+      "core_augments": [
+        "3163",
+        "1015",
+        "1095"
+      ],
+      "follow_ups": [
+        "1141",
+        "1118",
+        "1037",
+        "1005",
+        "1076",
+        "1314",
+        "2144",
+        "3025",
+        "1420",
+        "1098",
+        "1379"
+      ],
+      "hero_bonus": [
+        "37",
+        "16",
+        "147",
+        "902",
+        "43",
+        "25"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "迷人蝴蝶与死亡之环把高额治疗护盾直接转化为真实伤害输出，配风语者/全心为你/急急小子又奶又秒人",
+      "reroll_hint": "已走盾奶核爆流，追死亡之环、迷人蝴蝶、风语者的祝福、全心为你或会心治疗",
+      "required_anchor": "3163"
+    },
+    {
+      "id": "phenomenal_eureka_scaling",
+      "name": "超凡邪恶法强永动机",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1390",
+        "1030",
+        "1156"
+      ],
+      "follow_ups": [
+        "1388",
+        "1045",
+        "1097",
+        "1204",
+        "2087",
+        "1311",
+        "1048",
+        "1133"
+      ],
+      "hero_bonus": [
+        "63",
+        "13",
+        "69",
+        "136",
+        "112",
+        "134",
+        "99",
+        "101",
+        "8",
+        "50",
+        "910",
+        "143"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "超凡邪恶叠加无限法强，尤里卡把法强直接折算成海量技能急速，越打法强越高、CD 越短",
+      "reroll_hint": "追尤里卡、沃格勒特的巫师帽、无限循环往复或炼狱导管",
+      "required_anchor": "1390"
+    },
+    {
+      "id": "mana_overflow_archmage",
+      "name": "没法力溢流蓝量核弹",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "3059",
+        "1311",
+        "1056"
+      ],
+      "follow_ups": [
+        "1030",
+        "2087",
+        "1388",
+        "1048",
+        "1180",
+        "1390",
+        "1068"
+      ],
+      "hero_bonus": [
+        "13",
+        "69",
+        "136",
+        "112",
+        "101",
+        "99",
+        "61",
+        "134",
+        "910",
+        "147"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "没法力没问题/溢流/由心及物把法力池同时转化为增伤、生命与高额急速，法术炮台全属性飙升",
+      "reroll_hint": "追溢流、由心及物、大法师或尤里卡，放弃物理攻击系",
+      "required_anchor": "3059"
+    },
+    {
+      "id": "adapt_escapade_duality",
+      "name": "物法双修属性转职",
+      "gamble": true,
+      "profile": "HYBRID",
+      "core_augments": [
+        "1205",
+        "1206",
+        "1054"
+      ],
+      "follow_ups": [
+        "1129",
+        "1029",
+        "1048",
+        "1058",
+        "1156",
+        "1225"
+      ],
+      "hero_bonus": [
+        "145",
+        "10",
+        "81",
+        "42",
+        "55",
+        "29",
+        "110",
+        "901"
+      ],
+      "anti_axes": [
+        "TANK_HP"
+      ],
+      "synergy_reason": "物理转魔法/魔法转物理/物法皆修打通双修装备池，配神射法师或珠光护手面板爆炸",
+      "reroll_hint": "追物法皆修、神射法师、虚幻武器或珠光护手"
+    },
+    {
+      "id": "volley_split_barrage",
+      "name": "裂变弹幕炮台法师",
+      "gamble": true,
+      "profile": "AP",
+      "core_augments": [
+        "2054",
+        "2072",
+        "2062"
+      ],
+      "follow_ups": [
+        "1133",
+        "1045",
+        "1048",
+        "1113",
+        "1388",
+        "2078",
+        "1030",
+        "3123"
+      ],
+      "hero_bonus": [
+        "101",
+        "99",
+        "81",
+        "145",
+        "910",
+        "63",
+        "134",
+        "25",
+        "147",
+        "103"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "三重射击/咒语裂变/回响施放把直线或范围技能成倍分裂，配魔法飞弹与炼狱导管瞬间铺满全屏弹幕",
+      "reroll_hint": "追魔法飞弹、炼狱导管、老练狙神或珠光护手"
+    },
+    {
+      "id": "dashing_earthwake_assassin",
+      "name": "身法大地苏醒爆破",
+      "gamble": true,
+      "profile": "HYBRID",
+      "core_augments": [
+        "1019",
+        "1027",
+        "1073"
+      ],
+      "follow_ups": [
+        "1116",
+        "1348",
+        "1058",
+        "1326",
+        "1187",
+        "1006"
+      ],
+      "hero_bonus": [
+        "105",
+        "84",
+        "238",
+        "246",
+        "245",
+        "103",
+        "157",
+        "777",
+        "236",
+        "55",
+        "131"
+      ],
+      "anti_axes": [
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "全凭身法压低位移 CD，配大地苏醒每次突进炸高额路径伤害，闪现向前/暗影疾奔持续黏杀",
+      "reroll_hint": "追全凭身法、大地苏醒、闪现向前或暗影疾奔",
+      "required_anchor": "1019"
+    },
+    {
+      "id": "minion_bees_swarm",
+      "name": "仆从蜜蜂召唤海",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1104",
+        "3086",
+        "3048"
+      ],
+      "follow_ups": [
+        "1045",
+        "1133",
+        "1390",
+        "1092",
+        "1388",
+        "1030"
+      ],
+      "hero_bonus": [
+        "143",
+        "74",
+        "90",
+        "1",
+        "17"
+      ],
+      "anti_axes": [
+        "AD_ATTACK",
+        "AUTO_ONHIT",
+        "CRIT_ATTACK"
+      ],
+      "synergy_reason": "仆从大师叠加小蜜蜂/弹跳蜜蜂铺场，召唤物自动触发炼狱导管与魔法飞弹持续消耗",
+      "reroll_hint": "追仆从大师、小蜜蜂！！！、炼狱导管或魔法飞弹",
+      "required_anchor": "3086"
+    },
+    {
+      "id": "draw_sword_melee_brawler",
+      "name": "亮剑近战无双肉搏",
+      "gamble": true,
+      "profile": "AD",
+      "core_augments": [
+        "1134",
+        "1006",
+        "2141"
+      ],
+      "follow_ups": [
+        "1058",
+        "1077",
+        "1138",
+        "2140",
+        "2143",
+        "2157",
+        "1225",
+        "1079",
+        "1019"
+      ],
+      "hero_bonus": [
+        "11",
+        "157",
+        "777",
+        "233",
+        "360",
+        "236",
+        "67",
+        "29"
+      ],
+      "anti_axes": [
+        "AP_SPELL",
+        "SHIELD_HEAL"
+      ],
+      "synergy_reason": "亮出你的剑换取巨额面板与吸血，配利刃华尔兹/终极九头蛇/秘术冲拳贴脸无脑站撸清场",
+      "reroll_hint": "追利刃华尔兹、终极九头蛇、秘术冲拳或灵魂虹吸",
+      "required_anchor": "1134"
+    },
+    {
+      "id": "snowball_engage_bomb",
+      "name": "巨型雪球核爆开团",
+      "gamble": false,
+      "profile": "TANK",
+      "core_augments": [
+        "1329",
+        "1392",
+        "1358"
+      ],
+      "follow_ups": [
+        "2088",
+        "1018",
+        "1149",
+        "1323",
+        "1027",
+        "1310"
+      ],
+      "hero_bonus": [
+        "32",
+        "54",
+        "89",
+        "3",
+        "154",
+        "516",
+        "127",
+        "131",
+        "9"
+      ],
+      "anti_axes": [
+        "CRIT_ATTACK",
+        "AUTO_ONHIT"
+      ],
+      "synergy_reason": "史上最大雪球/神圣雪球配下雪天与巨像/残忍，超远距离必中开团并附带高额护盾控制爆发",
+      "reroll_hint": "追下雪天、巨像的勇气、不动如山或残忍"
+    },
+    {
+      "id": "skilled_sniper_poke",
+      "name": "老练狙神零 CD 远程炮",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1113",
+        "1133",
+        "1045"
+      ],
+      "follow_ups": [
+        "1388",
+        "2054",
+        "2072",
+        "1048",
+        "3123",
+        "1030",
+        "1390",
+        "3052"
+      ],
+      "hero_bonus": [
+        "101",
+        "99",
+        "81",
+        "145",
+        "110",
+        "910",
+        "22",
+        "25",
+        "134"
+      ],
+      "anti_axes": [
+        "TANK_HP"
+      ],
+      "synergy_reason": "老练狙神超远命中返还 80% 冷却，联动魔法飞弹与三重射击/裂变把长手 Poke 变成连发火炮",
+      "reroll_hint": "追魔法飞弹、三重射击、咒语裂变或珠光护手",
+      "required_anchor": "1113"
+    },
+    {
+      "id": "marksmage_ap_auto",
+      "name": "神射法师法强平 A 流",
+      "gamble": false,
+      "profile": "HYBRID",
+      "core_augments": [
+        "1129",
+        "1029",
+        "1225"
+      ],
+      "follow_ups": [
+        "1054",
+        "1390",
+        "1156",
+        "1079",
+        "1022",
+        "3094",
+        "1205"
+      ],
+      "hero_bonus": [
+        "10",
+        "145",
+        "887",
+        "131",
+        "29",
+        "17",
+        "110",
+        "81",
+        "1",
+        "99"
+      ],
+      "anti_axes": [
+        "TANK_HP"
+      ],
+      "synergy_reason": "神射法师让普攻附带高额法强加成，叠加双刀流/巫妖大脑/高法强拆塔切人速度拉满",
+      "reroll_hint": "追双刀流、虚幻武器、超凡邪恶或沃格勒特的巫师帽",
+      "required_anchor": "1129"
+    },
+    {
+      "id": "gacha_transmute_highroll",
+      "name": "质变潘朵拉纯赌狗",
+      "gamble": true,
+      "profile": "UTILITY",
+      "core_augments": [
+        "1238",
+        "1243",
+        "12317"
+      ],
+      "follow_ups": [
+        "1237",
+        "1384",
+        "1335",
+        "1402",
+        "1403",
+        "3081"
+      ],
+      "hero_bonus": [],
+      "anti_axes": [],
+      "synergy_reason": "质变棱彩/混沌与潘朵拉直接博高阶棱彩池上限，运气好一轮成型版本 T0 核爆组合",
+      "reroll_hint": "已开启纯赌狗路线，后续优先锁高上限棱彩核或命运之武器"
+    },
+    {
+      "id": "bread_family_qwe_loop",
+      "name": "面包家族全技能极速",
+      "gamble": false,
+      "profile": "AP",
+      "core_augments": [
+        "1103",
+        "1150",
+        "1151"
+      ],
+      "follow_ups": [
+        "1388",
+        "1068",
+        "1030",
+        "1045",
+        "1133",
+        "2100",
+        "3059"
+      ],
+      "hero_bonus": [
+        "81",
+        "21",
+        "99",
+        "101",
+        "8",
+        "69",
+        "13",
+        "147",
+        "43",
+        "37"
+      ],
+      "anti_axes": [
+        "AUTO_ONHIT"
+      ],
+      "synergy_reason": "面包系单技能 200 极速直接质变核心小技能，配循环往复/炼狱导管把主力技能当平 A 丢",
+      "reroll_hint": "配炼狱导管、魔法飞弹、无限循环往复或尤里卡"
+    }
+  ],
+  "augment_axes": {
+    "1001": [
+      "TANK_HP"
+    ],
+    "1002": [
+      "TANK_HP",
+      "HASTE_LOOP"
+    ],
+    "1004": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "1005": [
+      "SHIELD_HEAL"
+    ],
+    "1006": [
+      "AD_ATTACK",
+      "MOBILITY_DASH"
+    ],
+    "1007": [
+      "AD_ATTACK"
+    ],
+    "1011": [
+      "ULT_CYCLE"
+    ],
+    "1013": [
+      "TANK_HP"
+    ],
+    "1015": [
+      "SHIELD_HEAL",
+      "AP_SPELL"
+    ],
+    "1018": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1019": [
+      "MOBILITY_DASH",
+      "HASTE_LOOP"
+    ],
+    "1020": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1022": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1025": [
+      "TANK_HP"
+    ],
+    "1026": [
+      "MOBILITY_DASH"
+    ],
+    "1027": [
+      "MOBILITY_DASH"
+    ],
+    "1028": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "1029": [
+      "AP_SPELL",
+      "AUTO_ONHIT"
+    ],
+    "1030": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "1034": [
+      "SHIELD_HEAL"
+    ],
+    "1036": [
+      "AUTO_ONHIT",
+      "BURN_DOT"
+    ],
+    "1037": [
+      "SHIELD_HEAL"
+    ],
+    "1038": [
+      "AP_SPELL",
+      "AD_ATTACK"
+    ],
+    "1041": [
+      "TANK_HP"
+    ],
+    "1044": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "1045": [
+      "AP_SPELL",
+      "BURN_DOT",
+      "HASTE_LOOP"
+    ],
+    "1046": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "1047": [
+      "CRIT_ATTACK",
+      "CRIT_SPELL"
+    ],
+    "1048": [
+      "CRIT_SPELL",
+      "AP_SPELL",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1051": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1053": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1054": [
+      "AP_SPELL",
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1056": [
+      "AP_SPELL",
+      "TANK_HP"
+    ],
+    "1057": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1058": [
+      "AUTO_ONHIT",
+      "HASTE_LOOP"
+    ],
+    "1060": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1061": [
+      "AP_SPELL"
+    ],
+    "1062": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1063": [
+      "TANK_HP",
+      "MOBILITY_DASH"
+    ],
+    "1067": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1068": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "1071": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1072": [
+      "AP_SPELL",
+      "SHIELD_HEAL"
+    ],
+    "1073": [
+      "MOBILITY_DASH"
+    ],
+    "1074": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1076": [
+      "SHIELD_HEAL"
+    ],
+    "1077": [
+      "CRIT_ATTACK",
+      "AD_ATTACK"
+    ],
+    "1079": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1080": [
+      "CRIT_ATTACK",
+      "TANK_HP"
+    ],
+    "1081": [
+      "AD_ATTACK",
+      "AUTO_ONHIT",
+      "MOBILITY_DASH"
+    ],
+    "1084": [
+      "AP_SPELL",
+      "AD_ATTACK"
+    ],
+    "1087": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1088": [
+      "ULT_CYCLE",
+      "HASTE_LOOP"
+    ],
+    "1092": [
+      "CRIT_SPELL",
+      "BURN_DOT"
+    ],
+    "1095": [
+      "SHIELD_HEAL"
+    ],
+    "1097": [
+      "AP_SPELL"
+    ],
+    "1098": [
+      "HASTE_LOOP",
+      "SHIELD_HEAL",
+      "MOBILITY_DASH"
+    ],
+    "1103": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "1104": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "1105": [
+      "MOBILITY_DASH"
+    ],
+    "1112": [
+      "ULT_CYCLE",
+      "TANK_HP"
+    ],
+    "1113": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "1115": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1116": [
+      "MOBILITY_DASH",
+      "HASTE_LOOP"
+    ],
+    "1118": [
+      "SHIELD_HEAL",
+      "CRIT_SPELL"
+    ],
+    "1129": [
+      "AP_SPELL",
+      "AUTO_ONHIT"
+    ],
+    "1133": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "1134": [
+      "AD_ATTACK",
+      "AUTO_ONHIT",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1136": [
+      "TANK_HP"
+    ],
+    "1138": [
+      "AD_ATTACK",
+      "TANK_HP"
+    ],
+    "1141": [
+      "SHIELD_HEAL"
+    ],
+    "1149": [
+      "TANK_HP"
+    ],
+    "1150": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "1151": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "1152": [
+      "TANK_HP",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1154": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1156": [
+      "AP_SPELL",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1170": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "1180": [
+      "AP_SPELL",
+      "SHIELD_HEAL"
+    ],
+    "1181": [
+      "TANK_HP",
+      "AUTO_ONHIT"
+    ],
+    "1187": [
+      "MOBILITY_DASH"
+    ],
+    "1194": [
+      "ULT_CYCLE",
+      "AP_SPELL"
+    ],
+    "1195": [
+      "AD_ATTACK",
+      "CRIT_ATTACK"
+    ],
+    "1204": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1205": [
+      "AP_SPELL",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1206": [
+      "AD_ATTACK",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1211": [
+      "ULT_CYCLE"
+    ],
+    "1214": [
+      "AD_ATTACK",
+      "HASTE_LOOP"
+    ],
+    "1225": [
+      "AD_ATTACK",
+      "AUTO_ONHIT",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1237": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1238": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1243": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1301": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "1305": [
+      "MOBILITY_DASH"
+    ],
+    "1308": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "1310": [
+      "MOBILITY_DASH",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1311": [
+      "AP_SPELL"
+    ],
+    "1314": [
+      "SHIELD_HEAL"
+    ],
+    "1315": [
+      "SHIELD_HEAL",
+      "MOBILITY_DASH"
+    ],
+    "1318": [
+      "AP_SPELL"
+    ],
+    "1319": [
+      "TANK_HP",
+      "BURN_DOT"
+    ],
+    "1320": [
+      "AD_ATTACK",
+      "CRIT_ATTACK"
+    ],
+    "1322": [
+      "AD_ATTACK",
+      "MOBILITY_DASH"
+    ],
+    "1323": [
+      "TANK_HP",
+      "AP_SPELL"
+    ],
+    "1324": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "1325": [
+      "AP_SPELL",
+      "AD_ATTACK",
+      "CRIT_SPELL",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1326": [
+      "AD_ATTACK",
+      "MOBILITY_DASH"
+    ],
+    "1328": [
+      "CRIT_ATTACK",
+      "AUTO_ONHIT",
+      "AD_ATTACK"
+    ],
+    "1329": [
+      "TANK_HP",
+      "MOBILITY_DASH"
+    ],
+    "1331": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "1332": [
+      "AP_SPELL",
+      "SHIELD_HEAL"
+    ],
+    "1333": [
+      "MOBILITY_DASH"
+    ],
+    "1335": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1336": [
+      "CRIT_ATTACK",
+      "CRIT_SPELL",
+      "AD_ATTACK"
+    ],
+    "1344": [
+      "ULT_CYCLE",
+      "TANK_HP"
+    ],
+    "1347": [
+      "SHIELD_HEAL"
+    ],
+    "1348": [
+      "MOBILITY_DASH"
+    ],
+    "1349": [
+      "ULT_CYCLE",
+      "HASTE_LOOP"
+    ],
+    "1353": [
+      "TANK_HP",
+      "GAMBLE_HIGHROLL"
+    ],
+    "1358": [
+      "TANK_HP",
+      "MOBILITY_DASH"
+    ],
+    "1361": [
+      "TANK_HP",
+      "BURN_DOT"
+    ],
+    "1373": [
+      "MOBILITY_DASH",
+      "HASTE_LOOP"
+    ],
+    "1375": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "1379": [
+      "SHIELD_HEAL"
+    ],
+    "1384": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1386": [
+      "AD_ATTACK",
+      "HASTE_LOOP"
+    ],
+    "1388": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "1389": [
+      "AP_SPELL",
+      "AD_ATTACK"
+    ],
+    "1390": [
+      "AP_SPELL"
+    ],
+    "1392": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "1401": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "1402": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1403": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1404": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "1413": [
+      "TANK_HP"
+    ],
+    "1415": [
+      "BURN_DOT",
+      "AP_SPELL"
+    ],
+    "1416": [
+      "AP_SPELL"
+    ],
+    "1420": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "1421": [
+      "TANK_HP"
+    ],
+    "1996": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "2004": [
+      "SHIELD_HEAL"
+    ],
+    "2005": [
+      "AD_ATTACK",
+      "AUTO_ONHIT",
+      "GAMBLE_HIGHROLL"
+    ],
+    "2009": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "2010": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "2016": [
+      "AP_SPELL",
+      "AD_ATTACK"
+    ],
+    "2018": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "2026": [
+      "AD_ATTACK",
+      "MOBILITY_DASH"
+    ],
+    "2032": [
+      "AP_SPELL"
+    ],
+    "2043": [
+      "SHIELD_HEAL"
+    ],
+    "2054": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "2055": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "2062": [
+      "AP_SPELL"
+    ],
+    "2064": [
+      "MOBILITY_DASH"
+    ],
+    "2065": [
+      "MOBILITY_DASH",
+      "AD_ATTACK"
+    ],
+    "2072": [
+      "AP_SPELL"
+    ],
+    "2073": [
+      "AD_ATTACK",
+      "SHIELD_HEAL"
+    ],
+    "2076": [
+      "TANK_HP"
+    ],
+    "2077": [
+      "TANK_HP",
+      "AP_SPELL"
+    ],
+    "2078": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "2083": [
+      "AD_ATTACK"
+    ],
+    "2087": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "2088": [
+      "TANK_HP",
+      "MOBILITY_DASH"
+    ],
+    "2091": [
+      "AD_ATTACK",
+      "CRIT_ATTACK"
+    ],
+    "2096": [
+      "AD_ATTACK"
+    ],
+    "2098": [
+      "MOBILITY_DASH",
+      "TANK_HP"
+    ],
+    "2099": [
+      "AP_SPELL",
+      "CRIT_SPELL"
+    ],
+    "2100": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "2102": [
+      "BURN_DOT",
+      "TANK_HP"
+    ],
+    "2103": [
+      "AD_ATTACK",
+      "CRIT_ATTACK"
+    ],
+    "2104": [
+      "SHIELD_HEAL"
+    ],
+    "2107": [
+      "TANK_HP",
+      "AD_ATTACK"
+    ],
+    "2111": [
+      "AD_ATTACK",
+      "TANK_HP"
+    ],
+    "2115": [
+      "TANK_HP",
+      "AD_ATTACK"
+    ],
+    "2116": [
+      "AP_SPELL",
+      "AD_ATTACK"
+    ],
+    "2119": [
+      "MOBILITY_DASH",
+      "GAMBLE_HIGHROLL"
+    ],
+    "2123": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "2125": [
+      "MOBILITY_DASH"
+    ],
+    "2127": [
+      "GAMBLE_HIGHROLL",
+      "TANK_HP"
+    ],
+    "2129": [
+      "AP_SPELL"
+    ],
+    "2131": [
+      "ULT_CYCLE",
+      "TANK_HP"
+    ],
+    "2132": [
+      "SHIELD_HEAL",
+      "AP_SPELL"
+    ],
+    "2133": [
+      "SHIELD_HEAL"
+    ],
+    "2135": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "2136": [
+      "AD_ATTACK"
+    ],
+    "2138": [
+      "TANK_HP"
+    ],
+    "2139": [
+      "TANK_HP"
+    ],
+    "2140": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "2141": [
+      "AD_ATTACK",
+      "TANK_HP",
+      "GAMBLE_HIGHROLL"
+    ],
+    "2143": [
+      "AD_ATTACK",
+      "TANK_HP"
+    ],
+    "2144": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "2157": [
+      "AD_ATTACK",
+      "TANK_HP"
+    ],
+    "3004": [
+      "AD_ATTACK",
+      "MOBILITY_DASH"
+    ],
+    "3016": [
+      "AD_ATTACK",
+      "AUTO_ONHIT"
+    ],
+    "3018": [
+      "CRIT_SPELL",
+      "ULT_CYCLE",
+      "GAMBLE_HIGHROLL"
+    ],
+    "3025": [
+      "SHIELD_HEAL"
+    ],
+    "3036": [
+      "AUTO_ONHIT",
+      "AD_ATTACK"
+    ],
+    "3039": [
+      "SHIELD_HEAL"
+    ],
+    "3048": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "3049": [
+      "TANK_HP",
+      "SHIELD_HEAL"
+    ],
+    "3051": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "3052": [
+      "AP_SPELL",
+      "AD_ATTACK"
+    ],
+    "3053": [
+      "TANK_HP",
+      "AD_ATTACK"
+    ],
+    "3055": [
+      "ULT_CYCLE",
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "3058": [
+      "AD_ATTACK",
+      "AUTO_ONHIT",
+      "GAMBLE_HIGHROLL"
+    ],
+    "3059": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "3060": [
+      "AD_ATTACK",
+      "CRIT_ATTACK"
+    ],
+    "3063": [
+      "AD_ATTACK",
+      "CRIT_ATTACK"
+    ],
+    "3071": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "3075": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "3078": [
+      "HASTE_LOOP",
+      "AD_ATTACK"
+    ],
+    "3079": [
+      "MOBILITY_DASH",
+      "AD_ATTACK"
+    ],
+    "3081": [
+      "GAMBLE_HIGHROLL"
+    ],
+    "3085": [
+      "AP_SPELL",
+      "HASTE_LOOP"
+    ],
+    "3086": [
+      "AP_SPELL",
+      "BURN_DOT"
+    ],
+    "3088": [
+      "AD_ATTACK",
+      "AP_SPELL"
+    ],
+    "3094": [
+      "AP_SPELL",
+      "AUTO_ONHIT"
+    ],
+    "3116": [
+      "MOBILITY_DASH",
+      "AD_ATTACK"
+    ],
+    "3118": [
+      "ULT_CYCLE",
+      "AP_SPELL"
+    ],
+    "3121": [
+      "SHIELD_HEAL"
+    ],
+    "3123": [
+      "CRIT_SPELL",
+      "AP_SPELL",
+      "GAMBLE_HIGHROLL"
+    ],
+    "3129": [
+      "AP_SPELL",
+      "TANK_HP"
+    ],
+    "3131": [
+      "TANK_HP"
+    ],
+    "3132": [
+      "GAMBLE_HIGHROLL",
+      "AD_ATTACK"
+    ],
+    "3134": [
+      "TANK_HP"
+    ],
+    "3149": [
+      "SHIELD_HEAL"
+    ],
+    "3150": [
+      "AP_SPELL"
+    ],
+    "3159": [
+      "GAMBLE_HIGHROLL",
+      "AP_SPELL"
+    ],
+    "3163": [
+      "SHIELD_HEAL",
+      "AP_SPELL",
+      "GAMBLE_HIGHROLL"
+    ],
+    "3170": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "3171": [
+      "HASTE_LOOP",
+      "AP_SPELL"
+    ],
+    "3172": [
+      "HASTE_LOOP",
+      "SHIELD_HEAL"
+    ],
+    "3173": [
+      "ULT_CYCLE",
+      "TANK_HP"
+    ],
+    "3262": [
+      "TANK_HP"
+    ],
+    "3263": [
+      "TANK_HP"
+    ],
+    "3264": [
+      "SHIELD_HEAL",
+      "TANK_HP"
+    ],
+    "3265": [
+      "TANK_HP"
+    ],
+    "12317": [
+      "GAMBLE_HIGHROLL"
+    ]
+  }
+}

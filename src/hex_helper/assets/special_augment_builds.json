@@ -1,0 +1,2392 @@
+{
+  "schema_version": 1,
+  "patch": "26.23 (16.23)",
+  "updated_at": "2026-11-21",
+  "archetypes": [
+    {
+      "id": "3163",
+      "name": "迷人蝴蝶",
+      "aliases": [
+        "小蝴蝶",
+        "蝴蝶"
+      ],
+      "rarity": "gold",
+      "archetype": "治疗护盾蝴蝶爆发流",
+      "mechanic": "给友军治疗或套盾时积聚蝴蝶，满7只后伤敌齐射高额魔法伤害",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.4,
+      "core_items": [
+        "6617",
+        "2526",
+        "3504",
+        "6616",
+        "3107",
+        "6621"
+      ],
+      "force_items": [
+        "6617"
+      ],
+      "required_tags": [
+        "ManaRegen"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先堆治疗护盾强度与技能急速，避免纯肉或无急速装备",
+      "playstyle_tip": "高频给队友套盾回血叠满7只蝴蝶，再摸敌方打齐射爆发"
+    },
+    {
+      "id": "3086",
+      "name": "小蜜蜂！！！",
+      "aliases": [
+        "小蜜蜂",
+        "蜂巢"
+      ],
+      "rarity": "gold",
+      "archetype": "技能触发4段攻击特效流",
+      "mechanic": "技能命中投掷蜂巢，2秒AOE魔伤+减速并触发4次40%效能攻击特效",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.6,
+      "core_items": [
+        "3115",
+        "6672",
+        "3153",
+        "3124",
+        "2510",
+        "3118",
+        "4645"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "OnHit"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "特效装收益翻倍，优先纳什/破败/海妖/黄昏与黎明触发蜂巢多段特效",
+      "playstyle_tip": "卡好蜂巢冷却用远程技能丢人堆，1个技能直接拉满4段攻击特效"
+    },
+    {
+      "id": "3048",
+      "name": "弹跳蜜蜂",
+      "aliases": [
+        "大蜜蜂",
+        "弹射蜜蜂"
+      ],
+      "rarity": "prismatic",
+      "archetype": "技能接弹射普攻流",
+      "mechanic": "施放技能后下一次普攻弹射附近敌方，任务升级永久+AD并增加弹射次数",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [
+        "6676",
+        "3031",
+        "3036",
+        "3085",
+        "3153",
+        "6672"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike",
+        "OnHit"
+      ],
+      "stat_keys": [
+        "FlatPhysicalDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "堆高单发AD/暴击或特效放大弹射AOE收益",
+      "playstyle_tip": "技能穿插平A触发弹射，前期积极摸敌方英雄叠满弹射层数"
+    },
+    {
+      "id": "3058",
+      "name": "嗡嗡怪兽",
+      "aliases": [
+        "攻速转化",
+        "AD转攻速"
+      ],
+      "rarity": "gold",
+      "archetype": "纯高AD转极致攻速特效流",
+      "mechanic": "装备额外攻击力全部转化为攻速(每10AD转17.5%攻速)并附带魔法特效",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 4.8,
+      "core_items": [
+        "3074",
+        "3072",
+        "3031",
+        "6676",
+        "3036",
+        "3004",
+        "2517"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Damage"
+      ],
+      "stat_keys": [
+        "FlatPhysicalDamageMod"
+      ],
+      "penalize_tags": [
+        "AttackSpeed"
+      ],
+      "avoid_note": "严禁出无AD纯攻速装(如飓风/绿叉)，无脑堆最高面板AD收益最大",
+      "playstyle_tip": "出高面板AD装备即可自带拉满攻速，专注走A打魔法特效输出"
+    },
+    {
+      "id": "1015",
+      "name": "死亡之环",
+      "aliases": [
+        "死环",
+        "奶伤转换"
+      ],
+      "rarity": "prismatic",
+      "archetype": "极限回复/生命转魔法轰击流",
+      "mechanic": "施加的治疗与生命回复约70%转化为魔法伤害直接轰击最近敌方英雄",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.8,
+      "core_items": [
+        "3083",
+        "3065",
+        "3084",
+        "6617",
+        "3107",
+        "2502",
+        "4633",
+        "3146",
+        "6610"
+      ],
+      "force_items": [
+        "3065"
+      ],
+      "required_tags": [
+        "HealthRegen",
+        "LifeSteal",
+        "SpellVamp"
+      ],
+      "stat_keys": [
+        "PercentLifeStealMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "振奋盔甲+狂徒/月石/无终恨意/科技枪可让回血直接变炮台轰炸",
+      "playstyle_tip": "堆满回血与振奋加成，拉近距离靠持续回血与治疗直接把对面电死"
+    },
+    {
+      "id": "3049",
+      "name": "装甲冲击",
+      "aliases": [
+        "护甲冲击",
+        "护甲A人"
+      ],
+      "rarity": "gold",
+      "archetype": "全护甲技能接A核爆流",
+      "mechanic": "放技能后10秒内下一次普攻对周围造成额外物理伤害，伤害与范围吃护甲加成",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "TANK",
+      "boost": 4.8,
+      "core_items": [
+        "3110",
+        "3075",
+        "3143",
+        "6662",
+        "3068",
+        "2502",
+        "6665",
+        "6333",
+        "3157"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Armor"
+      ],
+      "stat_keys": [
+        "FlatArmorMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先高护甲+技能急速装备(冰心/冰脉/反甲/兰顿/无终恨意)，少出无护甲纯血装",
+      "playstyle_tip": "技能后务必接一发普攻打满高护甲AOE冲击，肉度与伤害双丰收"
+    },
+    {
+      "id": "3059",
+      "name": "没法力，没问题",
+      "aliases": [
+        "没法力",
+        "蓝转法强"
+      ],
+      "rarity": "silver",
+      "archetype": "蓝量转AP高法强流",
+      "mechanic": "装备法力值转化为法强(每10蓝≈0.8AP)且总法强提升15%",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AP",
+      "boost": 4.4,
+      "core_items": [
+        "3003",
+        "6655",
+        "6657",
+        "3118",
+        "2503",
+        "3089",
+        "3110"
+      ],
+      "force_items": [
+        "3003"
+      ],
+      "required_tags": [
+        "Mana"
+      ],
+      "stat_keys": [
+        "FlatMPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "高蓝量装备(大天使/卢登/时光/残疫/黯炎)直接双吃蓝转AP+15%总AP乘区",
+      "playstyle_tip": "尽早挂女神之泪合炽天使，配合大帽让总AP呈指数暴涨"
+    },
+    {
+      "id": "1056",
+      "name": "由心及物",
+      "aliases": [
+        "蓝转血",
+        "心灵与物质"
+      ],
+      "rarity": "silver",
+      "archetype": "蓝量转海量生命法坦流",
+      "mechanic": "按最大法力值比例获得巨额额外最大生命值",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.4,
+      "core_items": [
+        "6657",
+        "3003",
+        "3119",
+        "3110",
+        "6655",
+        "2503",
+        "3084"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Mana"
+      ],
+      "stat_keys": [
+        "FlatMPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "时光+炽天使/凛冬之临+冰心可白嫖上千血量，法坦容错拉满",
+      "playstyle_tip": "多出带蓝量与抗性的装备，靠超高血条顶前排打持续输出"
+    },
+    {
+      "id": "3063",
+      "name": "溺水之赠礼",
+      "aliases": [
+        "血转穿甲",
+        "生命转穿甲"
+      ],
+      "rarity": "silver",
+      "archetype": "半肉血量转极限穿甲流",
+      "mechanic": "装备额外生命值全部转化为固定穿甲，并自带额外穿甲",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 4.6,
+      "core_items": [
+        "3071",
+        "6610",
+        "3748",
+        "3053",
+        "3161",
+        "6631",
+        "3084"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先黑切/焚天/巨九/血手/朔极等高血量战士装，比纯脆皮穿甲装穿甲更高更肉",
+      "playstyle_tip": "出高血量战士半肉即可自带破百穿甲，直接进场追着脆皮砍"
+    },
+    {
+      "id": "1092",
+      "name": "易损",
+      "aliases": [
+        "装备暴击",
+        "持续伤害暴击"
+      ],
+      "rarity": "gold",
+      "archetype": "装备特效与DoT暴击流",
+      "mechanic": "装备伤害效果与技能持续伤害(DoT)可以暴击，并提供暴击率",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.4,
+      "core_items": [
+        "6653",
+        "2503",
+        "4645",
+        "3430",
+        "4646",
+        "3153",
+        "6672",
+        "6676",
+        "3031"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "面具/黯炎/影焰/风暴狂涌/破败/海妖全部吃暴击加成，配无尽伤害爆炸",
+      "playstyle_tip": "优先出带装备伤害或灼烧特效的核心装，配合暴击把特效拉满"
+    },
+    {
+      "id": "1029",
+      "name": "虚幻武器",
+      "aliases": [
+        "技能特效",
+        "技能带特效"
+      ],
+      "rarity": "gold",
+      "archetype": "技能施加攻击特效流",
+      "mechanic": "技能命中敌方直接施加攻击特效(含纳什/破败/海妖/咒刃等)",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.4,
+      "core_items": [
+        "3115",
+        "3153",
+        "6672",
+        "3100",
+        "2510",
+        "3091",
+        "3124",
+        "3078"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "OnHit"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先高收益攻击特效装(纳什/破败/巫妖/黄昏/海妖)，技能远距离直接打特效",
+      "playstyle_tip": "靠高频技能远程触发破败/纳什/咒刃特效消耗，无需冒险贴脸平A"
+    },
+    {
+      "id": "1002",
+      "name": "尖端发明家",
+      "aliases": [
+        "装备急速",
+        "发明家"
+      ],
+      "rarity": "gold",
+      "archetype": "100装备急速主动/内置CD流",
+      "mechanic": "获得100装备急速(所有装备主动与内置冷却时间减半)",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.4,
+      "core_items": [
+        "3084",
+        "2502",
+        "6610",
+        "3157",
+        "6655",
+        "3100",
+        "3003",
+        "3119",
+        "3107",
+        "3190",
+        "6692"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Active"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先带内置CD的质变装(心之钢/无终恨意/焚天/星蚀/中娅/炽天使/凛冬/卢登)",
+      "playstyle_tip": "心之钢与无终恨意CD砍半，积极贴身换血高频触发装备被动"
+    },
+    {
+      "id": "1048",
+      "name": "珠光护手",
+      "aliases": [
+        "技能暴击",
+        "珠光"
+      ],
+      "rarity": "prismatic",
+      "archetype": "技能暴击核爆流",
+      "mechanic": "所有技能均可暴击，且随法强额外获得暴击率",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.2,
+      "core_items": [
+        "3031",
+        "3430",
+        "4645",
+        "3089",
+        "6676",
+        "3036",
+        "3033"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "AP英雄可出毁坏仪式(3430)+无尽之刃(3031)放大技能暴击倍率与暴击护盾，影焰+大帽一招秒",
+      "playstyle_tip": "堆高法强/暴击与法穿，抓准敌方脆皮无闪现窗口一套技能暴击秒杀"
+    },
+    {
+      "id": "3123",
+      "name": "珠光手镯",
+      "aliases": [
+        "单技能暴击"
+      ],
+      "rarity": "gold",
+      "archetype": "指定核心技能暴击流",
+      "mechanic": "所选指定技能可造成暴击并提供额外暴击率",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3031",
+        "3430",
+        "4645",
+        "3089",
+        "6676"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "围绕可暴击的核心技能堆高爆发与穿透，视阵容可补无尽或收集者",
+      "playstyle_tip": "把核心暴击技能留给关键脆皮或斩杀收割"
+    },
+    {
+      "id": "1205",
+      "name": "物理转魔法",
+      "aliases": [
+        "物转法"
+      ],
+      "rarity": "silver",
+      "archetype": "AD英雄转纯AP法核流",
+      "mechanic": "所有额外攻击力转化为法术强度，彻底切换AP输出路线",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AP",
+      "boost": 4.2,
+      "core_items": [
+        "3089",
+        "4645",
+        "3115",
+        "6655",
+        "6653",
+        "2503",
+        "3135"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "SpellDamage"
+      ],
+      "stat_keys": [
+        "FlatMagicDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "直接按纯AP法师出装，大帽+法穿收益拉满",
+      "playstyle_tip": "依托高额法强打技能爆发与远程消耗"
+    },
+    {
+      "id": "1206",
+      "name": "魔法转物理",
+      "aliases": [
+        "法转物"
+      ],
+      "rarity": "silver",
+      "archetype": "AP英雄转高AD暴击/穿甲流",
+      "mechanic": "所有法术强度转化为攻击力，彻底切换物理输出路线",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 4.2,
+      "core_items": [
+        "3031",
+        "6676",
+        "3153",
+        "3036",
+        "3072",
+        "6696"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Damage"
+      ],
+      "stat_keys": [
+        "FlatPhysicalDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "直接走高AD/穿甲/暴击物理路线，大帽等纯AP转化效率不如直接出暴击穿甲",
+      "playstyle_tip": "利用高额面板AD穿插平A与物理技能打爆发"
+    },
+    {
+      "id": "1353",
+      "name": "坦克引擎",
+      "aliases": [
+        "无限叠血"
+      ],
+      "rarity": "gold",
+      "archetype": "击杀无限叠血巨兽流",
+      "mechanic": "参与击杀叠加最大生命值与体型(阵亡损失部分层数)",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "TANK",
+      "boost": 4.4,
+      "core_items": [
+        "3084",
+        "3083",
+        "2502",
+        "3748",
+        "3068",
+        "6665"
+      ],
+      "force_items": [
+        "3084"
+      ],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "心之钢+狂徒+无终恨意+巨九把血量与存活率拉满，尽量少送头保层数",
+      "playstyle_tip": "残血拉扯用狂徒回满绝不白给，稳保引擎层数滚成万年血牛"
+    },
+    {
+      "id": "1041",
+      "name": "歌利亚巨人",
+      "aliases": [
+        "歌利亚"
+      ],
+      "rarity": "prismatic",
+      "archetype": "巨型高血高双攻流",
+      "mechanic": "大幅提升最大生命值、英雄体型与自适应之力",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 3.8,
+      "core_items": [
+        "3084",
+        "3083",
+        "3748",
+        "4633",
+        "2502",
+        "3068"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先吃最大血量加成的装备(心之钢/巨九/裂隙/无终恨意)",
+      "playstyle_tip": "利用超大体型帮队友挡关键非指向技能，靠巨额血条碾压团战"
+    },
+    {
+      "id": "1152",
+      "name": "钢化你心",
+      "aliases": [
+        "心之钢任务"
+      ],
+      "rarity": "gold",
+      "archetype": "心之钢专属任务叠钢流",
+      "mechanic": "心之钢专属任务，叠满后生命值加成大幅暴涨",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "TANK",
+      "boost": 5.5,
+      "core_items": [
+        "3084",
+        "3083",
+        "3748",
+        "2502",
+        "3065"
+      ],
+      "force_items": [
+        "3084"
+      ],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "第一件必直奔心之钢(3084)尽早做完任务，后续接巨九/无终恨意/狂徒",
+      "playstyle_tip": "第一件火速出心之钢，积极贴脸敲钢早日完成任务质变"
+    },
+    {
+      "id": "1156",
+      "name": "沃格勒特的巫师帽",
+      "aliases": [
+        "巫师帽",
+        "大帽任务"
+      ],
+      "rarity": "prismatic",
+      "archetype": "大帽+中娅合体任务流",
+      "mechanic": "同时拥有大帽与中娅后完成任务合成超模沃格勒特巫师帽",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AP",
+      "boost": 5.5,
+      "core_items": [
+        "3089",
+        "3157",
+        "4645",
+        "3135"
+      ],
+      "force_items": [
+        "3089",
+        "3157"
+      ],
+      "required_tags": [
+        "SpellDamage"
+      ],
+      "stat_keys": [
+        "FlatMagicDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先凑齐大帽(3089)+中娅(3157)触发任务合体，自带金身+逆天法强",
+      "playstyle_tip": "尽快做齐大帽与中娅合体成超级巫师帽，团战输出保命双满"
+    },
+    {
+      "id": "1324",
+      "name": "蛋白粉奶昔",
+      "aliases": [
+        "双抗转奶",
+        "奶昔"
+      ],
+      "rarity": "prismatic",
+      "archetype": "双抗转高额治疗护盾流",
+      "mechanic": "额外护甲与魔抗直接转化为高额治疗和护盾强度",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.4,
+      "core_items": [
+        "6665",
+        "3050",
+        "3190",
+        "3110",
+        "3065",
+        "6617",
+        "3107"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Armor",
+        "SpellBlock"
+      ],
+      "stat_keys": [
+        "FlatArmorMod",
+        "FlatSpellBlockMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "出贾修/基克/鸟盾/冰心/振奋等高双抗装备，又肉又能把队友奶爆",
+      "playstyle_tip": "出肉装即可获得逆天治疗护盾强度，直接顶在前面保C打反手"
+    },
+    {
+      "id": "1118",
+      "name": "会心治疗",
+      "aliases": [
+        "治疗暴击"
+      ],
+      "rarity": "gold",
+      "archetype": "暴击治疗/护盾流",
+      "mechanic": "提供暴击率且治疗与护盾效果可暴击大幅增幅",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.8,
+      "core_items": [
+        "6617",
+        "2526",
+        "3107",
+        "3504",
+        "6616",
+        "6621",
+        "6673",
+        "3072"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike",
+        "ManaRegen"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "软辅补月石/救赎/香炉，战士AD可搭盾弓/饮血放大暴击吸血",
+      "playstyle_tip": "残血时一发暴击大奶/护盾直接逆转团战"
+    },
+    {
+      "id": "1095",
+      "name": "风语者的祝福",
+      "aliases": [
+        "风语者"
+      ],
+      "rarity": "prismatic",
+      "archetype": "群体治疗护盾加双抗流",
+      "mechanic": "施加治疗与护盾时额外赋予目标高额护甲与魔抗",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [
+        "6617",
+        "2526",
+        "3504",
+        "6616",
+        "3107",
+        "6621",
+        "3222"
+      ],
+      "force_items": [
+        "6617"
+      ],
+      "required_tags": [
+        "ManaRegen"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "月石+救赎+流水+香炉让全队常驻高额双抗",
+      "playstyle_tip": "开团瞬间先交群体护盾/治疗给前排套满双抗再反打"
+    },
+    {
+      "id": "1141",
+      "name": "全心为你",
+      "aliases": [
+        "单体强奶"
+      ],
+      "rarity": "gold",
+      "archetype": "单核保C极致奶盾流",
+      "mechanic": "对单一友军的治疗与护盾效果大幅强化",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.4,
+      "core_items": [
+        "6617",
+        "2526",
+        "3222",
+        "3504",
+        "6616",
+        "3107",
+        "6621"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "ManaRegen"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先月石/米凯尔/香炉/黎明核心，死保队内最肥大核",
+      "playstyle_tip": "所有奶盾技能集中灌给队内核心C位"
+    },
+    {
+      "id": "1045",
+      "name": "炼狱导管",
+      "aliases": [
+        "灼烧减CD"
+      ],
+      "rarity": "prismatic",
+      "archetype": "双烧无限减CD流",
+      "mechanic": "技能附加可叠加灼烧，所有灼烧伤害跳动均缩减基础技能冷却",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AP",
+      "boost": 4.6,
+      "core_items": [
+        "6653",
+        "2503",
+        "3116",
+        "4633",
+        "8010"
+      ],
+      "force_items": [
+        "6653",
+        "2503"
+      ],
+      "required_tags": [
+        "SpellDamage"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "兰德里(6653)+黯炎火炬(2503)双烧必出，持续跳烧让小技能几乎零CD",
+      "playstyle_tip": "靠双烧持续刷新所有基础技能，保持安全距离无限甩技能滚键盘"
+    },
+    {
+      "id": "1058",
+      "name": "秘术冲拳",
+      "aliases": [
+        "平A减CD"
+      ],
+      "rarity": "prismatic",
+      "archetype": "高攻速平A刷技能流",
+      "mechanic": "攻击特效命中大幅缩减所有基础技能冷却时间",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [
+        "3153",
+        "3124",
+        "3091",
+        "3115",
+        "3085",
+        "6672"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AttackSpeed",
+        "OnHit"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先高攻速+特效装(破败/羊刀/纳什/飓风)，攻速越快技能刷新越离谱",
+      "playstyle_tip": "粘着前排不停平A把位移和控制技能刷成无限连"
+    },
+    {
+      "id": "1225",
+      "name": "双刀流",
+      "aliases": [
+        "双倍特效"
+      ],
+      "rarity": "prismatic",
+      "archetype": "双倍攻击特效机关枪流",
+      "mechanic": "大幅提升攻速并触发额外普攻/攻击特效判定",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 4.2,
+      "core_items": [
+        "3153",
+        "3124",
+        "6672",
+        "3091",
+        "3302",
+        "3115",
+        "3085"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "OnHit",
+        "AttackSpeed"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "破败+羊刀+界弓/海妖/纳什收益翻倍，少出纯慢速穿甲装",
+      "playstyle_tip": "拉满特效三件套站桩融化一切前排"
+    },
+    {
+      "id": "1081",
+      "name": "踢踏舞",
+      "aliases": [
+        "平A叠移速攻速"
+      ],
+      "rarity": "prismatic",
+      "archetype": "无限叠速走A风筝流",
+      "mechanic": "普攻叠加移速并将移速转化为高额攻速",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.8,
+      "core_items": [
+        "3153",
+        "6672",
+        "3085",
+        "3046",
+        "3124",
+        "3091"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AttackSpeed",
+        "NonbootsMovement",
+        "OnHit"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "配移速特效装(破败/绿叉/飓风/海妖)，叠起来移速拉满随便风筝",
+      "playstyle_tip": "团战先A前排叠起移速攻速，再凭借超高移速拉扯收割"
+    },
+    {
+      "id": "1077",
+      "name": "灵魂虹吸",
+      "aliases": [
+        "暴击吸血"
+      ],
+      "rarity": "gold",
+      "archetype": "暴击高吸血站撸流",
+      "mechanic": "暴击附带高额全能/生命偷取并送暴击率",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3031",
+        "3032",
+        "3085",
+        "3036",
+        "6676",
+        "6673"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先拉满100%暴击(无尽+育恩塔尔/飓风/轻语)，自带超强续航可省吸血装",
+      "playstyle_tip": "拉满暴击率即可越A越满血，注意防敌方强控秒杀"
+    },
+    {
+      "id": "1328",
+      "name": "暴击律动",
+      "aliases": [
+        "暴击叠攻速"
+      ],
+      "rarity": "gold",
+      "archetype": "满暴击高攻速流",
+      "mechanic": "暴击时叠加高额攻击速度",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3031",
+        "3032",
+        "3085",
+        "3036",
+        "6676"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先凑高暴击+高AD(无尽/收集者/轻语)，攻速交给符文补足",
+      "playstyle_tip": "优先出高暴击伤害大件，打出暴击自动起飞"
+    },
+    {
+      "id": "1072",
+      "name": "炽烈黎明",
+      "aliases": [
+        "技能标记队友触发"
+      ],
+      "rarity": "gold",
+      "archetype": "高频技能标记增伤流",
+      "mechanic": "技能标记敌方，被友军下次攻击或技能命中引爆额外最大生命值魔法伤害",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.2,
+      "core_items": [
+        "6653",
+        "2503",
+        "4629",
+        "4645",
+        "6655"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AbilityHaste",
+        "SpellDamage"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先高急速+AOE持续伤害装(面具/黯炎/星界驱驰)高频挂标",
+      "playstyle_tip": "高频往人堆铺AOE技能给队友疯狂提供额外引爆伤害"
+    },
+    {
+      "id": "3051",
+      "name": "蓝色屏障",
+      "aliases": [
+        "耗蓝套盾"
+      ],
+      "rarity": "silver",
+      "archetype": "高蓝耗高频刷盾流",
+      "mechanic": "施放技能消耗法力时按比例获得临时护盾",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.2,
+      "core_items": [
+        "3003",
+        "6655",
+        "3118",
+        "6657",
+        "2503"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Mana"
+      ],
+      "stat_keys": [
+        "FlatMPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "搭配炽天使双盾+高急速蓝量装，生存容错大增",
+      "playstyle_tip": "持续施法即可不断刷新白盾换血，敢于顶着消耗打反手"
+    },
+    {
+      "id": "1311",
+      "name": "溢流",
+      "aliases": [
+        "高频施法回蓝"
+      ],
+      "rarity": "gold",
+      "archetype": "超高蓝耗技能增幅流",
+      "mechanic": "提高技能蓝耗以换取巨额技能伤害/治疗与冷却循环收益",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.4,
+      "core_items": [
+        "3003",
+        "6655",
+        "2503",
+        "3118",
+        "6657",
+        "4629"
+      ],
+      "force_items": [
+        "3003"
+      ],
+      "required_tags": [
+        "Mana"
+      ],
+      "stat_keys": [
+        "FlatMPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "必配高蓝量/回蓝装(大天使/卢登/黯炎)支撑加倍蓝耗",
+      "playstyle_tip": "蓝量充足时疯狂甩技能压血线，注意别空蓝"
+    },
+    {
+      "id": "1379",
+      "name": "升级：花晓之剑",
+      "aliases": [
+        "花晓升级",
+        "花剑"
+      ],
+      "rarity": "prismatic",
+      "archetype": "花晓之剑机关枪奶人流",
+      "mechanic": "获得高额攻速，对敌方英雄的普攻大幅提升花晓之剑的治疗效果",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 6.5,
+      "core_items": [
+        "4011",
+        "6617",
+        "3504",
+        "3115",
+        "3091",
+        "3085"
+      ],
+      "force_items": [
+        "4011"
+      ],
+      "required_tags": [
+        "AttackSpeed",
+        "ManaRegen"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "第一件必出花晓之剑(4011)，后续配月石/香炉/纳什/飓风化身移动泉水",
+      "playstyle_tip": "出完花晓之剑后疯狂平A敌方前排，靠250%治疗把全队奶成不死之身"
+    },
+    {
+      "id": "1336",
+      "name": "升级：无尽之刃",
+      "aliases": [
+        "无尽升级"
+      ],
+      "rarity": "gold",
+      "archetype": "无尽之刃超级暴击流",
+      "mechanic": "专属升级无尽之刃，大幅强化暴击伤害上限",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "AD",
+      "boost": 6.2,
+      "core_items": [
+        "3031",
+        "6676",
+        "3032",
+        "3036",
+        "3085"
+      ],
+      "force_items": [
+        "3031"
+      ],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "核心必出无尽之刃(3031)并尽早叠高暴击率吃满升级被动",
+      "playstyle_tip": "火速合成无尽之刃+暴击套件，两发暴击点融脆皮"
+    },
+    {
+      "id": "2143",
+      "name": "升级：焚天",
+      "aliases": [
+        "焚天升级"
+      ],
+      "rarity": "gold",
+      "archetype": "焚天超级续航战士流",
+      "mechanic": "大幅缩短焚天单目标冷却并强化已损失生命值治疗，同时赠送金币",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 6.2,
+      "core_items": [
+        "6610",
+        "3071",
+        "6333",
+        "3053",
+        "3065"
+      ],
+      "force_items": [
+        "6610"
+      ],
+      "required_tags": [
+        "Health",
+        "Damage"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "必出焚天(6610)配死舞/血手/振奋把进场回血拉满",
+      "playstyle_tip": "团战逐个切换目标平A高频触发强化焚天回血"
+    },
+    {
+      "id": "1996",
+      "name": "升级：耀光",
+      "aliases": [
+        "耀光升级"
+      ],
+      "rarity": "gold",
+      "archetype": "耀光咒刃强化流",
+      "mechanic": "咒刃额外造成目标最大生命值伤害并等比治疗自身，同时赠送250金币",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 5.5,
+      "core_items": [
+        "3078",
+        "3100",
+        "6662",
+        "2510",
+        "3508"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "OnHit"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "必出至少一件耀光成装(三相/巫妖/冰脉/黄昏与黎明/吸蓝刀)",
+      "playstyle_tip": "技能穿插平A卡好咒刃CD打满强化耀光爆发"
+    },
+    {
+      "id": "2140",
+      "name": "升级：贪欲九头蛇",
+      "aliases": [
+        "贪欲升级"
+      ],
+      "rarity": "gold",
+      "archetype": "贪欲九头蛇群体吸血顺劈流",
+      "mechanic": "技能命中即可触发九头蛇顺劈，大幅提升贪欲生命偷取并赠送金币",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 6.2,
+      "core_items": [
+        "3074",
+        "6333",
+        "3071",
+        "6610",
+        "2517"
+      ],
+      "force_items": [
+        "3074"
+      ],
+      "required_tags": [
+        "Damage",
+        "LifeSteal"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先直出贪欲九头蛇(3074)接死舞/黑切/焚天",
+      "playstyle_tip": "进人堆按贪欲主动瞬间顺劈回满血"
+    },
+    {
+      "id": "3150",
+      "name": "升级：风暴狂涌",
+      "aliases": [
+        "风暴升级"
+      ],
+      "rarity": "gold",
+      "archetype": "风暴狂涌高法穿秒杀流",
+      "mechanic": "风暴狂涌风啸必定范围引爆造成最大生命值魔法伤害并连锁标记附近敌方，赠送金币",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AP",
+      "boost": 6.2,
+      "core_items": [
+        "4646",
+        "4645",
+        "3089",
+        "3135"
+      ],
+      "force_items": [
+        "4646"
+      ],
+      "required_tags": [
+        "SpellDamage",
+        "MagicPenetration"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "首件必出风暴狂涌(4646)接影焰+大帽拉满双法穿秒脆皮",
+      "playstyle_tip": "一套打掉35%血立刻触发强化风暴雷电瞬秒后排"
+    },
+    {
+      "id": "1318",
+      "name": "升级：中娅",
+      "aliases": [
+        "中娅升级",
+        "金身升级"
+      ],
+      "rarity": "silver",
+      "archetype": "中娅沙漏保命开团流",
+      "mechanic": "中娅沙漏冷却大幅缩短，且在凝滞期间可自由移动并获得移速加成",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 5.8,
+      "core_items": [
+        "3157",
+        "3089",
+        "4645"
+      ],
+      "force_items": [
+        "3157"
+      ],
+      "required_tags": [
+        "SpellDamage"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "必出中娅沙漏(3157)吃满升级特效，进场开团容错极大",
+      "playstyle_tip": "大胆进场吃第一波关键技能后开强化金身走位拉扯或追击"
+    },
+    {
+      "id": "1320",
+      "name": "升级：收集者",
+      "aliases": [
+        "收集者升级"
+      ],
+      "rarity": "silver",
+      "archetype": "收集者高斩杀穿甲暴击流",
+      "mechanic": "专属强化收集者斩杀线与额外赏金收益",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "AD",
+      "boost": 6.0,
+      "core_items": [
+        "6676",
+        "3031",
+        "3036",
+        "6697"
+      ],
+      "force_items": [
+        "6676"
+      ],
+      "required_tags": [
+        "CriticalStrike",
+        "ArmorPenetration"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "第一件火速直出收集者(6676)吃满前期斩杀与滚雪球赏金",
+      "playstyle_tip": "首件收集者积极收残血滚起经济雪球"
+    },
+    {
+      "id": "2157",
+      "name": "升级：死亡之舞",
+      "aliases": [
+        "死舞升级"
+      ],
+      "rarity": "silver",
+      "archetype": "死亡之舞战神收割流",
+      "mechanic": "专属强化死亡之舞延迟伤害减免与参与击杀清除回血",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "AD",
+      "boost": 5.8,
+      "core_items": [
+        "6333",
+        "6610",
+        "3071",
+        "3053",
+        "3074"
+      ],
+      "force_items": [
+        "6333"
+      ],
+      "required_tags": [
+        "Damage",
+        "Armor"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "必出死亡之舞(6333)接焚天/血手，团战拿到助攻即死不了",
+      "playstyle_tip": "盯准残血拿参与击杀不断清除流血并回满血条"
+    },
+    {
+      "id": "1319",
+      "name": "升级：献祭",
+      "aliases": [
+        "日炎升级",
+        "献祭升级"
+      ],
+      "rarity": "silver",
+      "archetype": "日炎/璀璨回响献祭印钞流",
+      "mechanic": "赠送250金币，日炎圣盾与璀璨回响每次献祭跳伤均额外提供金币收益",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "TANK",
+      "boost": 6.0,
+      "core_items": [
+        "3068",
+        "6664",
+        "3084",
+        "2502",
+        "3065",
+        "6665"
+      ],
+      "force_items": [
+        "3068",
+        "6664"
+      ],
+      "required_tags": [
+        "Health",
+        "Armor",
+        "SpellBlock"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "敌AD多出日炎圣盾(3068)、敌AP多出璀璨回响(6664)，后续堆血量放大献祭伤害",
+      "playstyle_tip": "第一件火速做出日炎或璀璨回响贴脸烫人疯狂印钞，靠经济碾压成型"
+    },
+    {
+      "id": "2141",
+      "name": "终极九头蛇",
+      "aliases": [
+        "九头蛇流"
+      ],
+      "rarity": "prismatic",
+      "archetype": "三九头蛇合体任务流",
+      "mechanic": "每完成一件九头蛇赠送提亚马特；任务：同时持有贪欲(3074)+亵渎(6698)+巨型(3748)合体终极九头蛇",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 5.6,
+      "core_items": [
+        "3074",
+        "3748",
+        "6698",
+        "6333",
+        "3053"
+      ],
+      "force_items": [
+        "3074",
+        "3748",
+        "6698"
+      ],
+      "required_tags": [
+        "OnHit",
+        "Damage"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "核心任务必须凑齐贪欲(3074)+巨型(3748)+亵渎(6698)三件九头蛇触发合体",
+      "playstyle_tip": "优先依次做出三把九头蛇，利用赠送提亚马特加速合成终极九头蛇质变"
+    },
+    {
+      "id": "3081",
+      "name": "命运之武器",
+      "aliases": [
+        "命定武器"
+      ],
+      "rarity": "gold",
+      "archetype": "首件传说装绑定质变流",
+      "mechanic": "绑定特定传说成装大幅提升其综合强度(按26.23全英雄实测胜率择优)",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [],
+      "force_items": [],
+      "required_tags": [],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "按悬浮窗「命运绑定」实测最高胜率传说装优先合成",
+      "playstyle_tip": "直接以命运实测榜第1名传说装作为核心绑定件"
+    },
+    {
+      "id": "1361",
+      "name": "艾卡西亚的陷落",
+      "aliases": [
+        "虚空献祭",
+        "双日炎任务"
+      ],
+      "rarity": "prismatic",
+      "archetype": "日炎+璀璨回响合体虚空献祭流",
+      "mechanic": "立刻赠送斑比的熔渣；任务：同时持有日炎圣盾(3068)与璀璨回响(6664)合体为超模虚空献祭",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "TANK",
+      "boost": 5.6,
+      "core_items": [
+        "3068",
+        "6664",
+        "3084",
+        "3083",
+        "2502",
+        "3065"
+      ],
+      "force_items": [
+        "3068",
+        "6664"
+      ],
+      "required_tags": [
+        "Health",
+        "Armor",
+        "SpellBlock"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "前两件必直奔日炎圣盾(3068)+璀璨回响(6664)完成合体任务，后续堆血量与无终恨意/振奋",
+      "playstyle_tip": "利用开局白送的斑比熔渣火速凑齐双献祭装合体虚空献祭，贴脸烫融全场"
+    },
+    {
+      "id": "1134",
+      "name": "亮出你的剑",
+      "aliases": [
+        "近战AD",
+        "亮剑"
+      ],
+      "rarity": "prismatic",
+      "archetype": "远程转近战超模战士流",
+      "mechanic": "变为近战状态，按损失射程获得巨额百分比攻击力、生命值、攻速、生命偷取与移速",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "AD",
+      "boost": 4.4,
+      "core_items": [
+        "6333",
+        "3153",
+        "6610",
+        "3074",
+        "3053",
+        "3072",
+        "2517"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Damage",
+        "LifeSteal"
+      ],
+      "stat_keys": [
+        "FlatPhysicalDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "转为近战后可吃满近战版死亡之舞(30%减伤)/破败/血手/焚天/贪欲九头蛇，忌纯脆皮被秒",
+      "playstyle_tip": "凭借逆天面板属性与吸血直接贴脸站撸，死舞+血手+饮血可1打3"
+    },
+    {
+      "id": "3018",
+      "name": "大腕",
+      "aliases": [
+        "攻速转暴伤",
+        "大腕暴击"
+      ],
+      "rarity": "prismatic",
+      "archetype": "攻速转极限暴击伤害流",
+      "mechanic": "获得额外攻击力与暴击伤害，且按比例将攻击速度直接转化为巨额暴击伤害",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "AD",
+      "boost": 4.2,
+      "core_items": [
+        "3031",
+        "3032",
+        "3085",
+        "3046",
+        "6676",
+        "3036",
+        "3094"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike",
+        "AttackSpeed"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod",
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先暴击+攻速双属性装备(育恩塔尔/飓风/绿叉/火炮)配无尽，同时吃满暴击率与攻速转暴伤",
+      "playstyle_tip": "拉满100%暴击并堆攻速，一发暴击直接打出核爆级单发伤害"
+    },
+    {
+      "id": "2018",
+      "name": "纯粹主义者 - 术师",
+      "aliases": [
+        "攻速转急速",
+        "术师"
+      ],
+      "rarity": "silver",
+      "archetype": "攻速转超高技能急速流",
+      "mechanic": "获得冷却缩减并将所有攻击速度转化为高额技能急速",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [
+        "3115",
+        "2510",
+        "3087",
+        "3078",
+        "3091",
+        "3153",
+        "6672"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AttackSpeed",
+        "AbilityHaste"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "AP优先纳什之牙/黄昏与黎明，AD优先电刀/三相/智慧末刃，白嫖极高技能急速",
+      "playstyle_tip": "靠高攻速装备换取超高技能急速，团战无限循环技能输出"
+    },
+    {
+      "id": "2010",
+      "name": "双发快射",
+      "aliases": [
+        "暴击双特效"
+      ],
+      "rarity": "prismatic",
+      "archetype": "暴击触发双倍攻击特效流",
+      "mechanic": "提供暴击率，且每次暴击额外触发一次攻击特效",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 4.2,
+      "core_items": [
+        "3153",
+        "6672",
+        "3032",
+        "3085",
+        "3031",
+        "3124",
+        "3302"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike",
+        "OnHit"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "破败/海妖/羊刀/界弓搭配育恩塔尔/飓风/无尽，暴击与攻击特效双乘区联动",
+      "playstyle_tip": "保证高暴击率的同时补强力特效装，点前排和脆皮同样融化"
+    },
+    {
+      "id": "2016",
+      "name": "注魔",
+      "aliases": [
+        "特效暴击"
+      ],
+      "rarity": "silver",
+      "archetype": "攻击特效魔法暴击流",
+      "mechanic": "攻击特效附带额外魔法伤害，且该特效魔法伤害可以暴击",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3115",
+        "3153",
+        "6672",
+        "3085",
+        "3032",
+        "3031",
+        "2510",
+        "3124"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "OnHit",
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先兼具特效与暴击的攻速套件(破败/海妖/飓风/育恩塔尔/纳什/羊刀)",
+      "playstyle_tip": "高频平A触发可暴击的魔法特效，持续输出极高"
+    },
+    {
+      "id": "1129",
+      "name": "神射法师",
+      "aliases": [
+        "法强平A",
+        "AP平A"
+      ],
+      "rarity": "gold",
+      "archetype": "高法强平A双伤法核流",
+      "mechanic": "每次普攻附带高额法术强度加成的额外物理伤害",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "AP",
+      "boost": 4.0,
+      "core_items": [
+        "3115",
+        "2510",
+        "3089",
+        "3100",
+        "4645",
+        "4633"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "SpellDamage",
+        "AttackSpeed"
+      ],
+      "stat_keys": [
+        "FlatMagicDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "纳什之牙+黄昏与黎明+大帽让平A同时打出爆炸物法混伤，对线与推塔极快",
+      "playstyle_tip": "技能间隙积极穿插平A，靠高法强加成平A打满混伤让对手双抗难防"
+    },
+    {
+      "id": "1030",
+      "name": "尤里卡",
+      "aliases": [
+        "法强转急速",
+        "AP转CD"
+      ],
+      "rarity": "prismatic",
+      "archetype": "极致高法强转无限急速流",
+      "mechanic": "按法术强度比例转化为巨额技能急速",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "AP",
+      "boost": 3.8,
+      "core_items": [
+        "3089",
+        "4645",
+        "6655",
+        "3003",
+        "2503",
+        "3135"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "SpellDamage"
+      ],
+      "stat_keys": [
+        "FlatMagicDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "无脑堆最高法强(大帽/影焰/卢登/炽天使)，大帽总法强加成同步放大技能急速",
+      "playstyle_tip": "尽早做出大帽让法强与技能急速双重起飞，高爆发+短CD压制全场"
+    },
+    {
+      "id": "1054",
+      "name": "物法皆修",
+      "aliases": [
+        "双修叠攻",
+        "平A叠AP"
+      ],
+      "rarity": "prismatic",
+      "archetype": "攻速技能双修无限叠攻流",
+      "mechanic": "每次普攻无限叠加法术强度，每次技能伤敌无限叠加攻击力",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [
+        "3115",
+        "2510",
+        "3124",
+        "3146",
+        "3153",
+        "3089",
+        "3087"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AttackSpeed",
+        "OnHit"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先高攻速与双修特效装(纳什/黄昏与黎明/羊刀/科技枪/电刀)，叠满层数双攻爆炸",
+      "playstyle_tip": "拉长团战持续平A穿插技能滚起巨额双攻层数"
+    },
+    {
+      "id": "1181",
+      "name": "重量级打击手",
+      "aliases": [
+        "血量平A",
+        "重击手"
+      ],
+      "rarity": "silver",
+      "archetype": "最大生命值普攻重击流",
+      "mechanic": "每次普攻附带基于自身最大生命值的额外物理伤害",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3084",
+        "3748",
+        "3083",
+        "2501",
+        "2510",
+        "3078",
+        "6631"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先心之钢/巨型九头蛇/狂徒/霸王血铠/三相/黄昏与黎明，高血条直接转化平A重击",
+      "playstyle_tip": "堆高最大生命值与一定攻速，贴身普攻即可砸出极高额外物理伤害"
+    },
+    {
+      "id": "2102",
+      "name": "高压锅",
+      "aliases": [
+        "生命灼烧",
+        "高压锅任务"
+      ],
+      "rarity": "gold",
+      "archetype": "最大生命叠层光环灼烧流",
+      "mechanic": "每秒对周围敌方施加吃最大生命加成的可叠加灼烧，任务升级永久提升体型与灼烧伤害",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "TANK",
+      "boost": 3.8,
+      "core_items": [
+        "3084",
+        "3083",
+        "2502",
+        "3068",
+        "6664",
+        "3065"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先心之钢/狂徒/无终恨意/日炎/璀璨回响/振奋，血量越高贴脸灼烧越离谱",
+      "playstyle_tip": "主动进人堆站住吃满每秒叠层，快速刷满任务等级成为移动熔炉"
+    },
+    {
+      "id": "1080",
+      "name": "会心防御",
+      "aliases": [
+        "暴击减伤"
+      ],
+      "rarity": "silver",
+      "archetype": "满暴击高减伤站撸流",
+      "mechanic": "提供暴击率，且可用暴击几率触发会心防御大幅降低所受伤害",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3031",
+        "6676",
+        "3032",
+        "3036",
+        "6673",
+        "3085",
+        "3046"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先尽早堆高暴击率(无尽/收集者/育恩塔尔/盾弓/轻语)，暴击越高自身越肉",
+      "playstyle_tip": "高暴击自带强力概率减伤，配合盾弓或吸血装站撸换血优势极大"
+    },
+    {
+      "id": "2104",
+      "name": "灵魄炸弹",
+      "aliases": [
+        "群奶炸弹"
+      ],
+      "rarity": "prismatic",
+      "archetype": "高频奶盾群体炸弹续航流",
+      "mechanic": "提供治疗与护盾积攒层数，满层向残血友军投掷灵魄炸弹造成范围高额治疗与护盾",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 4.0,
+      "core_items": [
+        "6617",
+        "2526",
+        "6621",
+        "3504",
+        "6616",
+        "3107"
+      ],
+      "force_items": [
+        "6617"
+      ],
+      "required_tags": [
+        "ManaRegen"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先月石再生器(6617)+耳语头环(2526)+黎明核心(6621)+香炉/救赎堆满治疗护盾强度",
+      "playstyle_tip": "高频给队友套盾回血快速攒满灵魄炸弹，残血团战一口炸回全队血线"
+    },
+    {
+      "id": "1005",
+      "name": "喂呜喂呜",
+      "aliases": [
+        "救护车",
+        "残血强奶"
+      ],
+      "rarity": "gold",
+      "archetype": "残血极速驰援强奶护盾流",
+      "mechanic": "朝残血友军移动获得巨额移速，并按目标已损失生命值大幅增幅治疗与护盾效果",
+      "transformative": true,
+      "allow_off_profile": true,
+      "shifts_profile": "",
+      "boost": 3.8,
+      "core_items": [
+        "6617",
+        "2526",
+        "6621",
+        "3107",
+        "3504",
+        "6616"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "ManaRegen"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先月石/耳语头环/黎明核心/救赎堆治疗护盾强度，卡尔玛/赛娜/艾翁收益极高",
+      "playstyle_tip": "盯紧残血前排与C位，高速切入用残血增幅奶盾瞬间逆转血线"
+    },
+    {
+      "id": "2009",
+      "name": "狂热者",
+      "aliases": [
+        "法强攻速暴击"
+      ],
+      "rarity": "silver",
+      "archetype": "AP攻速暴击混伤流",
+      "mechanic": "获得暴击几率与随法术强度提升的高额攻击速度",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.4,
+      "core_items": [
+        "3115",
+        "2510",
+        "3430",
+        "3089",
+        "3031",
+        "3085"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "CriticalStrike",
+        "SpellDamage"
+      ],
+      "stat_keys": [
+        "FlatCritChanceMod",
+        "FlatMagicDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先纳什之牙/黄昏与黎明/毁坏仪式(3430)/无尽，凯尔/永恩/尼菈收益极高",
+      "playstyle_tip": "借助高额暴击与AP转化攻速打满持续平A输出"
+    },
+    {
+      "id": "3036",
+      "name": "翻倍时间",
+      "aliases": [
+        "蓝量魔伤",
+        "叠蓝增伤"
+      ],
+      "rarity": "gold",
+      "archetype": "无限叠蓝法力百分比爆发流",
+      "mechanic": "短时间内用2个不同技能命中敌方造成最大法力值百分比魔法伤害并永久增加最大法力",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3003",
+        "6657",
+        "6655",
+        "2503",
+        "3118",
+        "3119",
+        "3004"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Mana"
+      ],
+      "stat_keys": [
+        "FlatMPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先大天使/时光之杖/卢登/黯炎/凛冬之临/魔宗等高蓝量装，放大蓝量百分比魔伤",
+      "playstyle_tip": "多用双技能连招频繁触发展开蓝量叠层，中后期靠超高法力打满额外爆发"
+    },
+    {
+      "id": "1087",
+      "name": "台风",
+      "aliases": [
+        "近战飓风",
+        "额外弩箭"
+      ],
+      "rarity": "silver",
+      "archetype": "多目标额外弩箭特效流",
+      "mechanic": "普攻额外向附近一名敌人发射弩箭并施加完整攻击特效(近战英雄同样生效)",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3153",
+        "6672",
+        "3124",
+        "3091",
+        "3748",
+        "3302",
+        "3115"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "OnHit",
+        "AttackSpeed"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "破败/海妖/羊刀/智慧末刃/巨型九头蛇在团战双目标同时触发，收益翻倍",
+      "playstyle_tip": "尽量站位覆盖两名敌方目标输出，让每次普攻同时结算双份特效"
+    },
+    {
+      "id": "1036",
+      "name": "火上浇油",
+      "aliases": [
+        "普攻灼烧",
+        "叠烧特效"
+      ],
+      "rarity": "gold",
+      "archetype": "攻速无限叠层百分比灼烧流",
+      "mechanic": "每次普攻通过攻击特效施加可无限叠加的最大生命值百分比魔法灼烧",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3124",
+        "3085",
+        "3153",
+        "6672",
+        "3091",
+        "3115",
+        "3302"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AttackSpeed",
+        "OnHit"
+      ],
+      "stat_keys": [
+        "PercentAttackSpeedMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "羊刀双触发+飓风群体挂烧+高攻速装可快速叠起数十层百分比灼烧融化大肉",
+      "playstyle_tip": "优先堆攻速与羊刀/飓风，持续点射敌方前排叠满灼烧层数"
+    },
+    {
+      "id": "3060",
+      "name": "单曲红人",
+      "aliases": [
+        "急速转单技能增伤"
+      ],
+      "rarity": "gold",
+      "archetype": "高技能急速转单技能核爆流",
+      "mechanic": "技能急速不再缩短指定技能冷却，而是全部转化为该技能的巨额百分比增伤",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.4,
+      "core_items": [
+        "3161",
+        "6696",
+        "3071",
+        "4629",
+        "4628",
+        "2503",
+        "3118"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AbilityHaste"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "优先高技能急速成装(AD选朔极之矛/公理圆弧/黑切，AP选星界驱驰/视界专注/黯炎)",
+      "playstyle_tip": "把超高增伤的指定技能精准砸向敌方脆皮或残血核心一击必杀"
+    },
+    {
+      "id": "1053",
+      "name": "科学狂人",
+      "aliases": [
+        "大头小头",
+        "大小随机"
+      ],
+      "rarity": "prismatic",
+      "archetype": "体型切换全属性增幅流",
+      "mechanic": "每次复活随机变大(获得额外生命值与自适应之力)或变小(获得额外技能急速与移速)",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 2.6,
+      "core_items": [
+        "6333",
+        "2517",
+        "4633",
+        "3053",
+        "3161",
+        "3089"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AbilityHaste",
+        "Health"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "属于通用面板强化，按英雄常规核心路线出装即可，战士/法坦吃双形态收益最高",
+      "playstyle_tip": "大体型回合偏前排换血吃伤害，小体型回合靠高移速与高急速高频拉扯输出"
+    },
+    {
+      "id": "3262",
+      "name": "史莱姆时间",
+      "aliases": [
+        "史莱姆",
+        "粘液回血"
+      ],
+      "rarity": "silver",
+      "archetype": "近战贴脸粘液续航流",
+      "mechanic": "周期性向周围喷射史莱姆粘液造成最大生命值相关魔法伤害并回复自身生命值",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.0,
+      "core_items": [
+        "3065",
+        "4633",
+        "3084",
+        "2502",
+        "6333",
+        "2517"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "振奋盔甲与血量续航装可显著放大粘液回复与坦度，避免纯脆皮站撸",
+      "playstyle_tip": "贴近敌方前排持续作战，卡粘液触发节奏滚起持续回血与范围魔伤"
+    },
+    {
+      "id": "1004",
+      "name": "回归基本功",
+      "aliases": [
+        "禁大招",
+        "基本功"
+      ],
+      "rarity": "prismatic",
+      "archetype": "弃R强化小技能极速流",
+      "mechanic": "禁用终极技能(R)，换取小技能大幅增伤(+35%)、高额技能急速(+70)与治疗护盾增幅",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3161",
+        "2517",
+        "6333",
+        "4645",
+        "3089",
+        "4629"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AbilityHaste"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "严禁出依赖终极技能触发的装备(残疫3118/公理圆弧6696/猎魔人弩箭2512/基克3050)，全力堆小技能伤害",
+      "playstyle_tip": "专注高频小技能连招与拉扯消耗，无须保留大招窗口，小技能伤害直接碾压常规流派"
+    },
+    {
+      "id": "3078",
+      "name": "鼓声暴起 低音轰鸣",
+      "aliases": [
+        "鼓声暴起",
+        "低音轰鸣",
+        "五杀摇滚低音"
+      ],
+      "rarity": "gold",
+      "archetype": "高频连招节奏冲击波流",
+      "mechanic": "释放技能或普攻按节拍触发范围低音冲击波与移速增益，高频近战与持续输出收益极高",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.0,
+      "core_items": [
+        "3078",
+        "6333",
+        "2517",
+        "3161",
+        "6610",
+        "3071"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "AbilityHaste"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "高技能急速与半肉容错装可维持不断档节拍触发，提升团战持续范围伤害",
+      "playstyle_tip": "保持技能与普攻高频衔接，进场贴身持续打出范围低音爆发"
+    },
+    {
+      "id": "1333",
+      "name": "逃跑计划",
+      "aliases": [
+        "残血加速",
+        "逃生"
+      ],
+      "rarity": "silver",
+      "archetype": "低血爆发加速拉扯流",
+      "mechanic": "生命值跌入低血线时瞬间触发高额移速与缩小体型保命效果，大幅提升反杀与拉扯容错",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 2.4,
+      "core_items": [
+        "6333",
+        "3072",
+        "6673",
+        "3157",
+        "3156"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "LifeSteal"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "通用生存拉扯强化，无需强改核心路线；中后期补吸血/死舞/中娅可轻松残血反打",
+      "playstyle_tip": "残血触发爆发移速后立刻拉开身位躲关键技能，再借吸血或护盾回头收割"
+    },
+    {
+      "id": "1375",
+      "name": "吞噬灵魂",
+      "aliases": [
+        "击杀回血",
+        "噬魂"
+      ],
+      "rarity": "gold",
+      "archetype": "击杀百分比高额回血收割流",
+      "mechanic": "参与击杀回复高额生命值，持续团战收割与前排进场滚雪球能力极强",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.0,
+      "core_items": [
+        "3065",
+        "6333",
+        "2517",
+        "6610",
+        "3053",
+        "2502"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "Health"
+      ],
+      "stat_keys": [
+        "FlatHPPoolMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "振奋盔甲与死亡之舞/无穷饥渴联动击杀回血，团战只要先秒一人即可满血续战",
+      "playstyle_tip": "优先集火敌方残血脆皮触发击杀大额回血，借续航滚雪球连续收割"
+    },
+    {
+      "id": "1204",
+      "name": "叠角龙",
+      "aliases": [
+        "双倍叠层",
+        "叠层加速"
+      ],
+      "rarity": "silver",
+      "archetype": "永久叠层75%提速成长流",
+      "mechanic": "技能被动与可叠加装备的永久层数获取速度提升75%，叠层英雄与叠层装质变加速",
+      "transformative": true,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 3.6,
+      "core_items": [
+        "3084",
+        "6697",
+        "3003",
+        "3004",
+        "3119",
+        "2526"
+      ],
+      "force_items": [],
+      "required_tags": [],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "适合英雄优先提早做心之钢/狂妄/女神之泪系叠层核心装，吃满75%加速红利",
+      "playstyle_tip": "前中期积极换血与参团蹭层数，比常规对局早一整个大件周期进入后期强势期"
+    },
+    {
+      "id": "1195",
+      "name": "巨人杀手",
+      "aliases": [
+        "打大肉",
+        "小体型增伤"
+      ],
+      "rarity": "prismatic",
+      "archetype": "小体型高移速切坦增伤流",
+      "mechanic": "缩小体型并获得高额移速，对体型大于自身的目标造成显著百分比额外伤害",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 2.8,
+      "core_items": [
+        "3153",
+        "3036",
+        "6653",
+        "3135",
+        "2503",
+        "3033"
+      ],
+      "force_items": [],
+      "required_tags": [
+        "ArmorPenetration",
+        "MagicPenetration"
+      ],
+      "stat_keys": [],
+      "penalize_tags": [],
+      "avoid_note": "避免叠体型类肉装(心之钢/歌利亚)，保持小体型配百分比穿透切碎前排",
+      "playstyle_tip": "利用小体型与移速拉扯规避控制，优先集火敌方心之钢/坦克大核打满增伤"
+    }
+  ]
+}
