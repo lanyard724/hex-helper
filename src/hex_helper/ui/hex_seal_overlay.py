@@ -1655,7 +1655,7 @@ class CoreInsightPreviewDialog(QDialog):
 
         # Trust 3-anchor reassurance strip
         trust = QLabel(
-            "◈ 英雄大数据 / 3-4 卡识别 / 本地 5ms 出装永久免费不锁   |   ◈ 积分永不过期 · 绝无包月自动续费   |   ◈ 5 元一瓶饮料打 15-25 局"
+            "◈ 英雄大数据 / 3-4 卡识别 / 本地 5ms 出装永久免费不锁   |   ◈ 额度服务期内有效 · 绝无包月自动续费   |   ◈ 未消耗实付可退"
         )
         trust.setWordWrap(True)
         trust.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1677,7 +1677,7 @@ class CoreInsightPreviewDialog(QDialog):
         self.snooze_btn.clicked.connect(self._on_snooze)
 
         is_guest = state == CoreEnergyState.GUEST_UNCLAIMED
-        cta_txt = "免费领 450 积分试跑 2 局（10 秒注册）" if is_guest else "充能唤醒 AI（¥5 起 · 永不过期）"
+        cta_txt = "免费领 450 积分试跑 2 局（10 秒注册）" if is_guest else "充能唤醒 AI（¥5 起 · 服务期内有效）"
         self.primary_btn = HextechActionButton(
             cta_txt,
             variant="cyan" if is_guest else "gold",
@@ -1965,7 +1965,7 @@ class HextechSealSandboxDialog(QDialog):
                 cta_text="查看差异",
             )
         elif key == "s3":
-            self.state_badge.setText("当前态：S3 充值已到账 · 裂纹青光脉动，请亲手点击任意封印卡触发 720ms 多米诺破封！")
+            self.state_badge.setText("当前态：S3 算力已到账 · 裂纹青光脉动，请亲手点击任意封印卡触发 720ms 多米诺破封！")
             for s in self._lobby_seals:
                 s.set_seal_mode(SealMode.CHARGED_READY, subtitle="能量已注入 · 点击击碎封印", cta_text="✦ 点击破封")
             self.sim_brief_seal.set_copy(title="开局 10 人作战简报")

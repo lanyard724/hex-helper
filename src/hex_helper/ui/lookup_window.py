@@ -528,7 +528,7 @@ class LookupWindow(QWidget):
         ttl.setFont(display_font(15, bold=True, letter_spacing=1.0))
         ttl.setStyleSheet("border: none; background: transparent; color: #FDE68A;")
 
-        desc = QLabel("当前账号未登录或积分不足，请先登录或扫码充值以解锁全部功能")
+        desc = QLabel("当前账号未登录或算力额度不足，请先登录或补充算力以解锁全部功能")
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         desc.setStyleSheet("border: none; background: transparent; color: #F0E6D2; font-size: 13px;")
@@ -536,10 +536,10 @@ class LookupWindow(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
         btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        act_btn = HextechActionButton("立即扫码充值", variant="cyan", pointed_right=True, height=34)
+        act_btn = HextechActionButton("立即补充算力", variant="cyan", pointed_right=True, height=34)
         act_btn.setMinimumWidth(132)
         act_btn.clicked.connect(self._handle_cutoff_action)
-        goto_btn = HextechActionButton("前往账号与充值页", variant="gold", height=34)
+        goto_btn = HextechActionButton("前往账号与算力页", variant="gold", height=34)
         goto_btn.setMinimumWidth(148)
         goto_btn.clicked.connect(lambda: self._switch_page(2, force=True))
         btn_row.addWidget(act_btn)
@@ -928,7 +928,7 @@ class LookupWindow(QWidget):
         btn_row.setSpacing(8)
         self.login_btn = HextechActionButton("登录 / 注册", variant="cyan", pointed_right=True, height=30)
         self.login_btn.clicked.connect(lambda: self._on_login_click and self._on_login_click())
-        self.recharge_btn = HextechActionButton("扫码充值", variant="gold", height=30)
+        self.recharge_btn = HextechActionButton("补充算力", variant="gold", height=30)
         self.recharge_btn.clicked.connect(lambda: self._on_recharge_click and self._on_recharge_click())
         self.logout_btn = HextechActionButton("切换账号 / 退出", variant="gold", height=30)
         self.logout_btn.clicked.connect(lambda: self._on_logout_click and self._on_logout_click())
@@ -982,7 +982,7 @@ class LookupWindow(QWidget):
         til.setContentsMargins(10, 4, 10, 4)
         til.setSpacing(2)
         self.tier_info_lbl = QLabel(
-            "✓ 永久免费不锁：英雄大数据 / 3-4卡识别 / 组合路线 / 本地 5ms 出装  |  ◈ Auto 智能混合：开局定盘与质变走 Gemini，日常反制走 DeepSeek（约 3 毛/局 · 永不过期）"
+            "✓ 永久免费不锁：英雄大数据 / 3-4卡识别 / 组合路线 / 本地 5ms 出装  |  ◈ Auto 智能混合：开局定盘与质变走旗舰推理档，日常反制走极速经济档（约 3 毛/局 · 服务期内有效）"
         )
         self.tier_info_lbl.setWordWrap(True)
         self.tier_info_lbl.setStyleSheet(
@@ -1191,7 +1191,7 @@ class LookupWindow(QWidget):
             f"{format_balance_match_friendly(bal_credits, norm_tier)} · ¥{bal_cny:.2f}"
         )
         self.account_est_lbl.setText(
-            f"混合约 {est_auto} 局 · A档约 {est_a} 局 · B档约 {est_b} 局 · 永不过期"
+            f"混合约 {est_auto} 局 · A档约 {est_a} 局 · B档约 {est_b} 局 · 服务期内有效"
         )
 
     def _handle_tier_clicked(self, tier: str) -> None:
@@ -1543,8 +1543,8 @@ class LookupWindow(QWidget):
                 btn_txt = ""
                 show_btn = False
             else:
-                msg = reason or "当前账号积分不足，全功能已锁定 · 请扫码充值后立即解锁"
-                btn_txt = "立即扫码充值"
+                msg = reason or "当前账号算力额度不足，全功能已锁定 · 请补充算力后立即解锁"
+                btn_txt = "立即补充算力"
                 show_btn = True
             self._hero_locked_desc_lbl.setText(msg)
             self._special_locked_desc_lbl.setText(msg)
@@ -1633,7 +1633,7 @@ class LookupWindow(QWidget):
             self.account_est_lbl.setText(
                 "当前策略要求登录后解锁全部功能"
                 if full_locked
-                else "免代理直连 · 按局扣费永不过期"
+                else "国内节点直连 · 按量分摊算力 · 服务期内有效"
             )
             self.coach_page_status.setText("云端 AI 实时参谋 · 初始晶核待认领")
             self.coach_badge_lbl.setText(
@@ -1704,12 +1704,12 @@ class LookupWindow(QWidget):
             )
             self._style_cutoff_banner(is_system_gate=(code == "ACCOUNT_DISABLED" or full_locked))
             suffix = (
-                "（当前策略已锁定全部功能，请扫码充值后立即解锁）"
+                "（当前策略已锁定全部功能，请补充算力后立即解锁）"
                 if full_locked
                 else "（本地 5ms 大数据持续免费护航 · 充能后立即破封）"
             )
             self.cutoff_banner_lbl.setText(f"{reason_txt}{suffix}")
-            self.cutoff_action_btn.setText("立即扫码充值")
+            self.cutoff_action_btn.setText("立即补充算力")
             self.cutoff_action_btn.setVisible(code != "ACCOUNT_DISABLED")
             self.cutoff_banner.show()
             self._apply_lock_all_ui(full_locked, reason=self.cutoff_banner_lbl.text(), code=code)

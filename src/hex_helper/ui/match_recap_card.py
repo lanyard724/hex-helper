@@ -1354,7 +1354,7 @@ class MatchRecapDialog(QDialog):
                 nudge_btn_txt = "免费领 450 积分"
                 nudge_action = "register"
             elif lifecycle_state == CoreEnergyState.CORRODED_TRIAL_END:
-                nudge_txt = "◇ 本局 AI 高光点评处于休眠封印 · 充能后解锁下局 10 人定盘与精准散件反制（永不过期）"
+                nudge_txt = "◇ 本局 AI 高光点评处于休眠封印 · 充能后解锁下局 10 人定盘与精准散件反制（服务期内有效）"
                 nudge_btn_txt = "查看差异 / 充能"
                 nudge_action = "preview"
             elif lifecycle_state == CoreEnergyState.CORRODED_RETURNING:
@@ -1362,7 +1362,7 @@ class MatchRecapDialog(QDialog):
                 nudge_btn_txt = "快速补能"
                 nudge_action = "recharge"
             elif lifecycle_state == CoreEnergyState.TRIAL_LOW:
-                nudge_txt = "✦ 免费体验额度即将用尽 · 5 元一瓶饮料畅玩 15-25 局，积分永不过期"
+                nudge_txt = "✦ 免费体验额度即将用尽 · 小额按量分摊算力（¥5 起，服务期内有效，未消耗实付可退）"
                 nudge_btn_txt = "去充能"
                 nudge_action = "recharge"
 

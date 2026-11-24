@@ -75,18 +75,18 @@ def format_balance_match_friendly(balance_credits: float, tier: str = "auto") ->
 
 
 def format_package_unit_hint(amount_fen: int, credits: int, tier: str = "auto") -> str:
-    """Format recharge package match estimate & per-match cost, e.g. '约 16 局 · 约 3 毛/局 · 永不过期'."""
+    """Format recharge package match estimate & per-match cost, e.g. '约 16 局 · 约 3 毛/局 · 服务期内有效'."""
     try:
         fen = int(amount_fen or 0)
         cr = int(credits or 0)
     except (TypeError, ValueError):
-        return "永不过期"
+        return "服务期内有效"
     if cr <= 0:
-        return "永不过期"
+        return "服务期内有效"
     per_match = ESTIMATED_CREDITS_PER_MATCH[_normalize_tier(tier)]
     matches = max(1, int(round(cr / per_match)))
     if fen <= 0:
-        return f"约 {matches} 局 · 永不过期"
+        return f"约 {matches} 局 · 服务期内有效"
     yuan_per_match = (fen / 100.0) / float(matches)
     if yuan_per_match >= 0.95:
         rounded_yuan = max(1.0, round(yuan_per_match, 1))
@@ -97,7 +97,7 @@ def format_package_unit_hint(amount_fen: int, credits: int, tier: str = "auto") 
             price_txt = "不足 1 毛/局"
         else:
             price_txt = f"约 {int(round(jiao))} 毛/局"
-    return f"约 {matches} 局 · {price_txt} · 永不过期"
+    return f"约 {matches} 局 · {price_txt} · 服务期内有效"
 
 
 class _PackageOptionCard(QFrame):
@@ -496,7 +496,7 @@ class SignupBonusDialog(QDialog):
             f"{greet}\n\n"
             f"系统已自动向你的账户发放 {bonus_str} 积分新用户体验额度（{format_balance_match_friendly(self.bonus_credits, 'auto')}）：\n"
             "• 推荐 Auto「智能混合」模式，开局简报与质变大变阵走顶配旗舰、日常反制走极速模型，约 3 毛/局\n"
-            "• 局内抽屉与主界面可随时在 Auto / A 档 / B 档间自由切换，积分永不过期\n"
+            "• 局内抽屉与主界面可随时在 Auto / A 档 / B 档间自由切换，额度服务期内有效\n"
             "• 基础大数据梯度 / 3-4符文识别 / 海克斯组合路线 永久免费保留"
         )
         self.body_lbl.setWordWrap(True)
@@ -562,7 +562,7 @@ class RechargeDialog(QDialog):
         self._paid_notified = False
         self._closed = False
 
-        self.setWindowTitle("HexHelper · 积分充值")
+        self.setWindowTitle("HexHelper · 云端算力补能")
         self.setWindowIcon(load_app_icon())
         self.setModal(True)
         self.setMinimumWidth(480)
@@ -601,7 +601,7 @@ class RechargeDialog(QDialog):
 
         hdr_row = QHBoxLayout()
         hdr_row.setSpacing(10)
-        hdr = QLabel("HEXHELPER 积分扫码充值")
+        hdr = QLabel("HEXHELPER 云端算力补能")
         hdr.setFont(display_font(13, bold=True, letter_spacing=1.2))
         hdr.setStyleSheet("color: #F0E6D2; background: transparent; border: none;")
         hdr_row.addWidget(hdr)
@@ -617,7 +617,7 @@ class RechargeDialog(QDialog):
         self._refresh_balance_header()
 
         self.pricing_lbl = QLabel(
-            "智能混合约 3 毛/局  |  按实际 Token 透明计费  |  1,000 积分 = ¥1.00  |  永不过期"
+            "智能混合约 3 毛/局  |  仅分摊第三方云端算力  |  1,000 积分 = ¥1.00  |  未消耗实付可退"
         )
         self.pricing_lbl.setWordWrap(True)
         self.pricing_lbl.setStyleSheet(
@@ -633,7 +633,7 @@ class RechargeDialog(QDialog):
         left_col = QVBoxLayout()
         left_col.setSpacing(7)
 
-        pkg_hdr = QLabel("1. 选择充值套餐（一瓶冰红茶畅玩十余局 · 永不过期）")
+        pkg_hdr = QLabel("1. 选择算力包（小额按量分摊 · 服务期内有效 · 未消耗实付可退）")
         pkg_hdr.setStyleSheet("color: #C8AA6E; font-weight: bold; font-size: 11px; background: transparent; border: none;")
         left_col.addWidget(pkg_hdr)
 
@@ -738,7 +738,7 @@ class RechargeDialog(QDialog):
         body_row.addWidget(self.order_card)
         root.addLayout(body_row)
 
-        self.status_lbl = QLabel("按实际 Token 透明扣费 · 积分永不过期 · 余额归零永不锁本地 5ms 查表")
+        self.status_lbl = QLabel("按实际 Token 透明扣费 · 服务期内有效 · 未消耗实付可申请退还 · 本地 5ms 永久免费")
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet("color: #A09B8C; font-size: 11px; background: transparent; border: none;")
         root.addWidget(self.status_lbl)
@@ -769,7 +769,7 @@ class RechargeDialog(QDialog):
 
     def _refresh_balance_header(self) -> None:
         if self._balance_credits is None:
-            self.balance_lbl.setText("当前余额：待同步 · 积分永不过期")
+            self.balance_lbl.setText("当前余额：待同步 · 服务期内有效")
         else:
             self.balance_lbl.setText(
                 f"当前余额：{format_balance_match_friendly(self._balance_credits, self._tier)}"
@@ -844,7 +844,7 @@ class RechargeDialog(QDialog):
                 if a_in is not None and a_out is not None and b_in is not None and b_out is not None:
                     self.pricing_lbl.setText(
                         f"智能混合约 3 毛/局 · A档 {a_in:g} / {a_out:g} · "
-                        f"B档 {b_in:g} / {b_out:g} 积分/1K tokens  |  1,000 积分 = ¥1.00  |  永不过期"
+                        f"B档 {b_in:g} / {b_out:g} 积分/1K tokens  |  1,000 积分 = ¥1.00  |  服务期内有效"
                     )
             except Exception:
                 pass
@@ -917,9 +917,9 @@ class RechargeDialog(QDialog):
         if not enabled_chs:
             self._set_status("✕ 暂未开启任何在线收款渠道，请联系管理员后再试", "#F87171")
         elif not self._packages:
-            self._set_status("✕ 暂无可选充值套餐", "#F87171")
+            self._set_status("✕ 暂无可选算力包", "#F87171")
         else:
-            self._set_status("请选择套餐后点击「生成支付二维码」")
+            self._set_status("请选择算力包后点击「生成支付二维码」")
         self._sync_dialog_geometry()
 
     def _sync_dialog_geometry(self) -> None:
@@ -942,7 +942,7 @@ class RechargeDialog(QDialog):
         self._set_status(f"✕ 加载套餐失败：{msg}", "#F87171")
 
     def _load_packages_async(self) -> None:
-        self._set_status("⏳ 正在加载充值套餐...", "#FBBF24")
+        self._set_status("⏳ 正在加载算力包...", "#FBBF24")
 
         def worker() -> None:
             try:
@@ -958,7 +958,7 @@ class RechargeDialog(QDialog):
             self._set_status("✕ 暂未开启任何在线收款渠道，请联系管理员", "#F87171")
             return
         if not self._selected_package_id:
-            self._set_status("请先选择一个充值套餐", "#F87171")
+            self._set_status("请先选择一个算力包", "#F87171")
             return
         self.create_order_btn.setEnabled(False)
         self._set_status("⏳ 正在生成专属收款订单...", "#FBBF24")
@@ -1094,7 +1094,7 @@ class RechargeDialog(QDialog):
             self.paid_ceremony_box.show()
             self.order_card.show()
             self._set_status(
-                f"✓ 充值成功！已到账 +{added:,} 积分，当前{friendly} · AI 参谋已恢复使用",
+                f"✓ 算力补能成功！已到账 +{added:,} 积分，当前{friendly} · AI 参谋已恢复使用",
                 "#09C269",
             )
             if not self._paid_notified:

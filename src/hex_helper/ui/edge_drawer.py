@@ -919,7 +919,7 @@ class EdgeBuildDrawer(QWidget):
         self.cutoff_banner_lbl = QLabel("本地 5ms 引擎持续护航 · 核心待充能")
         self.cutoff_banner_lbl.setWordWrap(True)
         self.cutoff_banner_lbl.setStyleSheet("border: none; background: transparent; color: #E2D9C5; font-size: 10px; font-weight: bold;")
-        self.cutoff_action_btn = QPushButton("扫码充值")
+        self.cutoff_action_btn = QPushButton("补充算力")
         self.cutoff_action_btn.setFixedHeight(20)
         self.cutoff_action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cutoff_action_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -944,7 +944,7 @@ class EdgeBuildDrawer(QWidget):
         ipl.setSpacing(4)
         self.inline_preview_lbl = QLabel(
             "◈ 本地 5ms 出装与 3-4 卡识别永久免费不锁\n"
-            "◈ 云端 AI 参谋：开局定盘 + 阵亡精准双散件 + 72 质变重构（5元打 15-25 局 · 永不过期）"
+            "◈ 云端 AI 参谋：开局定盘 + 阵亡精准双散件 + 72 质变重构（5元打 15-25 局 · 服务期内有效）"
         )
         self.inline_preview_lbl.setWordWrap(True)
         self.inline_preview_lbl.setStyleSheet("border: none; background: transparent; color: #E2D9C5; font-size: 10px;")
@@ -2081,7 +2081,7 @@ class EdgeBuildDrawer(QWidget):
         else:
             self.inline_preview_lbl.setText(
                 "◈ 本地 5ms 出装与 3-4 卡识别永久免费不锁\n"
-                "◈ 云端 AI 参谋：开局定盘 + 精准双散件 + 72 质变重构（5元打 15-25 局 · 永不过期）"
+                "◈ 云端 AI 参谋：开局定盘 + 精准双散件 + 72 质变重构（5元打 15-25 局 · 服务期内有效）"
             )
             self.inline_preview_cta_btn.setText("查看实战对比 / 充能")
         self.inline_preview_box.setVisible(not self.inline_preview_box.isVisible())
@@ -2371,7 +2371,7 @@ class EdgeBuildDrawer(QWidget):
         friendly = format_balance_match_friendly(balance_credits, tier=self._coach_tier)
         short_pill = friendly.split(" (", 1)[0]
         self.coach_balance_lbl.setText(short_pill)
-        self.coach_balance_lbl.setToolTip(f"{friendly} · 永不过期")
+        self.coach_balance_lbl.setToolTip(f"{friendly} · 服务期内有效")
         self.coach_balance_lbl.show()
 
     def set_coach_loading(
@@ -2412,14 +2412,14 @@ class EdgeBuildDrawer(QWidget):
             elif eff_code == "ACCOUNT_DISABLED":
                 self.coach_content_lbl.setText("当前账号已被限制 · 全部功能已暂停使用")
             else:
-                self.coach_content_lbl.setText("余额不足 · 全功能已锁定，请扫码充值后立即解锁")
+                self.coach_content_lbl.setText("算力不足 · 全功能已锁定，请补充算力后立即解锁")
             return
         if eff_code == "NOT_LOGGED_IN":
             self.coach_content_lbl.setText("本地 5ms 引擎运行中 · 登录后开启云端 AI 参谋")
         elif eff_code == "ACCOUNT_DISABLED":
             self.coach_content_lbl.setText("本地 5ms 引擎运行中 · 当前账号已被限制")
         else:
-            self.coach_content_lbl.setText("本地 5ms 引擎仍在护航 · 充值后立即恢复 AI 推演")
+            self.coach_content_lbl.setText("本地 5ms 引擎仍在护航 · 补充算力后立即恢复 AI 推演")
 
     def set_ai_cutoff(
         self,
@@ -2492,7 +2492,7 @@ class EdgeBuildDrawer(QWidget):
                     if self._coach_advice is not None and not self._is_full_locked
                     else (reason or "余额不足 · 本地 5ms 持续护航")
                 )
-                self.cutoff_action_btn.setText("扫码充值")
+                self.cutoff_action_btn.setText("补充算力")
                 self.cutoff_action_btn.show()
             self._coach_status_color = status_color
             self.coach_status_lbl.setStyleSheet(
@@ -3207,7 +3207,7 @@ class EdgeBuildDrawer(QWidget):
             else:
                 self.pill_gold_lbl.setText("锁定")
                 self.pill_gold_lbl.setStyleSheet("border: none; background: transparent; color: #F59E0B; font-size: 9px; font-weight: bold;")
-                self.pill_item_ring.setToolTip("当前策略要求登录或充值后解锁全部功能")
+                self.pill_item_ring.setToolTip("当前策略要求登录或补充算力后解锁全部功能")
             return
 
         store = self._store_ref

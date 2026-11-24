@@ -39,7 +39,7 @@ FEEDBACK_CATEGORIES: tuple[tuple[str, str], ...] = (
     ("ocr_picker", "选卡识别异常"),
     ("build_ai", "出装 / AI 参谋"),
     ("overlay_ui", "浮窗 / 快捷键 / 卡顿"),
-    ("account_billing", "账号 / 充值 / 更新"),
+    ("account_billing", "账号 / 算力 / 更新"),
     ("other", "功能建议 / 其他"),
 )
 

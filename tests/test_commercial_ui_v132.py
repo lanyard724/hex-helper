@@ -62,20 +62,20 @@ def test_format_balance_match_friendly_display() -> None:
 
 
 def test_format_package_unit_hint_jiao_yuan_and_reassurance() -> None:
-    assert format_package_unit_hint(500, 5000, "auto") == "约 16 局 · 约 3 毛/局 · 永不过期"
-    assert format_package_unit_hint(1000, 10000, "auto") == "约 31 局 · 约 3 毛/局 · 永不过期"
-    assert format_package_unit_hint(3000, 30000, "auto") == "约 94 局 · 约 3 毛/局 · 永不过期"
-    assert format_package_unit_hint(5000, 50000, "auto") == "约 156 局 · 约 3 毛/局 · 永不过期"
+    assert format_package_unit_hint(500, 5000, "auto") == "约 16 局 · 约 3 毛/局 · 服务期内有效"
+    assert format_package_unit_hint(1000, 10000, "auto") == "约 31 局 · 约 3 毛/局 · 服务期内有效"
+    assert format_package_unit_hint(3000, 30000, "auto") == "约 94 局 · 约 3 毛/局 · 服务期内有效"
+    assert format_package_unit_hint(5000, 50000, "auto") == "约 156 局 · 约 3 毛/局 · 服务期内有效"
 
     # Tier A cheaper (~2 jiao/match), Tier B in yuan (~1.1 yuan/match)
-    assert format_package_unit_hint(1000, 10000, "a") == "约 45 局 · 约 2 毛/局 · 永不过期"
-    assert format_package_unit_hint(1000, 10000, "b") == "约 9 局 · 约 1.1 元/局 · 永不过期"
+    assert format_package_unit_hint(1000, 10000, "a") == "约 45 局 · 约 2 毛/局 · 服务期内有效"
+    assert format_package_unit_hint(1000, 10000, "b") == "约 9 局 · 约 1.1 元/局 · 服务期内有效"
 
     # Edge cases: ultra-cheap promo, ~0.98 yuan avoids "10 毛/局", zero credits safe
     assert "不足 1 毛/局" in format_package_unit_hint(100, 5000, "auto")
     assert "10 毛/局" not in format_package_unit_hint(970, 3200, "auto")
     assert "约 1 元/局" in format_package_unit_hint(970, 3200, "auto")
-    assert format_package_unit_hint(500, 0, "auto") == "永不过期"
+    assert format_package_unit_hint(500, 0, "auto") == "服务期内有效"
 
 
 def test_recharge_dialog_match_friendly_pills_balance_and_compact_height(qapp: QApplication) -> None:
@@ -105,11 +105,11 @@ def test_recharge_dialog_match_friendly_pills_balance_and_compact_height(qapp: Q
             }
         )
 
-        # Every package card has a Hextech gold/cyan pill with matches, per-match price & 永不过期
+        # Every package card has a Hextech gold/cyan pill with matches, per-match price & 服务期内有效
         assert len(dlg._pkg_cards) == 4
-        assert dlg._pkg_cards["pkg_5"].hint_pill.text() == "约 16 局 · 约 3 毛/局 · 永不过期"
-        assert dlg._pkg_cards["pkg_10"].hint_pill.text() == "约 31 局 · 约 3 毛/局 · 永不过期"
-        assert "永不过期" in dlg._pkg_cards["pkg_50"].hint_pill.text()
+        assert dlg._pkg_cards["pkg_5"].hint_pill.text() == "约 16 局 · 约 3 毛/局 · 服务期内有效"
+        assert dlg._pkg_cards["pkg_10"].hint_pill.text() == "约 31 局 · 约 3 毛/局 · 服务期内有效"
+        assert "服务期内有效" in dlg._pkg_cards["pkg_50"].hint_pill.text()
         assert "7-10 局" not in dlg._pkg_cards["pkg_5"].radio.text()
 
         # Selecting a different package updates active card state
@@ -192,7 +192,7 @@ def test_lookup_window_940x610_match_friendly_balance_recap_button_and_tier_card
         assert lw.account_balance_lbl.text().startswith("约剩 15 局 (4,850 积分)")
         assert "4.85" in lw.account_balance_lbl.text()
         assert "约剩15局" in lw.coach_badge_lbl.text()
-        assert "永不过期" in lw.account_est_lbl.text()
+        assert "服务期内有效" in lw.account_est_lbl.text()
 
         lw.tier_a_btn.click()
         assert switched_tiers == ["a"]
@@ -208,8 +208,9 @@ def test_lookup_window_940x610_match_friendly_balance_recap_button_and_tier_card
         info_txt = lw.tier_info_lbl.text()
         assert "永久免费" in info_txt
         assert "Auto 智能混合" in info_txt
-        assert "Gemini" in info_txt
-        assert "DeepSeek" in info_txt
+        assert "旗舰推理档" in info_txt and "极速经济档" in info_txt
+        assert "Gemini" not in info_txt
+        assert "服务期内有效" in info_txt
 
         # 3. "🏆 战报卡" button: disabled before finished match, lights up & triggers callback after set_recap_available(True)
         assert lw.recap_btn.text() == "🏆 战报卡"
