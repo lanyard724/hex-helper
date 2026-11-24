@@ -22,6 +22,11 @@ from hex_helper.config import format_display_patch
 from hex_helper.data.aram_balance import get_aram_balance, get_hero_ceiling_tag
 from hex_helper.data.store import DataStore
 from hex_helper.game.models import ChampSelectState
+from hex_helper.scoring.team_comp import (
+    BestFiveComp,
+    analyze_champ_select_pool,
+    classify_hero_role,
+)
 from hex_helper.scoring.tier import score_hero_tier
 from hex_helper.ui.resizable_overlay import FramelessResizeController, HextechCornerGrip
 from hex_helper.ui.theme import BASE_OVERLAY_QSS, load_app_pixmap, tier_badge_qss
@@ -60,27 +65,39 @@ def _circular_portrait(path_str: str, size: int = 24, border_hex: str = "#785A28
 
 
 def _classify_hero_role(hero_id: str, store: DataStore) -> str:
-    """Classify a champion's primary ARAM profile ('AP' | 'AD' | 'TANK') from top 26.23 core builds."""
-    ad_s = 0.0
-    ap_s = 0.0
-    tank_s = 0.0
-    for cb in store.get_core_builds(hero_id)[:2]:
-        for iid in cb.items:
-            info = store.get_item_info(iid)
-            st = info.stats or {}
-            ad_s += float(st.get("FlatPhysicalDamageMod", 0.0)) * 1.4
-            ad_s += float(st.get("FlatCritChanceMod", 0.0)) * 110.0
-            ap_s += float(st.get("FlatMagicDamageMod", 0.0)) * 1.15
-            tank_s += float(st.get("FlatArmorMod", 0.0)) * 1.45
-            tank_s += float(st.get("FlatSpellBlockMod", 0.0)) * 1.45
-            tank_s += float(st.get("FlatHPPoolMod", 0.0)) * 0.14
-    if tank_s > max(ad_s, ap_s) * 1.15 and tank_s >= 110.0:
-        return "TANK"
-    if ap_s >= ad_s and ap_s >= 40.0:
-        return "AP"
-    if ad_s > ap_s and ad_s >= 35.0:
-        return "AD"
-    return "AP"
+    """Classify a champion's primary ARAM profile ('AP' | 'AD' | 'TANK') from top core builds."""
+    return classify_hero_role(hero_id, store)
+
+
+_MODE_BTN_CLIMB_ACTIVE_QSS = (
+    "QPushButton { background-color: rgba(10, 200, 185, 56); border: 1px solid #0AC8B9; "
+    "border-radius: 2px; color: #F0E6D2; font-size: 10px; font-weight: bold; padding: 1px 8px; }"
+)
+_MODE_BTN_FUN_ACTIVE_QSS = (
+    "QPushButton { background-color: rgba(200, 155, 60, 64); border: 1px solid #C8AA6E; "
+    "border-radius: 2px; color: #F0E6D2; font-size: 10px; font-weight: bold; padding: 1px 8px; }"
+)
+_MODE_BTN_IDLE_QSS = (
+    "QPushButton { background-color: transparent; border: 1px solid transparent; "
+    "border-radius: 2px; color: #A09B8C; font-size: 10px; font-weight: 600; padding: 1px 8px; }"
+    "QPushButton:hover { color: #F0E6D2; background-color: rgba(200, 170, 110, 24); }"
+)
+_COMP_ALERT_QSS: dict[str, str] = {
+    "warn": (
+        "background-color: rgba(68, 38, 10, 215); border: 1px solid #C89B3C; "
+        "border-left: 3px solid #FDE68A; border-radius: 2px; padding: 4px 7px; "
+        "color: #FDE68A; font-size: 10px; font-weight: bold;"
+    ),
+    "swap": (
+        "background-color: rgba(6, 36, 46, 224); border: 1px solid #0AC8B9; "
+        "border-left: 3px solid #5EEAD4; border-radius: 2px; padding: 4px 7px; "
+        "color: #A5F3FC; font-size: 10px; font-weight: bold;"
+    ),
+    "ok": (
+        "background-color: rgba(6, 40, 34, 195); border: 1px solid #09C269; "
+        "border-radius: 2px; padding: 4px 7px; color: #6EE7B7; font-size: 10px;"
+    ),
+}
 
 
 _ROLE_GAP_BADGE: dict[str, str] = {
@@ -153,11 +170,20 @@ class ChampSelectOverlay(QWidget):
         on_size_changed: Callable[[list[int] | None], None] | None = None,
         initial_size: list[int] | None = None,
         on_core_action: Callable[[str], None] | None = None,
+        on_goal_mode_changed: Callable[[str], None] | None = None,
+        initial_goal_mode: str = "climb",
     ) -> None:
         super().__init__()
         self._on_pos_changed = on_pos_changed
         self._on_size_changed = on_size_changed
         self._on_core_action = on_core_action
+        self._on_goal_mode_changed = on_goal_mode_changed
+        self._goal_mode: str = "fun" if str(initial_goal_mode or "climb").strip().lower() == "fun" else "climb"
+        self._applied_goal_mode_style: str = ""
+        self._best_five_expanded: bool = False
+        self._last_best_five_sig: tuple | None = None
+        self._last_comp_alert_style: str = ""
+        self._last_rows_content_h: int = 64
         self._ai_bar_action: str = ""
         self._drag_offset: QPoint | None = None
         self._icon_cache: dict[tuple[str, str], QPixmap] = {}
@@ -220,6 +246,47 @@ class ChampSelectOverlay(QWidget):
         header.addWidget(close_btn)
         self.layout_main.addLayout(header)
 
+        mode_bar = QHBoxLayout()
+        mode_bar.setContentsMargins(0, 0, 0, 0)
+        mode_bar.setSpacing(6)
+
+        self.mode_pill_frame = QFrame()
+        self.mode_pill_frame.setStyleSheet(
+            "QFrame { background-color: #040E1A; border: 1px solid #785A28; border-radius: 2px; }"
+        )
+        pill_lay = QHBoxLayout(self.mode_pill_frame)
+        pill_lay.setContentsMargins(2, 2, 2, 2)
+        pill_lay.setSpacing(2)
+
+        self.mode_climb_btn = QPushButton("冲分")
+        self.mode_climb_btn.setCheckable(True)
+        self.mode_climb_btn.setFixedHeight(19)
+        self.mode_climb_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_climb_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode_climb_btn.setToolTip("冲分视角：优先前后排/AD-AP均衡、控制链与稳定胜率")
+        self.mode_climb_btn.clicked.connect(lambda: self.set_goal_mode("climb"))
+
+        self.mode_fun_btn = QPushButton("爽局")
+        self.mode_fun_btn.setCheckable(True)
+        self.mode_fun_btn.setFixedHeight(19)
+        self.mode_fun_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_fun_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode_fun_btn.setToolTip("爽局视角：加权海克斯高上限爆发与爽点英雄")
+        self.mode_fun_btn.clicked.connect(lambda: self.set_goal_mode("fun"))
+
+        pill_lay.addWidget(self.mode_climb_btn)
+        pill_lay.addWidget(self.mode_fun_btn)
+
+        self.team_score_lbl = QLabel("")
+        self.team_score_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #C8AA6E; font-size: 10px; font-weight: bold;"
+        )
+        mode_bar.addWidget(self.mode_pill_frame)
+        mode_bar.addStretch(1)
+        mode_bar.addWidget(self.team_score_lbl)
+        self.layout_main.addLayout(mode_bar)
+        self._sync_goal_mode_buttons()
+
         div = QFrame()
         div.setFixedHeight(1)
         div.setStyleSheet("background-color: rgba(200, 170, 110, 75);")
@@ -240,6 +307,60 @@ class ChampSelectOverlay(QWidget):
         self.rows_container.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.rows_scroll.setWidget(self.rows_body)
         self.layout_main.addWidget(self.rows_scroll, 1)
+
+        # Collapsible Best-5 strip (inline C(n,5) optimal lineup preview, zero extra floating windows)
+        self.best_five_strip = QFrame()
+        self.best_five_strip.setStyleSheet(
+            "QFrame { background-color: rgba(6, 20, 34, 224); "
+            "border: 1px solid rgba(120, 90, 40, 145); "
+            "border-left: 2px solid #C8AA6E; border-radius: 2px; }"
+        )
+        b5_lay = QVBoxLayout(self.best_five_strip)
+        b5_lay.setContentsMargins(7, 4, 7, 4)
+        b5_lay.setSpacing(4)
+
+        b5_hdr = QHBoxLayout()
+        b5_hdr.setContentsMargins(0, 0, 0, 0)
+        b5_hdr.setSpacing(5)
+        self.best_five_hdr_lbl = QLabel("")
+        self.best_five_hdr_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #F0E6D2; font-size: 10px; font-weight: bold;"
+        )
+        self.best_five_toggle_btn = QPushButton("展开")
+        self.best_five_toggle_btn.setFixedHeight(18)
+        self.best_five_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.best_five_toggle_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.best_five_toggle_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(17, 30, 46, 220); border: 1px solid #785A28; "
+            "border-radius: 2px; color: #C8AA6E; font-size: 9px; font-weight: bold; padding: 0px 6px; }"
+            "QPushButton:hover { border-color: #C8AA6E; color: #F0E6D2; }"
+        )
+        self.best_five_toggle_btn.clicked.connect(self._toggle_best_five)
+        b5_hdr.addWidget(self.best_five_hdr_lbl, 1)
+        b5_hdr.addWidget(self.best_five_toggle_btn)
+        b5_lay.addLayout(b5_hdr)
+
+        self.best_five_body = QWidget()
+        self.best_five_body.setStyleSheet("background: transparent; border: none;")
+        b5_body_lay = QVBoxLayout(self.best_five_body)
+        b5_body_lay.setContentsMargins(0, 2, 0, 0)
+        b5_body_lay.setSpacing(3)
+
+        self.best_five_heroes_lay = QHBoxLayout()
+        self.best_five_heroes_lay.setContentsMargins(0, 0, 0, 0)
+        self.best_five_heroes_lay.setSpacing(4)
+        b5_body_lay.addLayout(self.best_five_heroes_lay)
+
+        self.best_five_tags_lbl = QLabel("")
+        self.best_five_tags_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #0AC8B9; font-size: 9px;"
+        )
+        b5_body_lay.addWidget(self.best_five_tags_lbl)
+
+        self.best_five_body.hide()
+        b5_lay.addWidget(self.best_five_body)
+        self.best_five_strip.hide()
+        self.layout_main.addWidget(self.best_five_strip)
 
         self.comp_alert_lbl = QLabel("")
         self.comp_alert_lbl.setWordWrap(True)
@@ -485,6 +606,179 @@ class ChampSelectOverlay(QWidget):
             self.ai_readiness_btn.setVisible(low)
         self.ai_readiness_bar.show()
 
+    @property
+    def goal_mode(self) -> str:
+        return self._goal_mode
+
+    def _sync_goal_mode_buttons(self) -> None:
+        is_climb = self._goal_mode == "climb"
+        self.mode_climb_btn.setChecked(is_climb)
+        self.mode_fun_btn.setChecked(not is_climb)
+        if self._applied_goal_mode_style != self._goal_mode:
+            self._applied_goal_mode_style = self._goal_mode
+            self.mode_climb_btn.setStyleSheet(_MODE_BTN_CLIMB_ACTIVE_QSS if is_climb else _MODE_BTN_IDLE_QSS)
+            self.mode_fun_btn.setStyleSheet(_MODE_BTN_FUN_ACTIVE_QSS if not is_climb else _MODE_BTN_IDLE_QSS)
+
+    def set_goal_mode(self, mode: str, *, emit_callback: bool = True) -> None:
+        """Switch between 'climb' (冲分) and 'fun' (爽局) scoring profiles and refresh view."""
+        norm = "fun" if str(mode or "climb").strip().lower() == "fun" else "climb"
+        changed = norm != self._goal_mode
+        self._goal_mode = norm
+        self._sync_goal_mode_buttons()
+        if not changed:
+            return
+        if emit_callback and self._on_goal_mode_changed is not None:
+            self._on_goal_mode_changed(norm)
+        if self._last_state is not None and self._last_store is not None:
+            self.update_state(self._last_state, self._last_store)
+
+    def set_best_five_expanded(self, expanded: bool) -> None:
+        exp = bool(expanded)
+        self._best_five_expanded = exp
+        self.best_five_body.setVisible(exp)
+        self.best_five_toggle_btn.setText("收起" if exp else "展开")
+        self._sync_window_height(self._last_rows_content_h)
+
+    def _toggle_best_five(self) -> None:
+        self.set_best_five_expanded(not self._best_five_expanded)
+
+    def _render_best_five(
+        self,
+        bf: BestFiveComp | None,
+        ally_set: set[str],
+        store: DataStore,
+        *,
+        is_narrow: bool,
+    ) -> None:
+        if bf is None:
+            self.best_five_strip.hide()
+            self._last_best_five_sig = None
+            return
+
+        hdr_txt = (
+            f"◈ 已算 {bf.evaluated_combos} 阵 · 最强 {bf.score:.1f}分"
+            if is_narrow
+            else f"◈ 已算 {bf.evaluated_combos} 阵 · 最强5人 {bf.score:.1f}分"
+        )
+        self.best_five_hdr_lbl.setText(hdr_txt)
+
+        tag_txt = " · ".join(bf.tags) if bf.tags else ""
+        self.best_five_tags_lbl.setText(tag_txt)
+        self.best_five_tags_lbl.setVisible(bool(tag_txt))
+
+        portraits: list[tuple[str, str, bool, str, QPixmap | None]] = []
+        for hid, hname in zip(bf.hero_ids, bf.hero_names):
+            in_team = hid in ally_set
+            border_hex = "#C8AA6E" if in_team else "#0AC8B9"
+            pm = self._get_portrait(hid, store, border_hex)
+            portraits.append((hid, hname, in_team, border_hex, pm))
+
+        icon_ready = tuple((hid, pm is not None) for hid, _hname, _in_team, _border, pm in portraits)
+        sig = (bf.hero_ids, bf.hero_names, tuple(sorted(ally_set)), is_narrow, icon_ready)
+        if sig != self._last_best_five_sig:
+            while self.best_five_heroes_lay.count():
+                item = self.best_five_heroes_lay.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.hide()
+                    w.setParent(None)
+                    w.deleteLater()
+
+            for hid, hname, in_team, border_hex, pm in portraits:
+                chip = QFrame()
+                chip.setStyleSheet(
+                    "QFrame { background-color: rgba(9, 20, 40, 200); "
+                    "border: 1px solid rgba(200, 170, 110, 95); border-radius: 2px; }"
+                    if in_team
+                    else "QFrame { background-color: rgba(6, 36, 46, 215); "
+                    "border: 1px solid rgba(10, 200, 185, 145); border-radius: 2px; }"
+                )
+                chip.setToolTip(f"{hname}（{'当前队内' if in_team else '备战席可换'}）")
+                cl = QVBoxLayout(chip)
+                cl.setContentsMargins(2, 3, 2, 2)
+                cl.setSpacing(2)
+                cl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+                ico_sz = 18
+                ico = QLabel()
+                ico.setFixedSize(ico_sz, ico_sz)
+                ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                if pm is not None:
+                    ico.setPixmap(
+                        pm.scaled(
+                            ico_sz,
+                            ico_sz,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                else:
+                    ico.setText(hname[:1])
+                    ico.setStyleSheet(
+                        f"background-color: #040E1A; border: 1px solid {border_hex}; "
+                        f"border-radius: {ico_sz // 2}px; color: {border_hex}; font-size: 9px; font-weight: bold;"
+                    )
+
+                nm = QLabel(hname[:4] if is_narrow and len(hname) > 4 else hname)
+                nm.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                nm.setStyleSheet(
+                    f"border: none; background: transparent; font-size: 9px; font-weight: bold; "
+                    f"color: {'#F0E6D2' if in_team else '#A5F3FC'};"
+                )
+                cl.addWidget(ico, 0, Qt.AlignmentFlag.AlignHCenter)
+                cl.addWidget(nm)
+                self.best_five_heroes_lay.addWidget(chip, 1)
+            self._last_best_five_sig = sig
+
+        self.best_five_body.setVisible(self._best_five_expanded)
+        self.best_five_toggle_btn.setText("收起" if self._best_five_expanded else "展开")
+        self.best_five_strip.show()
+
+    def _sync_window_height(self, content_h: int) -> None:
+        self._last_rows_content_h = max(64, int(content_h))
+        scr = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
+        avail_h = scr.availableGeometry().height() if scr is not None else 720
+        max_win_h = max(self.MIN_H, avail_h - 24)
+        if self._custom_h is not None:
+            self.rows_scroll.setMinimumHeight(64)
+            self.rows_scroll.setMaximumHeight(self._QWIDGETSIZE_MAX)
+            self.layout_main.invalidate()
+            self.layout_main.activate()
+            self.setFixedHeight(min(max_win_h, max(self.MIN_H, self._custom_h)))
+        else:
+            max_scroll_h = max(260, min(780, avail_h - 180))
+            target_scroll_h = min(max_scroll_h, self._last_rows_content_h)
+            self.rows_scroll.setFixedHeight(target_scroll_h)
+
+            for sub_w in (self.best_five_body, self.best_five_strip):
+                lay_s = sub_w.layout()
+                if lay_s is not None:
+                    lay_s.invalidate()
+                    lay_s.activate()
+                sub_w.updateGeometry()
+
+            self.layout_main.invalidate()
+            self.layout_main.activate()
+            self.root.updateGeometry()
+            outer_lay = self.layout()
+            if outer_lay is not None:
+                outer_lay.invalidate()
+                outer_lay.activate()
+            total_h = max(self.layout_main.sizeHint().height() + 4, target_scroll_h + 100)
+            if total_h > max_win_h and target_scroll_h > 120:
+                shrunk_scroll_h = max(120, target_scroll_h - (total_h - max_win_h))
+                self.rows_scroll.setFixedHeight(shrunk_scroll_h)
+                self.layout_main.invalidate()
+                self.layout_main.activate()
+                self.root.updateGeometry()
+                if outer_lay is not None:
+                    outer_lay.invalidate()
+                    outer_lay.activate()
+                total_h = self.layout_main.sizeHint().height() + 4
+            self.setFixedHeight(min(max_win_h, total_h))
+        self.ensure_on_screen()
+        self._layout_corner_grips()
+
     def _refresh_last_state(self) -> None:
         if self._last_state is not None and self._last_store is not None and self.isVisible():
             self.update_state(self._last_state, self._last_store)
@@ -507,7 +801,22 @@ class ChampSelectOverlay(QWidget):
             self.patch_lbl.setText(f"{disp.split('（')[0]} · {mode_tag}")
 
         ally_ids = list(dict.fromkeys(([state.my_hero_id] if state.my_hero_id else []) + list(state.team_hero_ids)))
-        comp_txt, is_warn, needed_roles = analyze_team_needs(ally_ids, store)
+        ally_set = set(ally_ids)
+        analysis = analyze_champ_select_pool(
+            state.my_hero_id,
+            state.team_hero_ids,
+            state.bench_hero_ids,
+            store,
+            goal_mode=self._goal_mode,
+        )
+        needed_roles = analysis.needed_roles
+        best_swap_id = analysis.best_swap.hero_id if analysis.best_swap is not None else ""
+
+        mode_cn = "爽局" if self._goal_mode == "fun" else "冲分"
+        if len(ally_ids) >= 3 and analysis.current_score > 0:
+            self.team_score_lbl.setText(f"阵容 {analysis.current_score:.1f}分 · {mode_cn}")
+        else:
+            self.team_score_lbl.setText("爽局高上限视角" if self._goal_mode == "fun" else "冲分均衡视角")
 
         eff_w = self._custom_w or self.width() or self.DEFAULT_W
         is_narrow = eff_w < 342
@@ -530,12 +839,16 @@ class ChampSelectOverlay(QWidget):
             *,
             is_mine: bool = False,
             gap_badge: str = "",
+            swap_delta: float | None = None,
+            swap_reason: str = "",
+            is_best_swap: bool = False,
             compact: bool = False,
         ) -> QFrame | None:
             h = store.get_hero(hid)
             if h is None:
                 return None
             wr, name, rank, games = h.win_rate, h.name, h.rank, h.games
+            has_pos_swap = swap_delta is not None and swap_delta >= 1.5
             row = QFrame()
             row.setObjectName("SubCard")
             if is_mine:
@@ -543,7 +856,12 @@ class ChampSelectOverlay(QWidget):
                     "QFrame#SubCard { background-color: rgba(48, 36, 14, 232); "
                     "border: 1px solid #C89B3C; border-left: 3px solid #F0E6D2; border-radius: 2px; }"
                 )
-            elif gap_badge:
+            elif is_best_swap:
+                row.setStyleSheet(
+                    "QFrame#SubCard { background-color: rgba(6, 42, 52, 236); "
+                    "border: 1px solid #0AC8B9; border-left: 3px solid #FDE68A; border-radius: 2px; }"
+                )
+            elif gap_badge or has_pos_swap:
                 row.setStyleSheet(
                     "QFrame#SubCard { background-color: rgba(6, 36, 46, 228); "
                     "border: 1px solid #0397AB; border-left: 3px solid #0AC8B9; border-radius: 2px; }"
@@ -560,7 +878,7 @@ class ChampSelectOverlay(QWidget):
 
             hl = QHBoxLayout()
             hl.setContentsMargins(0, 0, 0, 0)
-            hl.setSpacing(5)
+            hl.setSpacing(3 if is_narrow else 5)
 
             tier = score_hero_tier(wr)
             t_lbl = QLabel(tier)
@@ -572,9 +890,20 @@ class ChampSelectOverlay(QWidget):
             ico_lbl = QLabel()
             ico_lbl.setFixedSize(ico_size, ico_size)
             ico_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pm = self._get_portrait(hid, store, "#F0E6D2" if is_mine else ("#0AC8B9" if gap_badge else "#785A28"))
+            pm = self._get_portrait(
+                hid,
+                store,
+                "#F0E6D2" if is_mine else ("#0AC8B9" if (gap_badge or has_pos_swap) else "#785A28"),
+            )
             if pm is not None:
-                ico_lbl.setPixmap(pm.scaled(ico_size, ico_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                ico_lbl.setPixmap(
+                    pm.scaled(
+                        ico_size,
+                        ico_size,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
             else:
                 ico_lbl.setText(name[:1])
                 ico_lbl.setStyleSheet(
@@ -599,7 +928,21 @@ class ChampSelectOverlay(QWidget):
                     "border-radius: 2px; padding: 0px 4px; color: #A5F3FC; font-size: 9px; font-weight: bold;"
                 )
                 hl.addWidget(gb_lbl)
-            elif role_tag:
+
+            if has_pos_swap and swap_delta is not None:
+                if gap_badge or is_narrow or not swap_reason:
+                    gain_txt = f"+{swap_delta:.1f}分"
+                else:
+                    gain_txt = f"+{swap_delta:.1f}分 · {swap_reason}"
+                gain_lbl = QLabel(gain_txt)
+                gain_lbl.setStyleSheet(
+                    "background-color: rgba(200, 155, 60, 48); border: 1px solid #C8AA6E; "
+                    "border-radius: 2px; padding: 0px 4px; color: #FDE68A; font-size: 9px; font-weight: bold;"
+                )
+                if swap_reason:
+                    gain_lbl.setToolTip(f"换取后整队 +{swap_delta:.1f}分 · {swap_reason}")
+                hl.addWidget(gain_lbl)
+            elif not gap_badge and role_tag:
                 tag_lbl = QLabel(role_tag)
                 tag_lbl.setStyleSheet(
                     "border: none; background: transparent; color: #FDE68A; font-size: 10px; font-weight: bold;"
@@ -672,8 +1015,8 @@ class ChampSelectOverlay(QWidget):
                 _append_widget(_make_section_hdr("◈ 我的当前锁定", "#FDE68A"))
                 _append_widget(my_row)
 
-        # 2. Actionable Bench Section: gap-fillers boosted + highlighted, then win-rate sorted
-        bench_items: list[tuple[int, float, str, str]] = []
+        # 2. Actionable Bench Section: positive swap-gain + gap-fillers boosted, then win-rate sorted
+        bench_items: list[tuple[int, float, int, float, str, str, float | None, str]] = []
         for hid in state.bench_hero_ids:
             if not hid or hid in seen:
                 continue
@@ -681,15 +1024,29 @@ class ChampSelectOverlay(QWidget):
             if h is None:
                 continue
             seen.add(hid)
-            h_role = _classify_hero_role(hid, store)
+            h_role = classify_hero_role(hid, store)
             gap_badge = _ROLE_GAP_BADGE.get(h_role, "") if h_role in needed_roles else ""
-            bench_items.append((1 if gap_badge else 0, h.win_rate, hid, gap_badge))
+            sd_entry = analysis.swap_deltas.get(hid)
+            swap_delta = sd_entry[0] if sd_entry is not None else None
+            swap_reason = sd_entry[1] if sd_entry is not None else ""
+            has_pos_gain = 1 if (swap_delta is not None and swap_delta >= 1.5) else 0
+            sort_delta = swap_delta if has_pos_gain and swap_delta is not None else -999.0
+            bench_items.append(
+                (has_pos_gain, sort_delta, 1 if gap_badge else 0, h.win_rate, hid, gap_badge, swap_delta, swap_reason)
+            )
 
         if bench_items:
-            bench_items.sort(key=lambda it: (it[0], it[1]), reverse=True)
+            bench_items.sort(key=lambda it: (it[0], it[1], it[2], it[3]), reverse=True)
             _append_widget(_make_section_hdr(f"◈ 备战席 · 可立即换取 ({len(bench_items)})", "#0AC8B9"))
-            for _prio, _wr, hid, gap_badge in bench_items[:8]:
-                brow = _build_hero_row(hid, "备战", gap_badge=gap_badge)
+            for _pg, _sd, _prio, _wr, hid, gap_badge, swap_delta, swap_reason in bench_items[:8]:
+                brow = _build_hero_row(
+                    hid,
+                    "备战",
+                    gap_badge=gap_badge,
+                    swap_delta=swap_delta,
+                    swap_reason=swap_reason,
+                    is_best_swap=(hid == best_swap_id),
+                )
                 if brow is not None:
                     _append_widget(brow)
 
@@ -712,18 +1069,21 @@ class ChampSelectOverlay(QWidget):
                 if mrow is not None:
                     _append_widget(mrow)
 
-        if comp_txt:
-            self.comp_alert_lbl.setText(comp_txt)
-            if is_warn:
-                self.comp_alert_lbl.setStyleSheet(
-                    "background-color: rgba(68, 38, 10, 215); border: 1px solid #D97706; "
-                    "border-radius: 2px; padding: 4px 7px; color: #FDE68A; font-size: 10px; font-weight: bold;"
-                )
+        # 4. Collapsible Best-5 strip (C(n,5) optimal lineup preview)
+        self._render_best_five(analysis.best_five, ally_set, store, is_narrow=is_narrow)
+
+        # 5. Unified Action Footer (replaces static-only alert with actionable swap decision)
+        if analysis.summary_text:
+            self.comp_alert_lbl.setText(analysis.summary_text)
+            if analysis.is_warn:
+                style_key = "warn"
+            elif analysis.best_swap is not None and analysis.summary_text.startswith("⚡"):
+                style_key = "swap"
             else:
-                self.comp_alert_lbl.setStyleSheet(
-                    "background-color: rgba(6, 40, 34, 195); border: 1px solid #09C269; "
-                    "border-radius: 2px; padding: 4px 7px; color: #6EE7B7; font-size: 10px;"
-                )
+                style_key = "ok"
+            if style_key != self._last_comp_alert_style:
+                self._last_comp_alert_style = style_key
+                self.comp_alert_lbl.setStyleSheet(_COMP_ALERT_QSS[style_key])
             self.comp_alert_lbl.show()
         else:
             self.comp_alert_lbl.hide()
@@ -741,6 +1101,7 @@ class ChampSelectOverlay(QWidget):
                 self.spell_lbl.setText("")
         else:
             self.spell_lbl.setText("◇ 等待锁定英雄...")
+        self.spell_lbl.setVisible(bool(self.spell_lbl.text()))
 
         # Explicitly measure every shown row widget so live updates while visible NEVER collapse to 60px!
         self.rows_container.invalidate()
@@ -756,31 +1117,7 @@ class ChampSelectOverlay(QWidget):
             explicit_sum_h += wh + (spacing if idx > 0 else 0)
         body_hint_h = self.rows_body.sizeHint().height()
         content_h = max(explicit_sum_h, body_hint_h) + 8
-
-        scr = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
-        avail_h = scr.availableGeometry().height() if scr is not None else 720
-        if self._custom_h is not None:
-            self.rows_scroll.setMinimumHeight(64)
-            self.rows_scroll.setMaximumHeight(self._QWIDGETSIZE_MAX)
-            self.layout_main.invalidate()
-            self.layout_main.activate()
-            self.setFixedHeight(min(avail_h - 24, max(self.MIN_H, self._custom_h)))
-        else:
-            # Allow full 10-13 hero visibility on 1080p/1440p without scrolling; bound safely on 1080p@150% DPI
-            max_scroll_h = max(260, min(780, avail_h - 180))
-            target_scroll_h = min(max_scroll_h, max(64, content_h))
-            self.rows_scroll.setFixedHeight(target_scroll_h)
-
-            self.layout_main.invalidate()
-            self.layout_main.activate()
-            outer_lay = self.layout()
-            if outer_lay is not None:
-                outer_lay.invalidate()
-                outer_lay.activate()
-            total_h = max(self.layout_main.sizeHint().height() + 4, target_scroll_h + 100)
-            self.setFixedHeight(min(avail_h - 24, total_h))
-        self.ensure_on_screen()
-        self._layout_corner_grips()
+        self._sync_window_height(content_h)
 
     def position_beside_lcu(self, lcu_phys_rect: tuple[int, int, int, int]) -> None:
         """Dock cleanly beside LCU in logical DPI coordinates, flipping left or clamping to stay on-screen."""

@@ -867,11 +867,9 @@ def test_lookup_window_auto_tier_new_settings_and_940x610_layout(
     finally:
         edition_mod._COMPILED_EDITION = prev_ed
 
-    # Strict visual discipline check: desktop UI files MUST NEVER use Web Tactile Orange (#FF5A1F)
-    for ui_rel in (
-        "src/hex_helper/ui/lookup_window.py",
-        "src/hex_helper/ui/edge_drawer.py",
-        "src/hex_helper/ui/augment_overlay.py",
-    ):
-        text = (ROOT / ui_rel).read_text(encoding="utf-8")
-        assert "#FF5A1F" not in text.upper(), f"Forbidden web orange color found in {ui_rel}"
+    # Strict visual discipline check: ALL desktop UI files MUST NEVER contain Web Tactile Orange (#FF5A1F)
+    ui_files = sorted((ROOT / "src/hex_helper/ui").rglob("*.py"))
+    assert ui_files, "Expected desktop UI source files under src/hex_helper/ui"
+    for ui_path in ui_files:
+        text = ui_path.read_text(encoding="utf-8")
+        assert "#FF5A1F" not in text.upper(), f"Forbidden web orange color found in {ui_path.relative_to(ROOT)}"

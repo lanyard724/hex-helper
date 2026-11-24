@@ -246,9 +246,24 @@ class HextechActionButton(_AnimatedHextechButton):
         super().__init__(text, parent)
         self.variant = variant
         self.pointed_right = pointed_right
+        self._font_pt: int | None = None
         self.setFixedHeight(height)
         extra_tip = 14 if pointed_right else 0
         self.setMinimumWidth(max(84 + extra_tip, len(text) * 14 + 34 + extra_tip))
+
+    def set_scaled_metrics(
+        self,
+        *,
+        height: int,
+        min_width: int | None = None,
+        font_pt: int | None = None,
+    ) -> None:
+        """Dynamically rescale button height, minimum width, and label point size for adaptive overlays."""
+        self.setFixedHeight(max(18, int(height)))
+        if min_width is not None:
+            self.setMinimumWidth(max(22, int(min_width)))
+        self._font_pt = max(8, int(font_pt)) if font_pt is not None else None
+        self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -270,7 +285,7 @@ class HextechActionButton(_AnimatedHextechButton):
 
         path = QPainterPath()
         if self.pointed_right:
-            tip = 11.0
+            tip = min(18.0, max(11.0, h * 0.36))
             path.moveTo(left_x, top_y)
             path.lineTo(right_x - tip, top_y)
             path.lineTo(right_x, mid_y)
@@ -336,9 +351,11 @@ class HextechActionButton(_AnimatedHextechButton):
         p.setPen(QPen(QBrush(b_grad), 1.9))
         p.drawPath(path)
 
-        font = display_font(10 if h < 30 else 11, bold=True, letter_spacing=1.0)
+        pt = self._font_pt if self._font_pt is not None else (10 if h < 30 else 11)
+        font = display_font(pt, bold=True, letter_spacing=1.0)
         p.setFont(font)
-        t_rect = QRectF(left_x + 4.0, top_y, right_x - left_x - (14.0 if self.pointed_right else 8.0), bot_y - top_y)
+        right_inset = (min(20.0, max(14.0, h * 0.42)) if self.pointed_right else 8.0)
+        t_rect = QRectF(left_x + 4.0, top_y, right_x - left_x - right_inset, bot_y - top_y)
         p.setPen(QColor(1, 10, 19, 215))
         p.drawText(t_rect.translated(0.0, 1.2), Qt.AlignmentFlag.AlignCenter, self.text())
         p.setPen(QColor("#FFFFFF") if t > 0.55 else QColor("#F0E6D2"))

@@ -174,7 +174,7 @@ COACH_SYSTEM_INSTRUCTION = """你是LOL海克斯大乱斗(26.23)实时参谋，�
 - build_path：未出大件名(2-5件,含未升二级鞋)。
 - tactical_summary<=28字：1句纯团战/站位/技能提醒，禁提装备与金币。
 7.六神满格：inventory_status.status为full_6_complete或full_5_plus_boots时，禁推第7件或散件；默认next_items[0]推500G合剂(2139巫术/2140愤怒/2138钢铁,priority="满格合剂")、build_path=[]、buy_now提示磕合剂；仅胜负刚需(0重伤打高回复/频被秒/钱够卖鞋换大件)可换装(priority="必须换装",reason写"卖X换Y+理由")。
-8.开局简报：仅trigger_reason=="game_start"时填opening_brief(enemy_threat<=22字敌核心威胁/伤害结构,augment_goal<=22字目标海克斯流派,opening_buy<=24字1400G出门与首件)；否则省略或{}。"""
+8.开局简报：仅trigger_reason=="game_start"时填opening_brief(enemy_threat<=22字结合lobby_scout敌大腿/车队与伤害结构,augment_goal<=22字目标海克斯流派,opening_buy<=24字1400G出门与首件)；否则{}。"""
 
 
 @dataclass(frozen=True)
@@ -253,6 +253,22 @@ _STRATEGIC_ROSTER_ITEM_IDS: frozenset[str] = frozenset(
     }
 )
 _VERBOSE_SPECIAL_BUILD_KEYS: frozenset[str] = frozenset({"mechanic", "playstyle_tip"})
+_LOBBY_SCOUT_PII_KEYS: frozenset[str] = frozenset(
+    {"puuid", "puuids", "summoner_name", "summonername", "riot_id", "riotid", "account_id", "accountid"}
+)
+
+
+def _compact_lobby_scout(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Sanitize and prune lobby_scout context while stripping any accidental PII keys."""
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    sanitized = {
+        k: v
+        for k, v in raw.items()
+        if str(k).strip().lower() not in _LOBBY_SCOUT_PII_KEYS
+    }
+    cleaned = _prune_empty(sanitized)
+    return cleaned if isinstance(cleaned, dict) else {}
 
 
 def _extract_item_id_token(raw: Any) -> str:
@@ -814,6 +830,7 @@ def build_coach_prompt_payload(req: CoachRequestPayload, store: DataStore | None
         trigger_reason=req.trigger_reason,
         has_offered=bool(req.offered_augments),
     )
+    compact_lobby_scout = _compact_lobby_scout(req.lobby_scout)
 
     # Assemble final payload: static match-invariant prefix FIRST, volatile state at tail
     data: dict[str, Any] = {
@@ -838,6 +855,8 @@ def build_coach_prompt_payload(req: CoachRequestPayload, store: DataStore | None
     data["committed_build_plan"] = compact_committed_plan
     data["local_engine_top_items"] = compact_local_items
     data["threat_summary"] = list(req.threat_summary or [])
+    if compact_lobby_scout:
+        data["lobby_scout"] = compact_lobby_scout
     data["allies"] = deduped_allies
     data["enemies"] = cleaned_enemies
     return data

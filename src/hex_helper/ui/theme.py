@@ -40,7 +40,7 @@ TEXT_MUTED = "#A09B8C"
 TEXT_FAINT = "#5B5A56"
 GREEN_ONLINE = "#09C269"
 
-# Weathered Hextech Seal Palette (LOL V16.23 native bronze/cyan, strictly zero Web #FF5A1F)
+# Weathered Hextech Seal Palette (LOL V16.23 native bronze/cyan, strictly zero Web Admin Tactile Orange)
 SEAL_VEIL_TOP = "rgba(4, 14, 26, 198)"
 SEAL_VEIL_MID = "rgba(9, 20, 40, 212)"
 SEAL_VEIL_BOT = "rgba(1, 10, 19, 226)"

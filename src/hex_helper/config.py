@@ -168,10 +168,15 @@ class AppConfig:
     champ_window_size: list[int] | None = None
     drawer_pos: list[int] | None = None
     drawer_size: list[int] | None = None
+    drawer_scale: float | None = None
     drawer_y_ratio: float = 0.34
     combo_drawer_pos: list[int] | None = None
     combo_drawer_size: list[int] | None = None
+    combo_drawer_scale: float | None = None
     combo_overlay_enabled: bool = True
+    combo_auto_popup_on_picker: bool = False
+    champ_select_goal_mode: str = "climb"  # "climb" | "fun"
+    lobby_scout_enabled: bool = True
     unsealed_user_ids: list[str] = field(default_factory=list)
     seal_snooze_until: int = 0
     newbie_banner_dismissed: bool = False
@@ -226,10 +231,15 @@ class AppConfig:
             "champ_window_size",
             "drawer_pos",
             "drawer_size",
+            "drawer_scale",
             "drawer_y_ratio",
             "combo_drawer_pos",
             "combo_drawer_size",
+            "combo_drawer_scale",
             "combo_overlay_enabled",
+            "combo_auto_popup_on_picker",
+            "champ_select_goal_mode",
+            "lobby_scout_enabled",
             "unsealed_user_ids",
             "seal_snooze_until",
             "newbie_banner_dismissed",
@@ -239,6 +249,10 @@ class AppConfig:
                 setattr(cfg, key, raw[key])
 
         cfg.combo_overlay_enabled = bool(cfg.combo_overlay_enabled)
+        cfg.combo_auto_popup_on_picker = bool(cfg.combo_auto_popup_on_picker)
+        goal_mode = str(cfg.champ_select_goal_mode or "climb").strip().lower()
+        cfg.champ_select_goal_mode = goal_mode if goal_mode in ("climb", "fun") else "climb"
+        cfg.lobby_scout_enabled = bool(cfg.lobby_scout_enabled)
         cfg.telemetry_enabled = bool(cfg.telemetry_enabled)
         cfg.auto_first_prismatic_mode = bool(cfg.auto_first_prismatic_mode)
         cfg.smart_picker_ai_gate = bool(cfg.smart_picker_ai_gate)
@@ -332,6 +346,16 @@ class AppConfig:
             )
 
         cfg.drawer_y_ratio = max(0.08, min(0.82, float(cfg.drawer_y_ratio)))
+        for scale_attr in ("drawer_scale", "combo_drawer_scale"):
+            raw_sc = getattr(cfg, scale_attr, None)
+            if raw_sc is None:
+                setattr(cfg, scale_attr, None)
+            else:
+                try:
+                    val_sc = float(raw_sc)
+                    setattr(cfg, scale_attr, round(max(0.85, min(2.20, val_sc)), 3))
+                except (TypeError, ValueError):
+                    setattr(cfg, scale_attr, None)
         return cfg
 
 

@@ -213,7 +213,8 @@ def test_lookup_window_combo_overlay_checkbox_and_callback():
 
 
 def test_app_controller_decouples_winrate_badges_from_combo_overlay(tmp_path: Path):
-    """Verify HexHelperController drives AugmentComboOverlay independently without mutating win-rate scores."""
+    """Verify v1.4.5 de-bloat behavior: unified shifts render on top badges without competing side auto-popup,
+    while opt-in auto-popup or manual F7 expand still enters picker mode, registers OCR exclude rect, and obeys full-lock."""
     from types import SimpleNamespace
 
     from hex_helper.app import GameState, HexHelperController, HexStateMachine
@@ -272,6 +273,7 @@ def test_app_controller_decouples_winrate_badges_from_combo_overlay(tmp_path: Pa
     ctl._last_combo_verdict = None
     ctl._last_cs = None
     ctl.cfg = AppConfig(combo_overlay_enabled=True)
+    assert ctl.cfg.combo_auto_popup_on_picker is False
     ctl.store = store
     ctl.sm = HexStateMachine()
     ctl.sm.state = GameState.AUGMENT_PICKING
@@ -297,16 +299,30 @@ def test_app_controller_decouples_winrate_badges_from_combo_overlay(tmp_path: Pa
     ctl._render_augment_badges(cards, game_rect=rect)
     app.processEvents()
 
-    # 1. Top win-rate badge overlay remains 100% pure Bayesian win rate (1225 wins raw WR)
+    # (a) Default AppConfig(combo_overlay_enabled=True) has combo_auto_popup_on_picker=False:
+    #     combo_overlay does NOT auto-popup during picker, while unified HexScore/synergy/conflict shifts
+    #     render directly on top badges without mutating underlying Bayesian stats.
+    assert ctl.combo_overlay.isVisible() is False
+    assert ctl.combo_overlay.mode == "plan"
+    assert ctl.combo_overlay.is_expanded is False
+
     assert len(captured_badge_items) == 3
     by_aid = {it.score.augment_id: it for it in captured_badge_items}
+    assert by_aid["1225"].score.raw_win_rate == 0.62
+    assert by_aid["1225"].unified is not None
+    assert by_aid["1225"].unified.shift_kind == "conflict"
+    assert by_aid["1225"].unified.combo_shift < 0
+    assert by_aid["1225"].unified.final_hex_score < by_aid["1225"].unified.base_hex_score
+    assert "互斥" in by_aid["1225"].unified.shift_label
+    assert by_aid["1045"].unified is not None
+    assert by_aid["1045"].unified.shift_kind == "synergy"
+    assert by_aid["1045"].unified.combo_shift > 0
+    assert by_aid["1045"].unified.final_hex_score > by_aid["1045"].unified.base_hex_score
+    assert "联动" in by_aid["1045"].unified.shift_label
+    # Huge +9% raw WR lead keeps 1225 ahead even after conflict penalty
     assert by_aid["1225"].is_best is True
     assert by_aid["1045"].is_best is False
 
-    # 2. Independent combo overlay auto-expands into picker mode, downgrades 1225 & crowns 1045
-    assert ctl.combo_overlay.isVisible() is True
-    assert ctl.combo_overlay.mode == "picker"
-    assert ctl.combo_overlay.is_expanded is True
     assert ctl._last_combo_verdict is not None
     verdict_by_aid = {c.augment_id: c for c in ctl._last_combo_verdict.cards}
     assert verdict_by_aid["1225"].verdict == "conflict"
@@ -314,16 +330,44 @@ def test_app_controller_decouples_winrate_badges_from_combo_overlay(tmp_path: Pa
     assert verdict_by_aid["1045"].verdict == "jackpot"
     assert ctl._last_combo_verdict.best_slot_index == 2
 
-    # 3. Visible combo overlay is registered in OCR exclude rects
+    # (b-1) Manual F7 expand enters picker mode immediately and registers OCR exclude rect
+    ctl._toggle_combo_hotkey()
+    app.processEvents()
+    assert ctl.combo_overlay.isVisible() is True
+    assert ctl.combo_overlay.mode == "picker"
+    assert ctl.combo_overlay.is_expanded is True
+    excl_f7 = ctl._get_all_overlay_exclude_rects()
+    combo_rect_f7 = ctl.combo_overlay.get_exclude_rect()
+    assert combo_rect_f7 is not None
+    assert combo_rect_f7 in excl_f7
+
+    # (b-2) Exiting picker restores collapsed state cleanly (zero ghost re-expand),
+    #       and opt-in combo_auto_popup_on_picker=True auto-enters picker mode and registers OCR exclude rect
+    ctl.combo_overlay.exit_picker_mode()
+    app.processEvents()
+    assert ctl.combo_overlay.mode == "plan"
+    assert ctl.combo_overlay.is_expanded is False
+    ctl.combo_overlay.hide()
+    assert ctl.combo_overlay.isVisible() is False
+
+    ctl.cfg.combo_auto_popup_on_picker = True
+    ctl._render_augment_badges(cards, game_rect=rect)
+    app.processEvents()
+    assert ctl.combo_overlay.isVisible() is True
+    assert ctl.combo_overlay.mode == "picker"
+    assert ctl.combo_overlay.is_expanded is True
     excl = ctl._get_all_overlay_exclude_rects()
     combo_rect = ctl.combo_overlay.get_exclude_rect()
     assert combo_rect is not None
     assert combo_rect in excl
 
-    # 4. Commercial full-lock immediately hides & locks combo overlay
+    # (b-3) Commercial full-lock immediately hides & locks combo overlay (even with opt-in enabled)
     ctl._commercial = True
     ctl._service_locked = True
     ctl._sync_overlays_for_cutoff_change()
+    app.processEvents()
+    assert ctl.combo_overlay.isVisible() is False
+    ctl._render_augment_badges(cards, game_rect=rect)
     app.processEvents()
     assert ctl.combo_overlay.isVisible() is False
 

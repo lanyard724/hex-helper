@@ -224,6 +224,7 @@ class LookupWindow(QWidget):
         on_dismiss_newbie_banner: Callable[[], None] | None = None,
         on_open_hotkeys: Callable[[], None] | None = None,
         on_open_feedback: Callable[[], None] | None = None,
+        on_reset_overlay_sizes: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         init_hextech_fonts()
@@ -249,6 +250,7 @@ class LookupWindow(QWidget):
         self._on_dismiss_newbie_banner = on_dismiss_newbie_banner
         self._on_open_hotkeys = on_open_hotkeys
         self._on_open_feedback = on_open_feedback
+        self._on_reset_overlay_sizes = on_reset_overlay_sizes
         self.tab2_push_btn: HextechActionButton | None = None
         self.hotkeys_summary_lbl: QLabel | None = None
         self.open_hotkeys_btn: HextechActionButton | None = None
@@ -1922,8 +1924,16 @@ class LookupWindow(QWidget):
         save_btn.clicked.connect(self._save_clicked)
         self.toggle_combo_btn = HextechActionButton("预览/切换海克斯联动浮窗 (F7)", variant="gold", height=34)
         self.toggle_combo_btn.clicked.connect(lambda: self._on_toggle_combo and self._on_toggle_combo())
+        self.reset_overlay_sizes_btn = HextechActionButton("重置左右悬浮窗尺寸", variant="gold", height=34)
+        self.reset_overlay_sizes_btn.setToolTip(
+            "将左右两侧推荐悬浮窗恢复至当前屏幕（含 4K）自适应默认尺寸与字号；也可双击浮窗边角缩放把手一键恢复"
+        )
+        self.reset_overlay_sizes_btn.clicked.connect(
+            lambda: self._on_reset_overlay_sizes and self._on_reset_overlay_sizes()
+        )
         save_row.addWidget(save_btn)
         save_row.addWidget(self.toggle_combo_btn)
+        save_row.addWidget(self.reset_overlay_sizes_btn)
         if not self._commercial:
             self.seal_sandbox_btn = HextechActionButton("预览海克斯封印与 720ms 破封沙盒", variant="gold", height=34)
             self.seal_sandbox_btn.clicked.connect(self.open_seal_sandbox)

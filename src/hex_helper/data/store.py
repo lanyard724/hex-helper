@@ -77,6 +77,7 @@ class _ModeSnapshot:
     hero_spells: dict[str, list[SpellComboStat]]
     core_builds: dict[str, list[CoreBuild]]
     destiny: dict[str, DestinyData]
+    augment_items: dict[tuple[str, str], DestinyData]
     item_recs: dict[str, dict[str, ItemRecStat]]
     item_meta_raw: dict[str, dict]
     hero_name_index: dict[str, str]
@@ -102,6 +103,7 @@ class DataStore:
         self._hero_spells: dict[str, list[SpellComboStat]] = {}
         self._core_builds: dict[str, list[CoreBuild]] = {}
         self._destiny: dict[str, DestinyData] = {}
+        self._augment_items: dict[tuple[str, str], DestinyData] = {}
         self._item_recs: dict[str, dict[str, ItemRecStat]] = {}
         self._item_meta_raw: dict[str, dict] = {}
 
@@ -296,27 +298,39 @@ class DataStore:
             core_builds[str(hid)] = parsed_b
 
         destiny: dict[str, DestinyData] = {}
+        augment_items: dict[tuple[str, str], DestinyData] = {}
         for hid, aug_dict in destiny_raw.items():
-            d3081 = aug_dict.get("3081")
-            if not isinstance(d3081, dict):
+            if not isinstance(aug_dict, dict):
                 continue
-            bl = d3081.get("baseline") or {}
-            items_list: list[DestinyItemEntry] = []
-            for it in d3081.get("items", []):
-                items_list.append(
-                    DestinyItemEntry(
-                        item_id=str(it.get("item", "")),
-                        name=str(it.get("name") or self.static.get_item_name(str(it.get("item", "")))),
-                        games=int(it.get("games", 0)),
-                        wins=int(it.get("wins", 0)),
-                        low_sample=bool(it.get("low_sample", False)),
+            hid_s = str(hid)
+            for aid, entry_raw in aug_dict.items():
+                if not isinstance(entry_raw, dict):
+                    continue
+                aid_s = str(aid)
+                bl = entry_raw.get("baseline")
+                bl_dict = bl if isinstance(bl, dict) else {}
+                items_list: list[DestinyItemEntry] = []
+                for it in entry_raw.get("items") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    item_id_s = str(it.get("item", ""))
+                    items_list.append(
+                        DestinyItemEntry(
+                            item_id=item_id_s,
+                            name=str(it.get("name") or self.static.get_item_name(item_id_s)),
+                            games=int(it.get("games", 0)),
+                            wins=int(it.get("wins", 0)),
+                            low_sample=bool(it.get("low_sample", False)),
+                        )
                     )
+                parsed_entry = DestinyData(
+                    baseline_games=int(bl_dict.get("games", 0)),
+                    baseline_wins=int(bl_dict.get("wins", 0)),
+                    items=tuple(items_list),
                 )
-            destiny[str(hid)] = DestinyData(
-                baseline_games=int(bl.get("games", 0)),
-                baseline_wins=int(bl.get("wins", 0)),
-                items=tuple(items_list),
-            )
+                augment_items[(hid_s, aid_s)] = parsed_entry
+                if aid_s == "3081":
+                    destiny[hid_s] = parsed_entry
 
         # Parse item recommendations & merge Tear item pairs (base <-> stacked)
         item_recs: dict[str, dict[str, ItemRecStat]] = {}
@@ -442,6 +456,7 @@ class DataStore:
             hero_spells=hero_spells,
             core_builds=core_builds,
             destiny=destiny,
+            augment_items=augment_items,
             item_recs=item_recs,
             item_meta_raw=item_meta_raw,
             hero_name_index=name_index,
@@ -461,6 +476,7 @@ class DataStore:
         self._hero_spells = snap.hero_spells
         self._core_builds = snap.core_builds
         self._destiny = snap.destiny
+        self._augment_items = snap.augment_items
         self._item_recs = snap.item_recs
         self._item_meta_raw = snap.item_meta_raw
         self._hero_name_index = snap.hero_name_index
@@ -597,9 +613,19 @@ class DataStore:
         with self._lock:
             return list(self._core_builds.get(str(hero_id)) or [])
 
-    def get_destiny_data(self, hero_id: str | int) -> DestinyData | None:
+    def get_augment_item_data(self, hero_id: str | int, augment_id: str | int) -> DestinyData | None:
+        hid_s = str(hero_id)
+        aid_s = str(augment_id)
         with self._lock:
-            return self._destiny.get(str(hero_id))
+            hit = self._augment_items.get((hid_s, aid_s))
+            if hit is not None:
+                return hit
+            if aid_s == "3081":
+                return self._destiny.get(hid_s)
+            return None
+
+    def get_destiny_data(self, hero_id: str | int) -> DestinyData | None:
+        return self.get_augment_item_data(hero_id, "3081")
 
     def get_hero_item_recs(self, hero_id: str | int) -> dict[str, ItemRecStat]:
         with self._lock:

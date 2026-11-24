@@ -9,7 +9,7 @@ from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from hex_helper.scoring.destiny import DestinyItemRec
-from hex_helper.scoring.tier import AugmentScore
+from hex_helper.scoring.tier import AugmentScore, UnifiedAugmentDecision
 from hex_helper.ui.hextech_widgets import HextechShimmerBar
 from hex_helper.ui.theme import BASE_OVERLAY_QSS, RARITY_COLORS, tier_badge_qss
 from hex_helper.ui.win32_window import physical_rect_to_logical, show_no_activate
@@ -25,6 +25,17 @@ class AugmentBadgeRenderItem:
     uncertain: bool = False
     archetype_hint: str = ""
     is_transmute: bool = False
+    unified: UnifiedAugmentDecision | None = None
+
+
+def _compact_sample_text(score: AugmentScore) -> str:
+    if score.games < 30:
+        return f"仅{score.games}场" if score.games > 0 else "暂无样本"
+    if score.low_sample or score.games < 300:
+        return f"低样本·{score.games}场"
+    if score.games >= 1000:
+        return f"{score.games / 1000.0:.1f}k场"
+    return f"{score.games}场"
 
 
 class _SingleBadgeCard(QFrame):
@@ -38,9 +49,15 @@ class _SingleBadgeCard(QFrame):
         self._is_best = item.is_best
         self._sheen_t: float = -0.35
         self._sheen_anim: QVariantAnimation | None = None
+        u = item.unified
 
         self.setObjectName("PanelRoot")
-        if item.is_best:
+        if u is not None and u.overridden_by_combo:
+            self.setStyleSheet(
+                "QFrame#PanelRoot { background-color: rgba(9, 20, 40, 246); "
+                "border: 2px solid #0AC8B9; border-top: 3px solid #F0E6D2; border-radius: 2px; }"
+            )
+        elif item.is_best:
             self.setStyleSheet(
                 "QFrame#PanelRoot { background-color: rgba(9, 20, 40, 246); "
                 "border: 2px solid #C89B3C; border-top: 3px solid #F0E6D2; border-radius: 2px; }"
@@ -52,56 +69,139 @@ class _SingleBadgeCard(QFrame):
                 f"border: 1px solid #463714; border-top: 2px solid {rarity_color}; border-radius: 2px; }}"
             )
 
-        self.setFixedWidth(max(168, min(258, int(card_width))))
-        compact = card_width < 196
+        card_w = max(168, min(258, int(card_width)))
+        self.setFixedWidth(card_w)
+        narrow_top = card_w < 246
+        compact = card_w <= 214
+        ultra_compact = card_w <= 180
+        h_pad = 5 if ultra_compact else (6 if compact else (8 if narrow_top else 10))
+        v_pad = 5 if ultra_compact else (6 if compact else 7)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(7 if compact else 10, 6 if compact else 7, 7 if compact else 10, 6 if compact else 7)
+        lay.setContentsMargins(h_pad, v_pad, h_pad, v_pad)
         lay.setSpacing(3 if compact else 4)
 
-        top = QHBoxLayout()
-        tier_text = f"◈ {item.score.tier} 首选" if item.is_best else item.score.tier
-        t_lbl = QLabel(tier_text)
-        t_lbl.setStyleSheet(tier_badge_qss(item.score.tier))
-
-        delta_pct = item.score.delta * 100.0
         pct = item.score.percentile
-        if pct is not None:
-            d_color = "#0AC8B9" if (pct >= 65.0 or delta_pct >= 0.5) else ("#FCA5A5" if item.score.is_below_rarity_par else "#F0E6D2")
-        else:
-            d_color = "#0AC8B9" if delta_pct >= 0.5 else ("#FCA5A5" if delta_pct <= -1.5 else "#F0E6D2")
-        d_lbl = QLabel(f"{delta_pct:+.2f}%")
-        d_lbl.setStyleSheet(f"color: {d_color}; font-weight: bold; font-size: 13px;")
+        stat_tooltip = ""
         if pct is not None and item.score.games >= 30:
             z_txt = f" · z={item.score.z_score:+.2f}" if item.score.z_score is not None else ""
-            d_lbl.setToolTip(f"同阶百分位 P{pct:.0f}{z_txt}")
+            stat_tooltip = f"同阶百分位 P{pct:.0f}{z_txt}"
 
+        # Anchor 1 (Top row): Tier + HexScore on left, Shift Pill (or compact delta) on right
+        top = QHBoxLayout()
+        top.setSpacing(2 if compact else (3 if narrow_top else 4))
+        if u is not None and u.overridden_by_combo:
+            tier_text = "◈反超首选" if ultra_compact else ("◈ 反超首选" if narrow_top else "◈ 联动反超首选")
+            t_pad = "1px 2px" if ultra_compact else ("1px 3px" if compact else ("1px 4px" if narrow_top else "1px 5px"))
+            t_fs = "9px" if compact else "11px"
+            t_lbl = QLabel(tier_text)
+            t_lbl.setStyleSheet(
+                "background-color: rgba(10, 200, 185, 42); border: 1px solid #0AC8B9; "
+                f"border-radius: 2px; padding: {t_pad}; color: #F0E6D2; "
+                f"font-weight: bold; font-size: {t_fs};"
+            )
+        else:
+            if item.is_best:
+                tier_text = f"◈{item.score.tier}首选" if ultra_compact else f"◈ {item.score.tier} 首选"
+            else:
+                tier_text = item.score.tier
+            t_lbl = QLabel(tier_text)
+            t_qss = tier_badge_qss(item.score.tier)
+            if ultra_compact:
+                t_qss = f"{t_qss} padding: 1px 2px; font-size: 9px;"
+            elif compact:
+                t_qss = f"{t_qss} padding: 1px 3px; font-size: 10px;"
+            elif narrow_top:
+                t_qss = f"{t_qss} padding: 1px 4px; font-size: 11px;"
+            t_lbl.setStyleSheet(t_qss)
         top.addWidget(t_lbl)
+
+        if u is not None and item.score.games >= 30:
+            hs_color = (
+                "#F0E6D2"
+                if (item.is_best or u.final_hex_score >= 78.0)
+                else ("#FCA5A5" if u.final_hex_score < 45.0 else "#C8AA6E")
+            )
+            hs_text = f"{u.final_hex_score:.1f}" if ultra_compact else f"{u.final_hex_score:.1f}分"
+            hs_fs = "9px" if ultra_compact else ("10px" if compact else ("11px" if narrow_top else "12px"))
+            hs_lbl = QLabel(hs_text)
+            hs_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: {hs_color}; "
+                f"font-weight: bold; font-size: {hs_fs};"
+            )
+            hs_tip = f"综合分 {u.final_hex_score:.1f}（基础 {u.base_hex_score:.1f}）"
+            if stat_tooltip:
+                hs_tip = f"{hs_tip} · {stat_tooltip}"
+            hs_lbl.setToolTip(hs_tip)
+            top.addWidget(hs_lbl)
+
         top.addStretch(1)
+
+        delta_pct = item.score.delta * 100.0
+        if u is not None and u.shift_label:
+            if u.shift_kind == "synergy":
+                pill_bg, pill_fg = "rgba(6, 48, 56, 215)", "#0AC8B9"
+            elif u.shift_kind == "gamble":
+                pill_bg, pill_fg = "rgba(56, 36, 8, 215)", "#F59E0B"
+            elif u.shift_kind == "conflict":
+                pill_bg, pill_fg = "rgba(68, 16, 22, 215)", "#FCA5A5"
+            else:
+                pill_bg, pill_fg = "rgba(20, 32, 48, 215)", "#C8AA6E"
+            p_pad = "1px 2px" if ultra_compact else ("1px 3px" if compact else ("1px 4px" if narrow_top else "1px 5px"))
+            p_fs = "9px" if compact else "10px"
+            d_lbl = QLabel(u.shift_label)
+            d_lbl.setStyleSheet(
+                f"background-color: {pill_bg}; border: 1px solid {pill_fg}; "
+                f"border-radius: 2px; padding: {p_pad}; color: {pill_fg}; "
+                f"font-weight: bold; font-size: {p_fs};"
+            )
+            delta_tip = f"单卡胜率差 {delta_pct:+.1f}%"
+            if stat_tooltip:
+                delta_tip = f"{delta_tip} · {stat_tooltip}"
+            d_lbl.setToolTip(delta_tip)
+        else:
+            if pct is not None:
+                d_color = (
+                    "#0AC8B9"
+                    if (pct >= 65.0 or delta_pct >= 0.5)
+                    else ("#FCA5A5" if item.score.is_below_rarity_par else "#F0E6D2")
+                )
+            else:
+                d_color = "#0AC8B9" if delta_pct >= 0.5 else ("#FCA5A5" if delta_pct <= -1.5 else "#F0E6D2")
+            d_fs = "11px" if compact else "13px"
+            d_lbl = QLabel(f"{delta_pct:+.1f}%")
+            d_lbl.setStyleSheet(f"border: none; background: transparent; color: {d_color}; font-weight: bold; font-size: {d_fs};")
+            if stat_tooltip:
+                d_lbl.setToolTip(stat_tooltip)
+
         top.addWidget(d_lbl)
         lay.addLayout(top)
 
+        # Anchor 2 (Mid row): Clean 2-item strip (raw win rate + compact sample; percentile moved to tooltip)
         mid = QHBoxLayout()
-        wr_text = f"胜率 {item.score.raw_win_rate * 100:.2f}%" if item.score.games >= 30 else "样本不足"
+        wr_text = f"胜率 {item.score.raw_win_rate * 100:.1f}%" if item.score.games >= 30 else "样本不足"
         wr_lbl = QLabel(wr_text)
-        wr_lbl.setStyleSheet("font-weight: bold; font-size: 12px; color: #F0E6D2;")
-        if pct is not None and item.score.games >= 30:
-            top_pct = max(1, min(99, int(round(100.0 - pct))))
-            rank_prefix = f"同阶前{top_pct}%" if card_width >= 224 else f"前{top_pct}%"
-            sample_text = f"{rank_prefix} · {item.score.sample_label}"
-        else:
-            sample_text = item.score.sample_label
-        g_lbl = QLabel(sample_text)
-        g_lbl.setStyleSheet("color: #C8AA6E; font-size: 11px;" if item.score.low_sample else "color: #A09B8C; font-size: 11px;")
+        wr_lbl.setStyleSheet("border: none; background: transparent; font-weight: bold; font-size: 12px; color: #F0E6D2;")
+        g_lbl = QLabel(_compact_sample_text(item.score))
+        g_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #C8AA6E; font-size: 11px;"
+            if item.score.low_sample
+            else "border: none; background: transparent; color: #A09B8C; font-size: 11px;"
+        )
+        if stat_tooltip:
+            wr_lbl.setToolTip(stat_tooltip)
+            g_lbl.setToolTip(stat_tooltip)
+            self.setToolTip(stat_tooltip)
         mid.addWidget(wr_lbl)
         mid.addStretch(1)
         mid.addWidget(g_lbl)
         lay.addLayout(mid)
 
+        # Single prioritized footer line: destiny_items > is_transmute > shift_reason > archetype_hint > uncertain
         if item.destiny_items:
             top_d = " / ".join(f"{d.name}({d.delta * 100:+.1f}%)" for d in item.destiny_items[:2])
             d_hint = QLabel(f"◈ 命运绑定：{top_d}")
             d_hint.setWordWrap(True)
-            d_hint.setStyleSheet("color: #C8AA6E; font-size: 11px;")
+            d_hint.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-size: 11px;")
             lay.addWidget(d_hint)
         elif item.is_transmute:
             tx_lbl = QLabel("⚡ 质变符文 · 选后自动二次识别")
@@ -110,6 +210,21 @@ class _SingleBadgeCard(QFrame):
                 "border-radius: 2px; padding: 2px 6px; color: #F5D0FE; font-size: 10px; font-weight: bold;"
             )
             lay.addWidget(tx_lbl)
+        elif u is not None and u.shift_reason:
+            if u.shift_kind == "conflict":
+                sr_prefix, sr_bg, sr_bd, sr_fg = "▽ ", "rgba(68, 16, 22, 210)", "#DC2626", "#FECACA"
+            elif u.shift_kind == "gamble":
+                sr_prefix, sr_bg, sr_bd, sr_fg = "◈ ", "rgba(56, 36, 8, 210)", "#F59E0B", "#FDE68A"
+            else:
+                sr_prefix, sr_bg, sr_bd, sr_fg = "◈ ", "rgba(8, 42, 54, 210)", "#0AC8B9", "#A5F3FC"
+            sr_lbl = QLabel(f"{sr_prefix}{u.shift_reason}")
+            sr_lbl.setWordWrap(True)
+            sr_lbl.setToolTip(u.shift_reason)
+            sr_lbl.setStyleSheet(
+                f"background-color: {sr_bg}; border: 1px solid {sr_bd}; "
+                f"border-radius: 2px; padding: 2px 6px; color: {sr_fg}; font-size: 10px; font-weight: bold;"
+            )
+            lay.addWidget(sr_lbl)
         elif item.archetype_hint:
             sp_lbl = QLabel(f"⚡ {item.archetype_hint}")
             sp_lbl.setWordWrap(True)
@@ -120,7 +235,7 @@ class _SingleBadgeCard(QFrame):
             lay.addWidget(sp_lbl)
         elif item.uncertain:
             u_lbl = QLabel("◇ 识别待确认 · 按 F2 重扫")
-            u_lbl.setStyleSheet("color: #FDBA74; font-size: 11px;")
+            u_lbl.setStyleSheet("border: none; background: transparent; color: #FDBA74; font-size: 11px;")
             lay.addWidget(u_lbl)
 
         if item.is_best and animate_sheen:
@@ -250,6 +365,15 @@ class AugmentBadgesOverlay(QWidget):
                     it.uncertain,
                     it.archetype_hint,
                     it.is_transmute,
+                    (
+                        round(it.unified.final_hex_score, 1),
+                        it.unified.shift_kind,
+                        it.unified.shift_label,
+                        it.unified.shift_reason,
+                        it.unified.overridden_by_combo,
+                    )
+                    if it.unified is not None
+                    else None,
                 )
                 for it in items
             ),

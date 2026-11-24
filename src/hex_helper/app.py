@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from hex_helper.coach.gemini_coach import GeminiCallStats
 from hex_helper.game.lcu_client import LcuClient
 from hex_helper.game.live_client import LiveClientReader
+from hex_helper.game.lobby_scout import LobbyScoutSnapshot, scout_lobby_readonly
 from hex_helper.game.models import ChampSelectState, LiveMatchSnapshot
 from hex_helper.logging_ring import install_match_log_handler
 from hex_helper.scoring.augment_combo import (
@@ -71,7 +72,7 @@ from hex_helper.scoring.matchup_optimizer import (
     optimize_next_items,
     reconcile_match_build_plan,
 )
-from hex_helper.scoring.tier import AugmentScore, score_hero_augment
+from hex_helper.scoring.tier import AugmentScore, rank_picker_cards, score_hero_augment
 from hex_helper.ui.augment_combo_overlay import AugmentComboOverlay
 from hex_helper.ui.augment_overlay import AugmentBadgeRenderItem, AugmentBadgesOverlay
 from hex_helper.ui.calibration_ui import CalibrationOverlay
@@ -536,11 +537,37 @@ def _build_tray_icon() -> QIcon:
     return QIcon(pm)
 
 
+class _ThreadSafeLcuProxy:
+    """Per-call synchronized read-only LCU proxy used when tests inject or patch controller.lcu."""
+
+    def __init__(self, target: Any, lock: threading.RLock) -> None:
+        self._target = target
+        self._lock = lock
+
+    def get_gameflow_session(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._target.get_gameflow_session()
+
+    def get_current_summoner(self) -> dict[str, Any] | None:
+        with self._lock:
+            fn = getattr(self._target, "get_current_summoner", None)
+            return fn() if callable(fn) else None
+
+    def get_ranked_stats(self, puuid: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._target.get_ranked_stats(puuid)
+
+    def get_match_history(self, puuid: str, count: int = 15) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._target.get_match_history(puuid, count=count)
+
+
 class HexHelperController:
     """Main desktop runtime integrating data sync, telemetry, WinRT OCR, UI overlays, and AI coach."""
 
     PICKER_COACH_DEBOUNCE_MS = 1800
     DEATH_COACH_DEFER_MS = 2500
+    GAME_START_SCOUT_WAIT_MS = 2500
     ICON_VERIFY_DELAY_MS = 850
     ICON_VERIFY_CONF_THRESHOLD = 0.65
     SMART_PICKER_GATE_DELTA_GAP = 0.018
@@ -593,6 +620,7 @@ class HexHelperController:
         self.datasets: list[DatasetDescriptor] = []
 
         # Telemetry
+        self._lcu_lock = threading.RLock()
         self.lcu = LcuClient(self.cfg.lockfile_path, force_all_modes=self.cfg.force_all_modes)
         self.live = LiveClientReader()
         self._last_live: LiveMatchSnapshot | None = None
@@ -694,6 +722,10 @@ class HexHelperController:
         self._last_reroll_mono: float = 0.0
         self._click_sample_counter: int = 0
         self._active_match_key: str = ""
+        self._lobby_scout: LobbyScoutSnapshot | None = None
+        self._lobby_scout_match_key: str = ""
+        self._lobby_scout_in_flight: bool = False
+        self._pending_game_start_match_key: str = ""
         self._match_state_path = self.data_dir / "match_state.json"
         self._combo_hidden_by_user: bool = False
         self._last_combo_plan: ComboPlan | None = None
@@ -733,6 +765,8 @@ class HexHelperController:
             on_size_changed=self._on_champ_size_changed,
             initial_size=self.cfg.champ_window_size,
             on_core_action=self._handle_core_action,
+            on_goal_mode_changed=self._on_champ_goal_mode_changed,
+            initial_goal_mode=self.cfg.champ_select_goal_mode,
         )
         if self.cfg.champ_window_pos and len(self.cfg.champ_window_pos) == 2:
             self.champ_overlay.move(int(self.cfg.champ_window_pos[0]), int(self.cfg.champ_window_pos[1]))
@@ -741,9 +775,11 @@ class HexHelperController:
         self.combo_overlay = AugmentComboOverlay(
             on_pos_changed=self._on_combo_pos_changed,
             on_size_changed=self._on_combo_size_changed,
+            on_scale_changed=self._on_combo_scale_changed,
             on_closed_by_user=self._on_combo_closed_by_user,
             initial_pos=self.cfg.combo_drawer_pos,
             initial_size=self.cfg.combo_drawer_size,
+            initial_scale=self.cfg.combo_drawer_scale,
         )
         self.edge_drawer = EdgeBuildDrawer(
             on_select_augment=self._on_manual_add_augment,
@@ -756,6 +792,7 @@ class HexHelperController:
             on_manual_hero=self._on_manual_hero,
             on_pos_changed=self._on_drawer_pos_changed,
             on_size_changed=self._on_drawer_size_changed,
+            on_scale_changed=self._on_drawer_scale_changed,
             on_closed_by_user=self._on_drawer_closed_by_user,
             on_switch_tier=self._on_switch_tier,
             on_recharge_click=self.open_recharge_dialog,
@@ -766,6 +803,7 @@ class HexHelperController:
             initial_tier=self.cfg.coach_tier,
             initial_pos=self.cfg.drawer_pos,
             initial_size=self.cfg.drawer_size,
+            initial_scale=self.cfg.drawer_scale,
             y_ratio=self.cfg.drawer_y_ratio,
         )
         self.lookup_window = LookupWindow(
@@ -789,6 +827,7 @@ class HexHelperController:
             on_dismiss_newbie_banner=self._on_dismiss_newbie_banner,
             on_open_hotkeys=self.open_hotkey_settings_dialog,
             on_open_feedback=self.open_feedback_dialog,
+            on_reset_overlay_sizes=self._reset_overlay_sizes,
         )
         self.calibrator = CalibrationOverlay(
             initial_title_roi=self.cfg.title_band_roi,
@@ -867,6 +906,11 @@ class HexHelperController:
         self._death_coach_defer_timer.setInterval(self.DEATH_COACH_DEFER_MS)
         self._death_coach_defer_timer.timeout.connect(self._on_death_coach_defer_timeout)
 
+        self._game_start_coach_defer_timer = QTimer()
+        self._game_start_coach_defer_timer.setSingleShot(True)
+        self._game_start_coach_defer_timer.setInterval(self.GAME_START_SCOUT_WAIT_MS)
+        self._game_start_coach_defer_timer.timeout.connect(self._on_game_start_coach_defer_timeout)
+
         self._icon_verify_timer = QTimer()
         self._icon_verify_timer.setSingleShot(True)
         self._icon_verify_timer.setInterval(self.ICON_VERIFY_DELAY_MS)
@@ -877,7 +921,7 @@ class HexHelperController:
 
     def _setup_tray(self) -> None:
         self.tray = QSystemTrayIcon(load_app_icon(), self.qt_app)
-        self.tray.setToolTip("HexHelper · 海克斯大乱斗小助手")
+        self.tray.setToolTip(f"HexHelper v{APP_VERSION} · 海克斯大乱斗小助手")
         menu = QMenu()
         self._tray_act_lookup = QAction("打开速查与设置", menu)
         self._tray_act_lookup.triggered.connect(self._show_lookup)
@@ -994,13 +1038,15 @@ class HexHelperController:
 
     def _build_feedback_diag_snapshot(self) -> dict[str, Any]:
         ring_stats = self.log_ring.summary_stats()
+        with self._get_lcu_lock():
+            lcu_creds = self.lcu.creds
         return {
             "state": self.sm.state.value,
             "edition": "commercial" if self._commercial else "dev",
             "dataset_patch": self.store.descriptor.patch if self.store.descriptor else "",
             "dataset_mode": self.store.active_match_mode if self.store.descriptor else "",
-            "lcu_connected": bool(self.lcu.creds is not None),
-            "lcu_source": str(self.lcu.creds.source) if self.lcu.creds else "",
+            "lcu_connected": bool(lcu_creds is not None),
+            "lcu_source": str(lcu_creds.source) if lcu_creds else "",
             "live_active": bool(self._last_live is not None),
             "capture_backend": str(self.capturer.backend),
             "black_frames": int(self.capturer.consecutive_black_frames),
@@ -1102,6 +1148,12 @@ class HexHelperController:
 
     def _on_drawer_size_changed(self, size: list[int] | None) -> None:
         self.cfg.drawer_size = size
+        if size is None:
+            self.cfg.drawer_scale = None
+        save_config(self.cfg)
+
+    def _on_drawer_scale_changed(self, scale: float | None) -> None:
+        self.cfg.drawer_scale = scale
         save_config(self.cfg)
 
     def _on_drawer_closed_by_user(self) -> None:
@@ -1125,12 +1177,24 @@ class HexHelperController:
             self.combo_overlay.hide()
             return
         self._combo_hidden_by_user = False
+        sm = getattr(self, "sm", None)
+        verdict = getattr(self, "_last_combo_verdict", None)
+        in_picker = sm is not None and sm.state == GameState.AUGMENT_PICKING and verdict is not None
         if not self.combo_overlay.isVisible():
             self._refresh_combo_plan_view()
-            self.combo_overlay.set_expanded(True)
+            if in_picker:
+                # Enter picker mode BEFORE expanding so pre-picker collapsed preference is preserved cleanly
+                self.combo_overlay.enter_picker_mode(verdict)
+            else:
+                self.combo_overlay.set_expanded(True)
             self.combo_overlay.show_overlay()
+        elif not self.combo_overlay.is_expanded:
+            if in_picker:
+                self.combo_overlay.enter_picker_mode(verdict)
+            else:
+                self.combo_overlay.set_expanded(True)
         else:
-            self.combo_overlay.toggle_expanded()
+            self.combo_overlay.set_expanded(False)
 
     def _on_combo_pos_changed(self, pos: list[int]) -> None:
         self.cfg.combo_drawer_pos = pos
@@ -1138,6 +1202,21 @@ class HexHelperController:
 
     def _on_combo_size_changed(self, size: list[int] | None) -> None:
         self.cfg.combo_drawer_size = size
+        if size is None:
+            self.cfg.combo_drawer_scale = None
+        save_config(self.cfg)
+
+    def _on_combo_scale_changed(self, scale: float | None) -> None:
+        self.cfg.combo_drawer_scale = scale
+        save_config(self.cfg)
+
+    def _reset_overlay_sizes(self) -> None:
+        self.edge_drawer.reset_default_size()
+        self.combo_overlay.reset_default_size()
+        self.cfg.drawer_size = None
+        self.cfg.drawer_scale = None
+        self.cfg.combo_drawer_size = None
+        self.cfg.combo_drawer_scale = None
         save_config(self.cfg)
 
     def _on_combo_closed_by_user(self) -> None:
@@ -1260,9 +1339,11 @@ class HexHelperController:
         save_config(cfg)
         self.syncer.proxy_url = "" if self._commercial else cfg.proxy_url
         self.static_assets.proxy_url = "" if self._commercial else cfg.proxy_url
-        self.lcu.preferred_lockfile = cfg.lockfile_path
-        self.lcu.force_all_modes = cfg.force_all_modes
-        self.lcu.creds = None
+        with self._get_lcu_lock():
+            self.lcu.preferred_lockfile = cfg.lockfile_path
+            self.lcu.force_all_modes = cfg.force_all_modes
+            self.lcu.creds = None
+            self.lcu.close()
         if cfg.auto_first_prismatic_mode:
             self._preload_first_prismatic_from_cache(self.store.descriptor, self.store.dataset_dir)
         elif self._auto_switched_first_prismatic:
@@ -1306,6 +1387,12 @@ class HexHelperController:
     def _on_champ_size_changed(self, size: list[int] | None) -> None:
         self.cfg.champ_window_size = size
         save_config(self.cfg)
+
+    def _on_champ_goal_mode_changed(self, mode: str) -> None:
+        norm = "fun" if str(mode or "climb").strip().lower() == "fun" else "climb"
+        if self.cfg.champ_select_goal_mode != norm:
+            self.cfg.champ_select_goal_mode = norm
+            save_config(self.cfg)
 
     def _on_rois_calibrated(self, card_roi: NormalizedRect, title_roi: NormalizedRect) -> None:
         self.cfg.card_band_roi = card_roi
@@ -2557,7 +2644,8 @@ class HexHelperController:
                     self._stop_event.wait(1.0)
                     continue
 
-                phase, cs = self.lcu.poll()
+                with self._get_lcu_lock():
+                    phase, cs = self.lcu.poll()
                 self.ui_invoker.invoke.emit(lambda p=phase, c=cs: self._apply_lcu_poll(p, c))
             except Exception as exc:
                 logger.debug("Telemetry worker error: %s", exc)
@@ -2720,6 +2808,47 @@ class HexHelperController:
             return
         if self.cfg.auto_trigger_coach and self._is_any_coach_online():
             self.trigger_coach_request("death_enemy_build_changed")
+
+    def _schedule_game_start_coach_defer(self, match_key: str) -> None:
+        self._pending_game_start_match_key = match_key
+        logger.info(
+            "Deferring game_start coach call up to %.1fs while LobbyScout runs",
+            self.GAME_START_SCOUT_WAIT_MS / 1000.0,
+        )
+        timer = getattr(self, "_game_start_coach_defer_timer", None)
+        if timer is not None:
+            timer.start(self.GAME_START_SCOUT_WAIT_MS)
+
+    def _cancel_game_start_coach_defer(self, reason: str = "") -> None:
+        timer = getattr(self, "_game_start_coach_defer_timer", None)
+        had_pending = bool(getattr(self, "_pending_game_start_match_key", "")) or bool(
+            timer is not None and timer.isActive()
+        )
+        self._pending_game_start_match_key = ""
+        if timer is not None and timer.isActive():
+            timer.stop()
+        if had_pending and reason:
+            logger.info("Cancelled deferred game_start coach call: %s", reason)
+
+    def _flush_pending_game_start_coach(self, match_key: str, *, source: str) -> None:
+        pending_key = getattr(self, "_pending_game_start_match_key", "")
+        if not pending_key:
+            return
+        if match_key and pending_key != match_key:
+            return
+        self._cancel_game_start_coach_defer()
+        if self._stop_event.is_set():
+            return
+        if pending_key != self._active_match_key:
+            return
+        if self.sm.state not in (GameState.IN_GAME, GameState.AUGMENT_PICKING):
+            return
+        if self.cfg.auto_trigger_coach and self._is_any_coach_online():
+            logger.info("Flushing deferred game_start coach call (%s)", source)
+            self.trigger_coach_request("game_start")
+
+    def _on_game_start_coach_defer_timeout(self) -> None:
+        self._flush_pending_game_start_coach(self._active_match_key, source="timeout")
 
     def _schedule_picker_coach_trigger(self) -> None:
         if not self.cfg.auto_trigger_coach or not self._is_any_coach_online():
@@ -3276,6 +3405,88 @@ class HexHelperController:
         dlg.activateWindow()
         return dlg
 
+    def _get_lcu_lock(self) -> threading.RLock:
+        lock = getattr(self, "_lcu_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._lcu_lock = lock
+        return lock
+
+    def _make_lobby_scout_lcu(self) -> tuple[Any, bool]:
+        """Return (lcu_handle, should_close) isolating background LobbyScout from shared self.lcu."""
+        lock = self._get_lcu_lock()
+        with lock:
+            lcu = self.lcu
+            if type(lcu) is LcuClient and not any(
+                name in lcu.__dict__
+                for name in (
+                    "_get_json",
+                    "get_gameflow_session",
+                    "get_current_summoner",
+                    "get_ranked_stats",
+                    "get_match_history",
+                )
+            ):
+                return (
+                    LcuClient(
+                        preferred_lockfile=lcu.preferred_lockfile,
+                        force_all_modes=lcu.force_all_modes,
+                    ),
+                    True,
+                )
+            return _ThreadSafeLcuProxy(lcu, lock), False
+
+    def _maybe_start_lobby_scout(self, match_key: str) -> None:
+        """Run strictly read-only LCU 10-player LobbyScout once per match in a daemon thread."""
+        if not self.cfg.lobby_scout_enabled or not match_key:
+            return
+        if self._lobby_scout_match_key == match_key:
+            return
+        self._lobby_scout_match_key = match_key
+        self._lobby_scout = None
+        self._lobby_scout_in_flight = True
+        self.edge_drawer.set_lobby_scout(None)
+        scout_lcu, should_close = self._make_lobby_scout_lcu()
+
+        def _worker(mk: str, lcu_handle: Any, close_after: bool) -> None:
+            try:
+                snap = scout_lobby_readonly(lcu_handle, self.store)
+            except Exception as exc:
+                logger.debug("Background LobbyScout failed: %s", exc)
+                snap = None
+            finally:
+                if close_after:
+                    try:
+                        lcu_handle.close()
+                    except Exception:
+                        pass
+            if not self._stop_event.is_set():
+                self.ui_invoker.invoke.emit(lambda s=snap, key=mk: self._on_lobby_scout_ready(key, s))
+
+        threading.Thread(
+            target=_worker,
+            args=(match_key, scout_lcu, should_close),
+            name="HexLobbyScout",
+            daemon=True,
+        ).start()
+
+    def _on_lobby_scout_ready(self, match_key: str, snap: LobbyScoutSnapshot | None) -> None:
+        if self._stop_event.is_set():
+            return
+        if not match_key or match_key != self._active_match_key:
+            return
+        self._lobby_scout_in_flight = False
+        if self.sm.state not in (GameState.IN_GAME, GameState.AUGMENT_PICKING):
+            self._cancel_game_start_coach_defer("not in game")
+            return
+        self._lobby_scout = snap
+        game_time_s = float(self._last_live.game_time or 0.0) if self._last_live else 0.0
+        self.edge_drawer.set_lobby_scout(snap, game_time_s=game_time_s)
+        self._flush_pending_game_start_coach(
+            match_key,
+            source="lobby_scout_ready" if snap is not None else "lobby_scout_empty",
+        )
+
     def _apply_live_snapshot(self, live_snap: LiveMatchSnapshot) -> None:
         self._last_live = live_snap
         self._last_cs = None
@@ -3295,12 +3506,17 @@ class HexHelperController:
             self._last_combo_verdict = None
             self._cancel_picker_coach_debounce()
             self._cancel_death_coach_defer()
+            self._cancel_game_start_coach_defer("new match")
             self._cancel_pending_icon_verify()
             self._restore_configured_dataset_mode()
             self._reset_match_telemetry_counters()
             if self.detector is not None:
                 self.detector.reset_match_metrics()
             self.edge_drawer.reset_opening_brief_state()
+            self._lobby_scout = None
+            self._lobby_scout_match_key = ""
+            self._lobby_scout_in_flight = False
+            self.edge_drawer.set_lobby_scout(None)
             self.edge_drawer.set_coach_advice(None)
             self.edge_drawer.set_recent_offered([])
             self.edge_drawer.set_picker_active(False)
@@ -3320,6 +3536,7 @@ class HexHelperController:
                 dataset_patch=self.store.descriptor.patch if self.store.descriptor else "",
                 dataset_mode=self.store.active_match_mode if self.store.descriptor else "",
             )
+            self._maybe_start_lobby_scout(self._active_match_key)
         elif self.sm.state in (GameState.IN_GAME, GameState.AUGMENT_PICKING) and not self._active_match_key:
             self._active_match_key = self._compute_match_key(live_snap, resolved_hid)
             self._restore_match_state_if_matching(self._active_match_key)
@@ -3333,6 +3550,7 @@ class HexHelperController:
                 dataset_patch=self.store.descriptor.patch if self.store.descriptor else "",
                 dataset_mode=self.store.active_match_mode if self.store.descriptor else "",
             )
+            self._maybe_start_lobby_scout(self._active_match_key)
 
         self._match_max_game_time_s = max(self._match_max_game_time_s, float(live_snap.game_time or 0.0))
         if live_snap.game_end_result in (0, 1):
@@ -3410,6 +3628,15 @@ class HexHelperController:
                     self._schedule_death_coach_defer()
                 else:
                     self.trigger_coach_request(eff.coach_trigger)
+            elif (
+                eff.coach_trigger == "game_start"
+                and self.cfg.lobby_scout_enabled
+                and float(live_snap.game_time or 0.0) < 90.0
+                and self._lobby_scout is None
+                and getattr(self, "_lobby_scout_in_flight", False)
+                and self._lobby_scout_match_key == self._active_match_key
+            ):
+                self._schedule_game_start_coach_defer(self._active_match_key)
             else:
                 self.trigger_coach_request(eff.coach_trigger)
 
@@ -3419,7 +3646,8 @@ class HexHelperController:
             resolved_won = self._match_won_result
             if resolved_won not in (0, 1) and phase in ("EndOfGame", "PreEndOfGame"):
                 try:
-                    resolved_won = self.lcu.get_eog_won()
+                    with self._get_lcu_lock():
+                        resolved_won = self.lcu.get_eog_won()
                 except Exception:
                     resolved_won = -1
             self._maybe_submit_match_telemetry(won=resolved_won)
@@ -3430,6 +3658,7 @@ class HexHelperController:
             )
             self._cancel_picker_coach_debounce()
             self._cancel_death_coach_defer()
+            self._cancel_game_start_coach_defer("match ended")
             self._cancel_pending_icon_verify()
             self.sm.on_live_snapshot(None, None, time.monotonic())
             self._restore_configured_dataset_mode()
@@ -3439,7 +3668,11 @@ class HexHelperController:
             self._latest_request_id = ""
             self._last_combo_verdict = None
             self._last_combo_plan = None
+            self._lobby_scout = None
+            self._lobby_scout_match_key = ""
+            self._lobby_scout_in_flight = False
             self.edge_drawer.reset_opening_brief_state()
+            self.edge_drawer.set_lobby_scout(None)
             self.edge_drawer.set_coach_advice(None)
             self.edge_drawer.set_recent_offered([])
             self.edge_drawer.set_picker_active(False)
@@ -3885,43 +4118,17 @@ class HexHelperController:
         self._last_combo_verdict = verdict
         combo_by_slot = {vc.slot_index: vc for vc in verdict.cards}
 
-        best_idx = -1
-        best_delta = -999.0
-        any_valid_sample = False
-        valid_scores: list[AugmentScore] = []
-        for i, (c, sc) in enumerate(scored_cards):
-            if sc.games >= 30:
-                any_valid_sample = True
-                valid_scores.append(sc)
-                if sc.delta > best_delta:
-                    best_delta = sc.delta
-                    best_idx = i
-
-        all_below_par = bool(valid_scores) and all(
-            (bool(sc.is_below_rarity_par) if sc.percentile is not None else (sc.delta < 0.0))
-            for sc in valid_scores
+        decisions, reroll_banner = rank_picker_cards(
+            [(c.slot_index, sc) for c, sc in scored_cards],
+            combo_by_slot=combo_by_slot,
         )
-        has_combo_upside = any(vc.verdict in ("jackpot", "gamble") for vc in verdict.cards)
-        reroll_banner = ""
-        if best_idx >= 0 and all_below_par and not has_combo_upside:
-            # All offered cards are below rarity par (or negative delta when dist unavailable) and have no combo upside:
-            # do NOT mislead player with a gold "首选" crown — surface a clear reroll-dice warning!
-            best_tier = scored_cards[best_idx][1].tier
-            best_idx = -1
-            reroll_banner = f"本轮三卡均低于同阶均线（最高仅 {best_tier} 级）· 建议用骰子刷新"
-        elif best_idx >= 0 and all_below_par and has_combo_upside:
-            # Prefer the combo jackpot/gamble card rather than a below-par non-synergy card
-            best_combo_slot = verdict.best_slot_index
-            best_idx = next(
-                (i for i, (c, _sc) in enumerate(scored_cards) if c.slot_index == best_combo_slot),
-                -1,
-            )
-        elif not any_valid_sample and verdict.reroll_advice:
+        any_valid_sample = any(sc.games >= 30 for _c, sc in scored_cards)
+        if not reroll_banner and not any_valid_sample and verdict.reroll_advice:
             reroll_banner = verdict.reroll_advice
 
         sp_db = get_special_augment_db()
         render_items: list[AugmentBadgeRenderItem] = []
-        for i, (c, sc) in enumerate(scored_cards):
+        for (c, sc), dec in zip(scored_cards, decisions):
             aid = c.augment.augment_id
             d_items = tuple(rank_destiny_items(self.store, hid, limit=2)) if (hid and aid == DESTINY_AUGMENT_ID) else ()
             sp = sp_db.get_by_id(aid)
@@ -3936,11 +4143,12 @@ class HexHelperController:
                     slot_index=c.slot_index,
                     score=sc,
                     screen_box=c.screen_box,
-                    is_best=(i == best_idx),
+                    is_best=dec.is_best,
                     destiny_items=d_items,
                     uncertain=(c.confidence < 0.72),
                     archetype_hint=arch_hint,
                     is_transmute=is_transmute_augment(aid),
+                    unified=dec,
                 )
             )
 
@@ -3967,6 +4175,7 @@ class HexHelperController:
             and not self._combo_hidden_by_user
             and not self._overlays_hidden_by_user
             and not self._is_full_locked()
+            and (self.cfg.combo_auto_popup_on_picker or self.combo_overlay.is_expanded)
         ):
             self.combo_overlay.enter_picker_mode(verdict)
             if not self.combo_overlay.isVisible():
@@ -4078,6 +4287,8 @@ class HexHelperController:
             self._cancel_death_coach_defer(f"superseded by {reason}")
         if reason in ("manual_f6", "augment_selected"):
             self._cancel_picker_coach_debounce()
+        if reason in ("manual_f6", "game_start"):
+            self._cancel_game_start_coach_defer(f"superseded by {reason}")
 
         # Smart local picker gate: skip automatic augment_picking cloud call when local 0ms winner is decisive
         if reason == "augment_picking" and self.cfg.smart_picker_ai_gate and self.sm.active_cards:
@@ -4276,6 +4487,7 @@ class HexHelperController:
                 else {}
             ),
             augment_combo_context=export_combo_coach_context(combo_plan, picker_verdict),
+            lobby_scout=self._lobby_scout.to_coach_context() if self._lobby_scout is not None else {},
         )
         self._latest_request_id = req.request_id
         self._latest_request_trigger = reason
@@ -4368,12 +4580,15 @@ class HexHelperController:
                     )
             mode_tag = f"{self.store.active_match_mode}{'（首棱彩局自动）' if self._auto_switched_first_prismatic else ''}" if self.store.descriptor else "-"
             rs = self.log_ring.summary_stats()
+            with self._get_lcu_lock():
+                lcu_creds = self.lcu.creds
+                lcu_err = self.lcu.last_error
             lines = [
                 f"状态机阶段：{self.sm.state.value}",
                 f"当前数据集：{format_display_patch(self.store.descriptor.patch) if self.store.descriptor else '未加载'} / {mode_tag}",
                 f"缓存目录：{self.data_dir}",
                 f"滚动运行日志：{rs['match_count']} / {rs['max_matches']} 局（超出自动覆盖最旧 · 约 {rs['total_bytes'] / 1024:.1f} KB）",
-                f"LCU 连接：{'已连接 port=' + str(self.lcu.creds.port) + ' (' + self.lcu.creds.source + ')' if self.lcu.creds else '未连接 (' + (self.lcu.last_error or '等待客户端') + ')'}",
+                f"LCU 连接：{'已连接 port=' + str(lcu_creds.port) + ' (' + lcu_creds.source + ')' if lcu_creds else '未连接 (' + (lcu_err or '等待客户端') + ')'}",
                 f"2999 局内接口：{'活跃' if self._last_live else '未在对局中'}",
                 f"截屏后端：{self.capturer.backend}（连续黑帧={self.capturer.consecutive_black_frames}）",
                 f"WinRT 中文 OCR：{'就绪 (zh-Hans-CN)' if self.ocr_engine else '不可用'}",
@@ -4399,12 +4614,15 @@ class HexHelperController:
             gemini_state += f" · 最近异常={self.gemini_coach.last_error[:60]}"
         mode_tag = f"{self.store.active_match_mode}{'（首棱彩局自动）' if self._auto_switched_first_prismatic else ''}" if self.store.descriptor else "-"
         rs = self.log_ring.summary_stats()
+        with self._get_lcu_lock():
+            lcu_creds = self.lcu.creds
+            lcu_err = self.lcu.last_error
         lines = [
             f"状态机阶段：{self.sm.state.value}",
             f"当前数据集：{format_display_patch(self.store.descriptor.patch) if self.store.descriptor else '未加载'} / {mode_tag}",
             f"缓存目录：{self.data_dir}",
             f"滚动运行日志：{rs['match_count']} / {rs['max_matches']} 局（超出自动覆盖最旧 · 约 {rs['total_bytes'] / 1024:.1f} KB）",
-            f"LCU 连接：{'已连接 port=' + str(self.lcu.creds.port) + ' (' + self.lcu.creds.source + ')' if self.lcu.creds else '未连接 (' + (self.lcu.last_error or '等待客户端') + ')'}",
+            f"LCU 连接：{'已连接 port=' + str(lcu_creds.port) + ' (' + lcu_creds.source + ')' if lcu_creds else '未连接 (' + (lcu_err or '等待客户端') + ')'}",
             f"2999 局内接口：{'活跃' if self._last_live else '未在对局中'}",
             f"截屏后端：{self.capturer.backend}（连续黑帧={self.capturer.consecutive_black_frames}）",
             f"WinRT 中文 OCR：{'就绪 (zh-Hans-CN)' if self.ocr_engine else '不可用'}",
@@ -4429,6 +4647,7 @@ class HexHelperController:
         self._click_timer.stop()
         self._picker_coach_debounce_timer.stop()
         self._death_coach_defer_timer.stop()
+        self._cancel_game_start_coach_defer("shutdown")
         self._icon_verify_timer.stop()
         self.hotkeys.unregister_all()
         if self.cloud_coach is not None:
@@ -4442,7 +4661,8 @@ class HexHelperController:
         if self.bridge is not None:
             self.bridge.stop()
         self.capturer.close()
-        self.lcu.close()
+        with self._get_lcu_lock():
+            self.lcu.close()
         self.live.close()
         if self.ocr_engine:
             self.ocr_engine.close()

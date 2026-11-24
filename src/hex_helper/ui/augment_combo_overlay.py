@@ -33,7 +33,14 @@ from hex_helper.scoring.augment_combo import (
     PickerComboVerdict,
 )
 from hex_helper.ui.hextech_widgets import HextechActionButton, HextechPulseFrame
-from hex_helper.ui.resizable_overlay import FramelessResizeController, HextechCornerGrip
+from hex_helper.ui.resizable_overlay import (
+    FramelessResizeController,
+    HextechCornerGrip,
+    HextechEdgeHandle,
+    OverlayScaleMetrics,
+    compute_auto_overlay_scale,
+    compute_overlay_scale,
+)
 from hex_helper.ui.theme import BASE_OVERLAY_QSS, RARITY_COLORS, display_font
 from hex_helper.ui.win32_window import show_no_activate
 
@@ -76,8 +83,10 @@ class AugmentComboOverlay(QWidget):
     COLLAPSED_MIN_H = 152
     EXPANDED_W = 316
     MIN_EXPANDED_W = 236
-    MAX_EXPANDED_W = 540
+    MAX_EXPANDED_W = 760
     EXPANDED_MIN_H = 180
+    MAX_EXPANDED_H = 1800
+    _MIN_COMFORT_H = 240
     _QWIDGETSIZE_MAX = 16777215
 
     def __init__(
@@ -85,14 +94,17 @@ class AugmentComboOverlay(QWidget):
         *,
         on_pos_changed: Callable[[list[int]], None] | None = None,
         on_size_changed: Callable[[list[int] | None], None] | None = None,
+        on_scale_changed: Callable[[float | None], None] | None = None,
         on_closed_by_user: Callable[[], None] | None = None,
         initial_pos: list[int] | None = None,
         initial_size: list[int] | None = None,
+        initial_scale: float | None = None,
         y_ratio: float = 0.26,
     ) -> None:
         super().__init__()
         self._on_pos_changed = on_pos_changed
         self._on_size_changed = on_size_changed
+        self._on_scale_changed = on_scale_changed
         self._on_closed_by_user = on_closed_by_user
         self._y_ratio = y_ratio
         self._target_screen: QScreen | None = None
@@ -101,16 +113,20 @@ class AugmentComboOverlay(QWidget):
             if (initial_pos and len(initial_pos) == 2)
             else None
         )
-        self._custom_w: int | None = (
-            max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(initial_size[0])))
-            if (initial_size and len(initial_size) >= 1 and int(initial_size[0]) > 0)
-            else None
-        )
+        if initial_size and len(initial_size) >= 1 and int(initial_size[0]) > 0:
+            self._custom_w: int | None = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(initial_size[0])))
+        elif initial_scale is not None and float(initial_scale) > 0:
+            sc = max(0.85, min(2.20, float(initial_scale)))
+            self._custom_w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(round(self.EXPANDED_W * sc))))
+        else:
+            self._custom_w = None
         self._custom_h: int | None = (
             max(self.EXPANDED_MIN_H, int(initial_size[1]))
             if (initial_size and len(initial_size) >= 2 and int(initial_size[1]) > 0)
             else None
         )
+        self._ui_scale: float = 1.0
+        self._applied_ui_scale: float = 0.0
         self._last_rendered_w: int = self._custom_w or self.EXPANDED_W
         self._drag_offset: QPoint | None = None
         self._anchor_left: bool = self._infer_initial_anchor_left(self._custom_pos)
@@ -193,17 +209,20 @@ class AugmentComboOverlay(QWidget):
         pill_lay.addWidget(self.pill_expand_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         root_lay.addWidget(self.pill)
 
-        # === Expanded Dual-Mode Panel (304px Hextech HUD) ===
+        # === Expanded Dual-Mode Panel (Adaptive Hextech HUD) ===
         self.panel = QFrame()
         self.panel.setObjectName("PanelRoot")
         self.panel.setFixedWidth(self.EXPANDED_W)
         panel_lay = QVBoxLayout(self.panel)
-        panel_lay.setContentsMargins(10, 8, 10, 8)
+        panel_lay.setContentsMargins(10, 9, 10, 9)
         panel_lay.setSpacing(6)
+        self._panel_lay = panel_lay
 
         # Header
         hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 10, 0)
         hdr.setSpacing(5)
+        self._hdr_lay = hdr
         self.hdr_title_lbl = QLabel("◈ 海克斯联动")
         self.hdr_title_lbl.setFont(display_font(11, bold=True, letter_spacing=0.4))
         self.hdr_title_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
@@ -245,8 +264,9 @@ class AugmentComboOverlay(QWidget):
         self.panel_body.setObjectName("ComboScrollBody")
         self.panel_body.setStyleSheet("QWidget#ComboScrollBody { background: transparent; border: none; }")
         body_lay = QVBoxLayout(self.panel_body)
-        body_lay.setContentsMargins(0, 0, 2, 0)
+        body_lay.setContentsMargins(0, 0, 3, 0)
         body_lay.setSpacing(6)
+        self._body_lay = body_lay
         self.panel_scroll.setWidget(self.panel_body)
         panel_lay.addWidget(self.panel_scroll, 1)
 
@@ -258,6 +278,7 @@ class AugmentComboOverlay(QWidget):
         plan_lay.setContentsMargins(0, 0, 0, 0)
         plan_lay.setSpacing(6)
         plan_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._plan_lay = plan_lay
 
         self.active_combo_card = HextechPulseFrame()
         self.active_combo_card.setStyleSheet(
@@ -268,6 +289,7 @@ class AugmentComboOverlay(QWidget):
         ac_lay = QVBoxLayout(self.active_combo_card)
         ac_lay.setContentsMargins(8, 6, 8, 6)
         ac_lay.setSpacing(3)
+        self._ac_lay = ac_lay
         self.active_combo_hdr = QLabel("◈ 当前联动方向")
         self.active_combo_hdr.setStyleSheet(
             "border: none; background: transparent; color: #C8AA6E; font-size: 10px; font-weight: bold;"
@@ -287,6 +309,7 @@ class AugmentComboOverlay(QWidget):
         t_lay = QVBoxLayout(self.targets_card)
         t_lay.setContentsMargins(8, 5, 8, 6)
         t_lay.setSpacing(4)
+        self._t_lay = t_lay
         self.targets_hdr = QLabel("◈ 值得追 / 留骰子赌的搭配")
         self.targets_hdr.setStyleSheet(
             "border: none; background: transparent; color: #C8AA6E; font-size: 10px; font-weight: bold;"
@@ -309,6 +332,7 @@ class AugmentComboOverlay(QWidget):
         )
         ab_lay = QHBoxLayout(self.avoid_banner)
         ab_lay.setContentsMargins(8, 4, 8, 4)
+        self._ab_lay = ab_lay
         self.avoid_lbl = QLabel("")
         self.avoid_lbl.setWordWrap(True)
         self.avoid_lbl.setStyleSheet(
@@ -328,6 +352,7 @@ class AugmentComboOverlay(QWidget):
         pk_lay.setContentsMargins(0, 0, 0, 0)
         pk_lay.setSpacing(5)
         pk_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._pk_lay = pk_lay
 
         self.picker_cards_wrap = QWidget()
         self.picker_cards_wrap.setObjectName("ComboPickerCardsWrap")
@@ -345,6 +370,7 @@ class AugmentComboOverlay(QWidget):
         )
         rb_lay = QHBoxLayout(self.reroll_banner)
         rb_lay.setContentsMargins(8, 5, 8, 5)
+        self._rb_lay = rb_lay
         self.reroll_lbl = QLabel("")
         self.reroll_lbl.setWordWrap(True)
         self.reroll_lbl.setStyleSheet(
@@ -358,8 +384,8 @@ class AugmentComboOverlay(QWidget):
         body_lay.addWidget(self.picker_wrap)
         body_lay.addStretch(1)
 
-        # Footer note emphasizing decoupling from top win-rate badges
-        self.footer_lbl = QLabel("独立联动建议 · 不改上方胜率梯度 · F7 切换")
+        # Footer note explaining on-demand F7 toggle alongside unified top-card badges
+        self.footer_lbl = QLabel("海克斯联动路线 · 已融合至卡片评分 · F7 切换")
         self.footer_lbl.setStyleSheet(
             "border: none; background: transparent; color: #64748B; font-size: 9px;"
         )
@@ -368,35 +394,169 @@ class AugmentComboOverlay(QWidget):
         root_lay.addWidget(self.panel)
         self.panel.hide()
 
-        self._grip_bl = HextechCornerGrip(self.panel, "bl")
-        self._grip_br = HextechCornerGrip(self.panel, "br")
+        self._edge_l = HextechEdgeHandle(self.panel, "l", show_notch=False)
+        self._edge_r = HextechEdgeHandle(
+            self.panel, "r", show_notch=True, on_double_click=self.reset_default_size
+        )
+        self._edge_t = HextechEdgeHandle(self.panel, "t", show_notch=False)
+        self._edge_b = HextechEdgeHandle(self.panel, "b", show_notch=False)
+        self._grip_tl = HextechCornerGrip(
+            self.panel, "tl", on_double_click=self.reset_default_size, prominent=False
+        )
+        self._grip_tr = HextechCornerGrip(
+            self.panel, "tr", on_double_click=self.reset_default_size, prominent=True
+        )
+        self._grip_bl = HextechCornerGrip(
+            self.panel, "bl", on_double_click=self.reset_default_size, prominent=False
+        )
+        self._grip_br = HextechCornerGrip(
+            self.panel, "br", on_double_click=self.reset_default_size, prominent=True
+        )
         self._resize_ctrl = FramelessResizeController(
             self,
             min_w=self.MIN_EXPANDED_W,
             max_w=self.MAX_EXPANDED_W,
             min_h=self.EXPANDED_MIN_H,
-            max_h=1100,
+            max_h=self.MAX_EXPANDED_H,
             can_resize=lambda: self._expanded and not self._full_locked,
             on_live_resize=self._on_live_resize,
             on_resize_finished=self._on_resize_finished,
             screen_provider=self._active_screen,
         )
-        self._resize_ctrl.attach(self.panel)
-        self._resize_ctrl.attach(self.panel_scroll.viewport())
-        self._resize_ctrl.attach(self._grip_bl)
-        self._resize_ctrl.attach(self._grip_br)
+        for handle in (
+            self.panel,
+            self.panel_scroll.viewport(),
+            self._edge_l,
+            self._edge_r,
+            self._edge_t,
+            self._edge_b,
+            self._grip_tl,
+            self._grip_tr,
+            self._grip_bl,
+            self._grip_br,
+        ):
+            self._resize_ctrl.attach(handle)
 
+        self._apply_ui_scale(1.0, force=True)
         self._reposition()
+
+    @property
+    def ui_scale(self) -> float:
+        return self._ui_scale
+
+    def _metrics(self) -> OverlayScaleMetrics:
+        return OverlayScaleMetrics(self._ui_scale)
+
+    def _fs(self, base_px: int | float, *, floor: int = 8) -> int:
+        return self._metrics().font_px(base_px, floor=floor)
+
+    def _px(self, base_px: int | float, *, floor: int = 1) -> int:
+        return self._metrics().px(base_px, floor=floor)
+
+    def _compute_scale_for_rect(self, w: int, h: int | None = None) -> float:
+        return compute_overlay_scale(
+            w,
+            self.EXPANDED_W,
+            height=h,
+            min_comfort_height=self._MIN_COMFORT_H,
+        )
+
+    def _apply_ui_scale(self, scale: float, *, force: bool = False) -> bool:
+        q_scale = round(max(0.85, min(2.20, float(scale))), 2)
+        if not force and abs(q_scale - self._applied_ui_scale) < 0.03:
+            return False
+        self._ui_scale = q_scale
+        self._applied_ui_scale = q_scale
+        m = OverlayScaleMetrics(q_scale)
+
+        self._panel_lay.setContentsMargins(m.px(10), m.px(9), m.px(10), m.px(9))
+        self._panel_lay.setSpacing(m.px(6))
+        self._hdr_lay.setContentsMargins(0, 0, m.px(10), 0)
+        self._hdr_lay.setSpacing(m.px(5))
+        self._body_lay.setContentsMargins(0, 0, m.px(3), 0)
+        self._body_lay.setSpacing(m.px(6))
+        self._plan_lay.setSpacing(m.px(6))
+        self._ac_lay.setContentsMargins(m.px(8), m.px(6), m.px(8), m.px(6))
+        self._ac_lay.setSpacing(m.px(3))
+        self._t_lay.setContentsMargins(m.px(8), m.px(5), m.px(8), m.px(6))
+        self._t_lay.setSpacing(m.px(4))
+        self.targets_list_lay.setSpacing(m.px(4))
+        self._ab_lay.setContentsMargins(m.px(8), m.px(4), m.px(8), m.px(4))
+        self._pk_lay.setSpacing(m.px(5))
+        self.picker_cards_lay.setSpacing(m.px(5))
+        self._rb_lay.setContentsMargins(m.px(8), m.px(5), m.px(8), m.px(5))
+
+        sb_w = max(6, min(14, m.px(6)))
+        self.panel_scroll.verticalScrollBar().setStyleSheet(
+            f"QScrollBar:vertical {{ width: {sb_w}px; background: #010A13; border: none; }}"
+            f"QScrollBar::handle:vertical {{ background: #785A28; border-radius: 2px; min-height: {m.px(24)}px; }}"
+            "QScrollBar::handle:vertical:hover { background: #C8AA6E; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: #010A13; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+        )
+
+        self.hdr_title_lbl.setFont(display_font(m.pt(11), bold=True, letter_spacing=0.4))
+        self.hdr_title_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F0E6D2; font-size: {m.font_px(13)}px; font-weight: bold;"
+        )
+        self.profile_badge_lbl.setStyleSheet(
+            "background-color: rgba(10, 200, 185, 36); border: 1px solid #0AC8B9; "
+            f"border-radius: 2px; padding: {m.px(1)}px {m.px(6)}px; color: #A5F3FC; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        close_sz = m.px(18, floor=16)
+        self.close_btn.setFixedSize(close_sz, close_sz)
+        self.close_btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: {m.font_px(14)}px; color: #A09B8C; background: transparent; border: none; }}"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); }"
+        )
+        self.active_combo_hdr.setStyleSheet(
+            f"border: none; background: transparent; color: #C8AA6E; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self.active_combo_body.setStyleSheet(
+            f"border: none; background: transparent; color: #E2E8F0; font-size: {m.font_px(11)}px;"
+        )
+        self.targets_hdr.setStyleSheet(
+            f"border: none; background: transparent; color: #C8AA6E; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self.avoid_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #FECACA; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self.reroll_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #FEF3C7; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self.footer_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #64748B; font-size: {m.font_px(9)}px;"
+        )
+        return True
 
     def _layout_corner_grips(self) -> None:
         pw = self.panel.width()
         ph = self.panel.height()
         if pw <= 20 or ph <= 20:
             return
-        self._grip_bl.move(1, ph - self._grip_bl.height() - 1)
-        self._grip_br.move(pw - self._grip_br.width() - 1, ph - self._grip_br.height() - 1)
-        self._grip_bl.raise_()
-        self._grip_br.raise_()
+        gsz = max(15, min(24, int(round(16 * self._ui_scale))))
+        eth = max(7, min(11, int(round(8 * self._ui_scale))))
+        top_eth = max(6, eth - 1)
+
+        self._edge_l.setGeometry(0, gsz, eth, max(0, ph - 2 * gsz))
+        self._edge_r.setGeometry(pw - eth, gsz, eth, max(0, ph - 2 * gsz))
+        self._edge_t.setGeometry(gsz, 0, max(0, pw - 2 * gsz), top_eth)
+        self._edge_b.setGeometry(gsz, ph - eth, max(0, pw - 2 * gsz), eth)
+
+        for grip, gx, gy in (
+            (self._grip_tl, 0, 0),
+            (self._grip_tr, pw - gsz, 0),
+            (self._grip_bl, 0, ph - gsz),
+            (self._grip_br, pw - gsz, ph - gsz),
+        ):
+            grip.set_grip_size(gsz)
+            grip.move(gx, gy)
+
+        for edge_w in (self._edge_l, self._edge_r, self._edge_t, self._edge_b):
+            edge_w.raise_()
+        for grip in (self._grip_tl, self._grip_tr, self._grip_bl, self._grip_br):
+            grip.raise_()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -411,38 +571,129 @@ class AugmentComboOverlay(QWidget):
             self.hdr_title_lbl.setText("◈ 联动" if compact else "◈ 海克斯联动")
         self.profile_badge_lbl.setVisible(not (w <= 248 and self._mode == "picker"))
         self.collapse_btn.setText("收" if w <= 258 else "收起")
-        self.collapse_btn.setMinimumWidth(26 if w <= 258 else 38)
+        m = self._metrics()
+        self.collapse_btn.set_scaled_metrics(
+            height=m.px(22, floor=20),
+            min_width=m.px(26 if w <= 258 else 38, floor=26),
+            font_pt=m.pt(10),
+        )
 
-    def _on_live_resize(self, target: QRect, _edge: str) -> None:
+    def _compute_auto_expanded_height(self, w: int, geo: QRect) -> int:
+        m = self._metrics()
+        inner_w = max(180, w - m.px(22))
+        active_wrap = self.picker_wrap if self._mode == "picker" else self.plan_wrap
+        active_h_w = active_wrap.heightForWidth(inner_w)
+        active_hint = active_h_w if active_h_w > 0 else active_wrap.sizeHint().height()
+        if self._mode == "picker" and self._picker_rows:
+            row_sp = m.px(5)
+            min_row_h = m.px(46)
+            row_sum = sum(
+                max(r.heightForWidth(inner_w) if r.heightForWidth(inner_w) > 0 else r.sizeHint().height(), min_row_h)
+                for r in self._picker_rows
+            ) + row_sp * max(0, len(self._picker_rows) - 1)
+            if not self.reroll_banner.isHidden():
+                rb_h = self.reroll_banner.heightForWidth(inner_w)
+                row_sum += max(rb_h if rb_h > 0 else self.reroll_banner.sizeHint().height(), m.px(28)) + row_sp
+            active_hint = max(active_hint, row_sum)
+        body_hint_h = active_hint if active_hint > 0 else self.panel_body.sizeHint().height()
+        chrome_h = m.px(66)
+        extra_pad = m.px(32) if self._mode == "picker" else m.px(20)
+        return min(geo.height() - 48, max(self.EXPANDED_MIN_H, chrome_h + body_hint_h + extra_pad))
+
+    def _invalidate_expanded_layouts(self) -> None:
+        for row_w in self._picker_rows:
+            rl = row_w.layout()
+            if rl is not None:
+                rl.invalidate()
+                rl.activate()
+        for child_wrap in (
+            self.targets_list_wrap,
+            self.targets_card,
+            self.plan_wrap,
+            self.picker_cards_wrap,
+            self.picker_wrap,
+            self.panel_body,
+        ):
+            cl = child_wrap.layout()
+            if cl is not None:
+                cl.invalidate()
+                cl.activate()
+        lay = self.panel.layout()
+        if lay is not None:
+            lay.invalidate()
+            lay.activate()
+
+    def _rebuild_dynamic_sections(self) -> None:
+        if self._mode == "picker" and self._last_verdict is not None:
+            self._rebuild_picker_rows(self._last_verdict)
+        elif self._last_plan is not None:
+            self._rebuild_plan_targets(self._last_plan)
+
+    def _on_live_resize(self, target: QRect, edge: str) -> None:
         w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
-        h = max(self.EXPANDED_MIN_H, target.height())
+        has_v = ("t" in edge) or ("b" in edge)
+        h_for_scale = max(self.EXPANDED_MIN_H, target.height()) if (has_v or self._custom_h is not None) else None
         self._custom_w = w
-        self._custom_h = h
+        if has_v:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+
+        new_scale = self._compute_scale_for_rect(w, h_for_scale)
+        scale_changed = self._apply_ui_scale(new_scale, force=False)
         self._apply_header_density(w)
+        inner_w = max(180, w - self._px(22))
+        self.panel.setFixedWidth(w)
+        self.panel_body.setMinimumWidth(0)
+        self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
+
+        if scale_changed or abs(w - self._last_rendered_w) >= 24:
+            self._last_rendered_w = w
+            self._rebuild_dynamic_sections()
+
+        self._invalidate_expanded_layouts()
+        if self._custom_h is not None:
+            h = max(self.EXPANDED_MIN_H, self._custom_h)
+            y = target.y()
+        else:
+            screen = self._active_screen()
+            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+            h = self._compute_auto_expanded_height(w, geo)
+            y = max(geo.top() + 12, min(geo.bottom() - h - 12, target.y()))
+
         self.setFixedWidth(w)
         self.setFixedHeight(h)
-        self.panel.setFixedWidth(w)
         self.panel.setFixedHeight(h)
-        self.panel_body.setFixedWidth(max(180, w - 22))
-        self.setGeometry(target.x(), target.y(), w, h)
+        self.setGeometry(target.x(), y, w, h)
         self._layout_corner_grips()
 
-        if abs(w - self._last_rendered_w) >= 28:
-            self._last_rendered_w = w
-            if self._mode == "picker" and self._last_verdict is not None:
-                self._rebuild_picker_rows(self._last_verdict)
-            elif self._last_plan is not None:
-                self._rebuild_plan_targets(self._last_plan)
+    def _on_resize_finished(self, target: QRect, edge: str) -> None:
+        w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
+        has_v = ("t" in edge) or ("b" in edge)
+        self._custom_w = w
+        if has_v:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
 
-    def _on_resize_finished(self, target: QRect, _edge: str) -> None:
-        self._custom_w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
-        self._custom_h = max(self.EXPANDED_MIN_H, target.height())
-        if self._custom_w != self._last_rendered_w:
-            self._last_rendered_w = self._custom_w
-            if self._mode == "picker" and self._last_verdict is not None:
-                self._rebuild_picker_rows(self._last_verdict)
-            elif self._last_plan is not None:
-                self._rebuild_plan_targets(self._last_plan)
+        final_scale = self._compute_scale_for_rect(w, self._custom_h)
+        need_rebuild = self._apply_ui_scale(final_scale, force=True) or (self._custom_w != self._last_rendered_w)
+        self._apply_header_density(w)
+        inner_w = max(180, w - self._px(22))
+        self.panel.setFixedWidth(w)
+        self.panel_body.setMinimumWidth(0)
+        self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
+        if need_rebuild:
+            self._last_rendered_w = w
+            self._rebuild_dynamic_sections()
+        self._invalidate_expanded_layouts()
+
+        if self._custom_h is None:
+            screen = self._active_screen()
+            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+            h = self._compute_auto_expanded_height(w, geo)
+            y = max(geo.top() + 12, min(geo.bottom() - h - 12, self.y()))
+            self.setFixedHeight(h)
+            self.panel.setFixedHeight(h)
+            self.setGeometry(self.x(), y, w, h)
+        self._layout_corner_grips()
+
         screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
         if screen is not None:
             self._target_screen = screen
@@ -450,21 +701,24 @@ class AugmentComboOverlay(QWidget):
             self._anchor_left = (self.x() - geo.left()) <= 28
             self._custom_pos = QPoint(geo.left(), self.y()) if self._anchor_left else self.pos()
         if self._on_size_changed:
-            self._on_size_changed([self._custom_w, self._custom_h])
+            saved_h = self._custom_h if self._custom_h is not None else 0
+            self._on_size_changed([self._custom_w, saved_h])
+        if self._on_scale_changed:
+            self._on_scale_changed(round(self._ui_scale, 3))
         if self._on_pos_changed and self._custom_pos is not None:
             self._on_pos_changed([self._custom_pos.x(), self._custom_pos.y()])
 
     def reset_default_size(self) -> None:
         self._custom_w = None
         self._custom_h = None
+        self._applied_ui_scale = 0.0
         self._reposition()
-        if self._mode == "picker" and self._last_verdict is not None:
-            self._rebuild_picker_rows(self._last_verdict)
-        elif self._last_plan is not None:
-            self._rebuild_plan_targets(self._last_plan)
+        self._rebuild_dynamic_sections()
         self._reposition()
         if self._on_size_changed:
             self._on_size_changed(None)
+        if self._on_scale_changed:
+            self._on_scale_changed(None)
 
     @property
     def is_expanded(self) -> bool:
@@ -499,12 +753,18 @@ class AugmentComboOverlay(QWidget):
         return (pos.x() - geo.left()) <= 32
 
     @classmethod
-    def compute_expanded_width(cls, logical_screen_w: int) -> int:
-        if logical_screen_w >= 1680:
-            return cls.EXPANDED_W
-        if logical_screen_w >= 1440:
+    def compute_expanded_width(
+        cls,
+        logical_screen_w: int,
+        logical_screen_h: int | None = None,
+        dpr: float = 1.0,
+    ) -> int:
+        if logical_screen_w < 1440:
+            return 244
+        if logical_screen_w < 1680:
             return 268
-        return 244
+        auto_scale = compute_auto_overlay_scale(logical_screen_w, logical_screen_h, dpr)
+        return max(cls.MIN_EXPANDED_W, min(cls.MAX_EXPANDED_W, int(round(cls.EXPANDED_W * auto_scale))))
 
     def set_target_screen(self, screen: QScreen | None) -> None:
         if screen is not None and screen is not self._target_screen:
@@ -521,9 +781,11 @@ class AugmentComboOverlay(QWidget):
         if screen is None:
             return
         geo = screen.geometry()
+        dpr = max(1.0, float(screen.devicePixelRatio() or 1.0))
         eff_screen_w = int(override_logical_width) if override_logical_width else geo.width()
+        eff_screen_h = None if override_logical_width else geo.height()
         if self._expanded:
-            auto_w = self.compute_expanded_width(eff_screen_w)
+            auto_w = self.compute_expanded_width(eff_screen_w, eff_screen_h, dpr)
             w = (
                 min(self._custom_w, max(self.MIN_EXPANDED_W, geo.width() - 24))
                 if (self._custom_w is not None and override_logical_width is None)
@@ -532,51 +794,21 @@ class AugmentComboOverlay(QWidget):
         else:
             w = self.COLLAPSED_W
         if self._expanded:
+            target_scale = self._compute_scale_for_rect(w, self._custom_h if override_logical_width is None else None)
+            scale_changed = self._apply_ui_scale(target_scale, force=False)
             self._apply_header_density(w)
             if self.panel.width() != w:
                 self.panel.setFixedWidth(w)
-            inner_w = max(180, w - 22)
-            if self.panel_body.width() != inner_w:
-                self.panel_body.setFixedWidth(inner_w)
-            for row_w in self._picker_rows:
-                rl = row_w.layout()
-                if rl is not None:
-                    rl.invalidate()
-                    rl.activate()
-            for child_wrap in (
-                self.targets_list_wrap,
-                self.targets_card,
-                self.plan_wrap,
-                self.picker_cards_wrap,
-                self.picker_wrap,
-                self.panel_body,
-            ):
-                cl = child_wrap.layout()
-                if cl is not None:
-                    cl.invalidate()
-                    cl.activate()
-            lay = self.panel.layout()
-            if lay is not None:
-                lay.invalidate()
-                lay.activate()
+            self.panel_body.setMinimumWidth(0)
+            self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
+            if scale_changed or abs(w - self._last_rendered_w) >= 24:
+                self._last_rendered_w = w
+                self._rebuild_dynamic_sections()
+            self._invalidate_expanded_layouts()
             if self._custom_h is not None and override_logical_width is None:
                 h = min(geo.height() - 32, max(self.EXPANDED_MIN_H, self._custom_h))
             else:
-                active_wrap = self.picker_wrap if self._mode == "picker" else self.plan_wrap
-                active_h_w = active_wrap.heightForWidth(inner_w)
-                active_hint = max(active_h_w if active_h_w > 0 else 0, active_wrap.sizeHint().height())
-                if self._mode == "picker" and self._picker_rows:
-                    row_sum = sum(
-                        max(r.heightForWidth(inner_w), r.sizeHint().height(), 46)
-                        for r in self._picker_rows
-                    ) + 5 * max(0, len(self._picker_rows) - 1)
-                    if not self.reroll_banner.isHidden():
-                        row_sum += max(self.reroll_banner.heightForWidth(inner_w), self.reroll_banner.sizeHint().height(), 28) + 5
-                    active_hint = max(active_hint, row_sum)
-                body_h_for_w = self.panel_body.heightForWidth(inner_w)
-                body_hint_h = max(body_h_for_w if body_h_for_w > 0 else 0, self.panel_body.sizeHint().height(), active_hint)
-                chrome_h = 62  # header + footer + vertical margins/spacing
-                h = min(geo.height() - 64, max(self.EXPANDED_MIN_H, chrome_h + body_hint_h + 12))
+                h = self._compute_auto_expanded_height(w, geo)
             if self.panel.height() != h or self.panel.minimumHeight() != h or self.panel.maximumHeight() != h:
                 self.panel.setFixedHeight(h)
         else:
@@ -635,8 +867,10 @@ class AugmentComboOverlay(QWidget):
     def _resolved_expanded_width(self) -> int:
         screen = self._active_screen()
         geo = screen.geometry() if screen is not None else None
+        dpr = max(1.0, float(screen.devicePixelRatio() or 1.0)) if screen is not None else 1.0
         eff_w = geo.width() if geo is not None else 1920
-        auto_w = self.compute_expanded_width(eff_w)
+        eff_h = geo.height() if geo is not None else 1080
+        auto_w = self.compute_expanded_width(eff_w, eff_h, dpr)
         if self._custom_w is not None and geo is not None:
             return min(self._custom_w, max(self.MIN_EXPANDED_W, geo.width() - 24))
         return self._custom_w or auto_w
@@ -646,6 +880,9 @@ class AugmentComboOverlay(QWidget):
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
         self._expanded = bool(expanded)
+        if self._mode == "picker" and not self._expanded:
+            # Respect manual collapse during picker so exit_picker_mode never ghost re-expands
+            self._pre_picker_expanded = False
         self.pill.setVisible(not self._expanded)
         self.panel.setVisible(self._expanded)
         # Single-frame snap avoids 60fps WS_EX_LAYERED resize DWM stalls
@@ -683,7 +920,13 @@ class AugmentComboOverlay(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            if (not self._expanded) or event.position().y() <= 38:
+            if self._resize_ctrl.is_resizing or (
+                self._expanded and self._resize_ctrl.hit_test_global(event.globalPosition().toPoint())
+            ):
+                event.ignore()
+                return
+            header_drag_h = self._px(38, floor=34)
+            if (not self._expanded) or event.position().y() <= header_drag_h:
                 self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 event.accept()
                 return
@@ -691,7 +934,7 @@ class AugmentComboOverlay(QWidget):
             menu = QMenu(self)
             a_toggle = QAction("收起成小条" if self._expanded else "展开联动面板", menu)
             a_toggle.triggered.connect(self.toggle_expanded)
-            a_reset_size = QAction("恢复默认尺寸", menu)
+            a_reset_size = QAction("恢复默认尺寸（适配屏幕）", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_reset = QAction("复位到屏幕左侧", menu)
             a_reset.triggered.connect(self.reset_to_left_edge)
@@ -807,6 +1050,9 @@ class AugmentComboOverlay(QWidget):
             self.active_combo_body.setText("进局选定英雄与海克斯后，实时推演后续搭配与降权方向")
 
         # Top follow-ups list
+        if self._mode == "plan":
+            eff_w = self._resolved_expanded_width()
+            self._apply_ui_scale(self._compute_scale_for_rect(eff_w, self._custom_h), force=False)
         self._rebuild_plan_targets(plan)
 
         if plan.avoid_summary:
@@ -816,15 +1062,16 @@ class AugmentComboOverlay(QWidget):
             self.avoid_banner.hide()
 
         if self._mode == "plan":
-            self._apply_header_density(self._custom_w or self.EXPANDED_W)
+            self._apply_header_density(self._resolved_expanded_width())
             self.plan_wrap.show()
             self.picker_wrap.hide()
             self._reposition()
 
     def _rebuild_plan_targets(self, plan: ComboPlan) -> None:
         _clear_layout(self.targets_list_lay)
-        eff_w = self._custom_w or self.width() or self.EXPANDED_W
-        reason_cap = max(24, int((eff_w - 36) / 6.2))
+        m = self._metrics()
+        eff_w = self._custom_w or self._resolved_expanded_width() or self.EXPANDED_W
+        reason_cap = max(24, int((eff_w - m.px(36)) / 6.2))
         if plan.recommended_targets:
             self.targets_hdr.setText(
                 "◈ 后续最配 / 留骰子追" if plan.active_combos else "◈ 开局核心起手目标"
@@ -837,28 +1084,31 @@ class AugmentComboOverlay(QWidget):
                     f"border: 1px solid #334155; border-left: 3px solid {rar_color}; border-radius: 2px; }}"
                 )
                 rl = QVBoxLayout(row)
-                rl.setContentsMargins(7, 4, 7, 4)
-                rl.setSpacing(2)
+                rl.setContentsMargins(m.px(7), m.px(4), m.px(7), m.px(4))
+                rl.setSpacing(m.px(2))
 
                 top_r = QHBoxLayout()
-                top_r.setSpacing(4)
+                top_r.setSpacing(m.px(4))
                 nm_lbl = QLabel(t.name)
                 nm_lbl.setStyleSheet(
-                    f"border: none; background: transparent; color: {rar_color}; font-size: 11px; font-weight: bold;"
+                    f"border: none; background: transparent; color: {rar_color}; "
+                    f"font-size: {m.font_px(11)}px; font-weight: bold;"
                 )
                 top_r.addWidget(nm_lbl)
                 if t.gamble:
                     gb = QLabel("赌上限")
                     gb.setStyleSheet(
                         "background-color: rgba(245, 158, 11, 45); border: 1px solid #F59E0B; "
-                        "border-radius: 2px; padding: 0px 4px; color: #FDE68A; font-size: 9px; font-weight: bold;"
+                        f"border-radius: 2px; padding: 0px {m.px(4)}px; color: #FDE68A; "
+                        f"font-size: {m.font_px(9)}px; font-weight: bold;"
                     )
                     top_r.addWidget(gb)
                 if t.hero_signature:
                     hs = QLabel("绝配")
                     hs.setStyleSheet(
                         "background-color: rgba(10, 200, 185, 40); border: 1px solid #0AC8B9; "
-                        "border-radius: 2px; padding: 0px 4px; color: #A5F3FC; font-size: 9px; font-weight: bold;"
+                        f"border-radius: 2px; padding: 0px {m.px(4)}px; color: #A5F3FC; "
+                        f"font-size: {m.font_px(9)}px; font-weight: bold;"
                     )
                     top_r.addWidget(hs)
                 top_r.addStretch(1)
@@ -868,14 +1118,16 @@ class AugmentComboOverlay(QWidget):
                 rs_lbl.setWordWrap(True)
                 rs_lbl.setToolTip(t.reason)
                 rs_lbl.setStyleSheet(
-                    "border: none; background: transparent; color: #CBD5E1; font-size: 10px;"
+                    f"border: none; background: transparent; color: #CBD5E1; font-size: {m.font_px(10)}px;"
                 )
                 rl.addWidget(rs_lbl)
                 self.targets_list_lay.addWidget(row)
                 row.show()
         else:
             empty = QLabel("◇ 选定首个海克斯后自动列出最搭配目标")
-            empty.setStyleSheet("border: none; background: transparent; color: #64748B; font-size: 10px;")
+            empty.setStyleSheet(
+                f"border: none; background: transparent; color: #64748B; font-size: {m.font_px(10)}px;"
+            )
             self.targets_list_lay.addWidget(empty)
             empty.show()
 
@@ -922,7 +1174,9 @@ class AugmentComboOverlay(QWidget):
             self._pre_picker_expanded = self._expanded
             self._mode = "picker"
 
-        self._apply_header_density(self._custom_w or self.EXPANDED_W)
+        eff_w = self._resolved_expanded_width()
+        self._apply_ui_scale(self._compute_scale_for_rect(eff_w, self._custom_h), force=False)
+        self._apply_header_density(eff_w)
         self.profile_badge_lbl.setText(_clip(verdict.profile.direction_label, 10))
         self.plan_wrap.hide()
         self.picker_wrap.show()
@@ -956,6 +1210,7 @@ class AugmentComboOverlay(QWidget):
         self.set_expanded(restore_exp)
 
     def _build_picker_row(self, card: PickerCardComboAdvice, *, is_best: bool, total_slots: int = 3) -> QFrame:
+        m = self._metrics()
         labels = _SLOT_LABELS_4 if total_slots >= 4 else _SLOT_LABELS_3
         slot_txt = labels[card.slot_index] if 0 <= card.slot_index < len(labels) else f"#{card.slot_index + 1}"
         rar_color, _ = RARITY_COLORS.get(card.rarity, ("#C89B3C", ""))
@@ -997,33 +1252,36 @@ class AugmentComboOverlay(QWidget):
             f"border-left: 3px solid {border}; border-radius: 2px; }}"
         )
         rl = QVBoxLayout(row)
-        rl.setContentsMargins(7, 5, 7, 5)
-        rl.setSpacing(2)
+        rl.setContentsMargins(m.px(7), m.px(5), m.px(7), m.px(5))
+        rl.setSpacing(m.px(2))
 
         top = QHBoxLayout()
-        top.setSpacing(3)
+        top.setSpacing(m.px(3))
         slot_lbl = QLabel(slot_txt)
         slot_lbl.setStyleSheet(
             "background-color: rgba(200, 170, 110, 35); border: 1px solid #785A28; "
-            "border-radius: 2px; padding: 0px 4px; color: #F0E6D2; font-size: 9px; font-weight: bold;"
+            f"border-radius: 2px; padding: 0px {m.px(4)}px; color: #F0E6D2; "
+            f"font-size: {m.font_px(9)}px; font-weight: bold;"
         )
-        eff_w = self._custom_w or self.width() or self.EXPANDED_W
+        eff_w = self._custom_w or self._resolved_expanded_width() or self.EXPANDED_W
         name_cap = 6 if eff_w <= 256 else (9 if eff_w < 360 else 16)
         nm_lbl = QLabel(_clip(card.name, name_cap))
         nm_lbl.setToolTip(card.name)
         nm_lbl.setStyleSheet(
-            f"border: none; background: transparent; color: {rar_color}; font-size: 11px; font-weight: bold;"
+            f"border: none; background: transparent; color: {rar_color}; "
+            f"font-size: {m.font_px(11)}px; font-weight: bold;"
         )
         v_txt = card.verdict_label.replace("·降权", "") if eff_w <= 256 else card.verdict_label
         v_lbl = QLabel(v_txt)
         v_lbl.setStyleSheet(
             f"background-color: {badge_bg}; border: 1px solid {border}; border-radius: 2px; "
-            f"padding: 0px 5px; color: {badge_fg}; font-size: 9px; font-weight: bold;"
+            f"padding: 0px {m.px(5)}px; color: {badge_fg}; font-size: {m.font_px(9)}px; font-weight: bold;"
         )
         delta_txt = f"{card.combo_delta:+.1f}" if abs(card.combo_delta) >= 0.1 else "0"
         d_lbl = QLabel(delta_txt)
         d_lbl.setStyleSheet(
-            f"border: none; background: transparent; color: {delta_fg}; font-size: 10px; font-weight: bold;"
+            f"border: none; background: transparent; color: {delta_fg}; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold;"
         )
         top.addWidget(slot_lbl)
         top.addWidget(nm_lbl)
@@ -1038,9 +1296,9 @@ class AugmentComboOverlay(QWidget):
         rs_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         rs_lbl.setToolTip(card.reason)
         rs_lbl.setStyleSheet(
-            "border: none; background: transparent; color: #E2E8F0; font-size: 10px;"
+            f"border: none; background: transparent; color: #E2E8F0; font-size: {m.font_px(10)}px;"
             if card.verdict != "conflict"
-            else "border: none; background: transparent; color: #FECACA; font-size: 10px;"
+            else f"border: none; background: transparent; color: #FECACA; font-size: {m.font_px(10)}px;"
         )
         rl.addWidget(rs_lbl)
         return row

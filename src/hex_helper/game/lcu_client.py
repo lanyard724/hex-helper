@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -120,17 +121,63 @@ class LcuClient:
             return None
         try:
             resp = self._client.get(path)
-            if resp.status_code == 404:
+            if resp.status_code in (400, 403, 404):
                 return None
             resp.raise_for_status()
             self.last_error = ""
             return resp.json()
+        except httpx.HTTPStatusError as exc:
+            self.last_error = str(exc)
+            if exc.response.status_code == 401:
+                self.creds = None
+                self.close()
+            return None
         except Exception as exc:
             self.last_error = str(exc)
             # Connection refused / port changed -> reset creds to re-discover
             self.creds = None
             self.close()
             return None
+
+    def get_gameflow_session(self) -> dict[str, Any] | None:
+        """Read-only GET of /lol-gameflow/v1/session."""
+        raw = self._get_json("/lol-gameflow/v1/session")
+        return raw if isinstance(raw, dict) else None
+
+    def get_current_summoner(self) -> dict[str, Any] | None:
+        """Read-only GET of /lol-summoner/v1/current-summoner."""
+        raw = self._get_json("/lol-summoner/v1/current-summoner")
+        return raw if isinstance(raw, dict) else None
+
+    def get_ranked_stats(self, puuid: str) -> dict[str, Any] | None:
+        """Read-only GET of ranked tier summary for a player PUUID."""
+        pid = str(puuid or "").strip()
+        if not pid:
+            return None
+        safe_pid = quote(pid, safe="-_")
+        raw = self._get_json(f"/lol-ranked/v1/ranked-stats/{safe_pid}")
+        return raw if isinstance(raw, dict) else None
+
+    def get_match_history(self, puuid: str, count: int = 15) -> list[dict[str, Any]]:
+        """Read-only GET of recent match history (empty list on hidden CN profiles)."""
+        pid = str(puuid or "").strip()
+        if not pid:
+            return []
+        end_idx = max(1, min(20, int(count))) - 1
+        safe_pid = quote(pid, safe="-_")
+        raw = self._get_json(
+            f"/lol-match-history/v1/products/lol/{safe_pid}/matches?begIndex=0&endIndex={end_idx}"
+        )
+        if not isinstance(raw, dict):
+            return []
+        games_field = raw.get("games")
+        if isinstance(games_field, dict):
+            games = games_field.get("games")
+        elif isinstance(games_field, list):
+            games = games_field
+        else:
+            games = None
+        return [g for g in games if isinstance(g, dict)] if isinstance(games, list) else []
 
     def poll(self) -> tuple[str, ChampSelectState | None]:
         """Poll LCU gameflow phase and (if in ChampSelect) the current team & bench."""

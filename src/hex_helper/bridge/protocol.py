@@ -28,6 +28,7 @@ class CoachRequestPayload:
     special_augment_builds: list[dict[str, Any]] = field(default_factory=list)
     hero_signature_hint: dict[str, Any] = field(default_factory=dict)
     augment_combo_context: dict[str, Any] = field(default_factory=dict)
+    lobby_scout: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,6 +51,7 @@ class CoachRequestPayload:
             special_augment_builds=list(raw.get("special_augment_builds") or []),
             hero_signature_hint=dict(raw.get("hero_signature_hint") or {}),
             augment_combo_context=dict(raw.get("augment_combo_context") or {}),
+            lobby_scout=dict(raw.get("lobby_scout") or {}),
         )
 
 

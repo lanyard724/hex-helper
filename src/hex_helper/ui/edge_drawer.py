@@ -31,6 +31,7 @@ from hex_helper.data.provider import AugmentInfo, DatasetDescriptor
 from hex_helper.data.special_builds import get_special_augment_db
 from hex_helper.data.store import DataStore
 from hex_helper.edition import is_commercial_edition
+from hex_helper.game.lobby_scout import LobbyScoutSnapshot, PlayerScoutCard
 from hex_helper.scoring.build_synergy import item_is_owned, normalize_item_id
 from hex_helper.scoring.destiny import DESTINY_AUGMENT_ID, rank_destiny_items
 from hex_helper.scoring.matchup_optimizer import (
@@ -55,7 +56,14 @@ from hex_helper.ui.hextech_widgets import (
     HextechPulseFrame,
     HextechShimmerBar,
 )
-from hex_helper.ui.resizable_overlay import FramelessResizeController, HextechCornerGrip
+from hex_helper.ui.resizable_overlay import (
+    FramelessResizeController,
+    HextechCornerGrip,
+    HextechEdgeHandle,
+    OverlayScaleMetrics,
+    compute_auto_overlay_scale,
+    compute_overlay_scale,
+)
 from hex_helper.ui.theme import (
     BASE_OVERLAY_QSS,
     RARITY_COLORS,
@@ -117,8 +125,10 @@ class EdgeBuildDrawer(QWidget):
     COLLAPSED_MIN_H = 184
     EXPANDED_W = 368
     MIN_EXPANDED_W = 288
-    MAX_EXPANDED_W = 580
+    MAX_EXPANDED_W = 860
     EXPANDED_MIN_H = 220
+    MAX_EXPANDED_H = 1850
+    _MIN_COMFORT_H = 300
     _QWIDGETSIZE_MAX = 16777215
 
     def __init__(
@@ -133,6 +143,7 @@ class EdgeBuildDrawer(QWidget):
         on_manual_hero: Callable[[str], None] | None = None,
         on_pos_changed: Callable[[list[int]], None] | None = None,
         on_size_changed: Callable[[list[int] | None], None] | None = None,
+        on_scale_changed: Callable[[float | None], None] | None = None,
         on_closed_by_user: Callable[[], None] | None = None,
         on_switch_tier: Callable[[str], None] | None = None,
         on_recharge_click: Callable[[], None] | None = None,
@@ -143,6 +154,7 @@ class EdgeBuildDrawer(QWidget):
         initial_tier: str = "a",
         initial_pos: list[int] | None = None,
         initial_size: list[int] | None = None,
+        initial_scale: float | None = None,
         y_ratio: float = 0.14,
     ) -> None:
         super().__init__()
@@ -157,6 +169,7 @@ class EdgeBuildDrawer(QWidget):
         self._on_manual_hero = on_manual_hero
         self._on_pos_changed = on_pos_changed
         self._on_size_changed = on_size_changed
+        self._on_scale_changed = on_scale_changed
         self._on_closed_by_user = on_closed_by_user
         self._on_switch_tier = on_switch_tier
         self._on_recharge_click = on_recharge_click
@@ -192,16 +205,28 @@ class EdgeBuildDrawer(QWidget):
             if (initial_pos and len(initial_pos) == 2)
             else None
         )
-        self._expanded_w: int = (
-            max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(initial_size[0])))
-            if (initial_size and len(initial_size) >= 1 and int(initial_size[0]) > 0)
-            else self.EXPANDED_W
-        )
+        if initial_size and len(initial_size) >= 1 and int(initial_size[0]) > 0:
+            self._expanded_w: int = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(initial_size[0])))
+            self._has_custom_w: bool = True
+        elif initial_scale is not None and float(initial_scale) > 0:
+            sc = max(0.85, min(2.20, float(initial_scale)))
+            self._expanded_w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(round(self.EXPANDED_W * sc))))
+            self._has_custom_w = True
+        else:
+            self._expanded_w = self.EXPANDED_W
+            self._has_custom_w = False
         self._custom_h: int | None = (
             max(self.EXPANDED_MIN_H, int(initial_size[1]))
             if (initial_size and len(initial_size) >= 2 and int(initial_size[1]) > 0)
             else None
         )
+        self._ui_scale: float = 1.0
+        self._applied_ui_scale: float = 0.0
+        self._coach_status_color: str = "#A09B8C"
+        self._rm_hdr_color: str = "#C8AA6E"
+        self._coach_balance_color: str = "#FDE68A"
+        self._cutoff_banner_color: str = "#E2D9C5"
+        self._cost_badge_state: tuple[int, bool, int] | None = None
         self._last_layout_bucket: int = self._width_bucket(self._expanded_w)
         self._last_rendered_w: int = self._expanded_w
         self._drag_offset: QPoint | None = None
@@ -244,6 +269,13 @@ class EdgeBuildDrawer(QWidget):
         self._icon_fetch_attempted: set[str] = set()
         self._is_closed: bool = False
         self._last_roadmap_sig: tuple[tuple[str, str, str], ...] = ()
+        self._lobby_scout: LobbyScoutSnapshot | None = None
+        self._radar_dismissed: bool = False
+        self._radar_detail_expanded: bool = False
+        self._last_radar_sig: tuple | None = None
+        self._last_radar_detail_sig: LobbyScoutSnapshot | None = None
+        self._last_pivot_banner_text: str = ""
+        self._last_top_threat_sig: tuple[str, str, bool] | None = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -323,17 +355,20 @@ class EdgeBuildDrawer(QWidget):
         pill_lay.addWidget(self.pill_expand_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         root_lay.addWidget(self.pill)
 
-        # === Expanded v0.3.0 Ultra-Scannable Visual Decision HUD ===
+        # === Expanded Adaptive Visual Decision HUD ===
         self.panel = QFrame()
         self.panel.setObjectName("PanelRoot")
         self.panel.setFixedWidth(self.EXPANDED_W)
         panel_lay = QVBoxLayout(self.panel)
-        panel_lay.setContentsMargins(10, 8, 10, 8)
+        panel_lay.setContentsMargins(10, 9, 10, 9)
         panel_lay.setSpacing(6)
+        self._panel_lay = panel_lay
 
         # 1. Compact Header
         hdr = QHBoxLayout()
+        hdr.setContentsMargins(6, 0, 0, 0)
         hdr.setSpacing(5)
+        self._hdr_lay = hdr
         self.hdr_icon = QLabel()
         self.hdr_icon.setPixmap(load_app_pixmap(22))
         self.hdr_icon.setFixedSize(22, 22)
@@ -396,8 +431,9 @@ class EdgeBuildDrawer(QWidget):
         self.panel_body.setObjectName("DrawerScrollBody")
         self.panel_body.setStyleSheet("QWidget#DrawerScrollBody { background: transparent; border: none; }")
         body_lay = QVBoxLayout(self.panel_body)
-        body_lay.setContentsMargins(0, 0, 2, 0)
+        body_lay.setContentsMargins(0, 0, 3, 0)
         body_lay.setSpacing(6)
+        self._body_lay = body_lay
         self.panel_scroll.setWidget(self.panel_body)
         panel_lay.addWidget(self.panel_scroll, 1)
 
@@ -410,6 +446,82 @@ class EdgeBuildDrawer(QWidget):
         self.warn_lbl.hide()
         body_lay.addWidget(self.warn_lbl)
 
+        # 1.25. ZERO-NEW-WINDOW COLLAPSIBLE 10-PLAYER LOBBY RADAR CARD (auto-collapses into top_threat_lbl at 90s)
+        self.radar_card = QFrame()
+        self.radar_card.setObjectName("LobbyRadarCard")
+        self.radar_card.setStyleSheet(
+            "QFrame#LobbyRadarCard { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, "
+            "stop:0 rgba(4, 18, 32, 238), stop:1 rgba(9, 20, 40, 238)); "
+            "border: 1px solid #785A28; border-left: 2px solid #0AC8B9; border-radius: 2px; }"
+        )
+        rd_lay = QVBoxLayout(self.radar_card)
+        rd_lay.setContentsMargins(8, 5, 8, 5)
+        rd_lay.setSpacing(3)
+        self._rd_lay = rd_lay
+
+        rd_hdr = QHBoxLayout()
+        rd_hdr.setContentsMargins(0, 0, 0, 0)
+        rd_hdr.setSpacing(4)
+        self.radar_title_lbl = QLabel("◈ 十人雷达")
+        self.radar_title_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: 10px;"
+        )
+        self.radar_premade_lbl = QLabel("")
+        self.radar_premade_lbl.setStyleSheet(
+            "background-color: rgba(127, 29, 29, 175); border: 1px solid rgba(248, 113, 113, 165); "
+            "border-radius: 2px; padding: 0px 4px; color: #FECACA; font-size: 9px; font-weight: bold;"
+        )
+        self.radar_premade_lbl.hide()
+        self.radar_detail_btn = QPushButton("详情")
+        self.radar_detail_btn.setFixedHeight(17)
+        self.radar_detail_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.radar_detail_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.radar_detail_btn.setToolTip("展开或收起 10 人战力明细")
+        self.radar_detail_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(8, 30, 44, 210); border: 1px solid #463714; "
+            "color: #0AC8B9; font-size: 9px; font-weight: bold; padding: 0px 6px; border-radius: 2px; }"
+            "QPushButton:hover { border-color: #0AC8B9; color: #F0E6D2; }"
+        )
+        self.radar_detail_btn.clicked.connect(self._toggle_radar_detail)
+        self.radar_dismiss_btn = QPushButton("×")
+        self.radar_dismiss_btn.setFixedSize(16, 16)
+        self.radar_dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.radar_dismiss_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.radar_dismiss_btn.setToolTip("折叠雷达卡（敌方大腿将保留在顶部威胁栏）")
+        self.radar_dismiss_btn.setStyleSheet(
+            "QPushButton { padding: 0px; font-size: 12px; color: #A09B8C; background: transparent; border: none; }"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); border-radius: 2px; }"
+        )
+        self.radar_dismiss_btn.clicked.connect(self._dismiss_lobby_radar)
+        rd_hdr.addWidget(self.radar_title_lbl)
+        rd_hdr.addWidget(self.radar_premade_lbl)
+        rd_hdr.addStretch(1)
+        rd_hdr.addWidget(self.radar_detail_btn)
+        rd_hdr.addWidget(self.radar_dismiss_btn)
+        rd_lay.addLayout(rd_hdr)
+
+        self.radar_summary_lbl = QLabel("")
+        self.radar_summary_lbl.setWordWrap(True)
+        self.radar_summary_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.radar_summary_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #F0E6D2; font-size: 10px; font-weight: bold;"
+        )
+        rd_lay.addWidget(self.radar_summary_lbl)
+
+        self.radar_detail_wrap = QWidget()
+        self.radar_detail_wrap.setObjectName("LobbyRadarDetailWrap")
+        self.radar_detail_wrap.setStyleSheet(
+            "QWidget#LobbyRadarDetailWrap { background: transparent; border: none; }"
+        )
+        self.radar_detail_lay = QVBoxLayout(self.radar_detail_wrap)
+        self.radar_detail_lay.setContentsMargins(0, 2, 0, 0)
+        self.radar_detail_lay.setSpacing(2)
+        self.radar_detail_wrap.hide()
+        rd_lay.addWidget(self.radar_detail_wrap)
+
+        self.radar_card.hide()
+        body_lay.addWidget(self.radar_card)
+
         # 1.5. OPENING 10-PLAYER MATCH BRIEF CARD (Hextech cyan/gold collapsible card on game_start)
         self.opening_brief_card = HextechPulseFrame()
         self.opening_brief_card.setObjectName("OpeningBriefCard")
@@ -421,6 +533,8 @@ class EdgeBuildDrawer(QWidget):
         ob_lay = QVBoxLayout(self.opening_brief_card)
         ob_lay.setContentsMargins(8, 6, 8, 6)
         ob_lay.setSpacing(4)
+        self._ob_lay = ob_lay
+        self._ob_tag_specs: list[tuple[QLabel, str, str]] = []
 
         ob_hdr = QHBoxLayout()
         ob_hdr.setContentsMargins(0, 0, 0, 0)
@@ -456,6 +570,7 @@ class EdgeBuildDrawer(QWidget):
                 f"background-color: {tag_bg}; border: 1px solid {tag_color}; border-radius: 2px; "
                 f"padding: 1px 3px; color: {tag_color}; font-size: 9px; font-weight: bold;"
             )
+            self._ob_tag_specs.append((tag_lbl, tag_color, tag_bg))
             val_lbl = QLabel("")
             val_lbl.setWordWrap(True)
             val_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -494,6 +609,7 @@ class EdgeBuildDrawer(QWidget):
         obsw_top.setContentsMargins(0, 0, 0, 0)
         obsw_skel = QLabel("[敌方威胁]  [海克斯目标]  [出门对策]")
         obsw_skel.setStyleSheet("border: none; background: transparent; color: rgba(200, 170, 110, 75); font-size: 9px;")
+        self._obsw_skel = obsw_skel
         self.opening_brief_seal_close_btn = QPushButton("×")
         self.opening_brief_seal_close_btn.setFixedSize(16, 16)
         self.opening_brief_seal_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -535,9 +651,11 @@ class EdgeBuildDrawer(QWidget):
         nb_lay = QVBoxLayout(self.next_buy_card)
         nb_lay.setContentsMargins(9, 7, 9, 7)
         nb_lay.setSpacing(6)
+        self._nb_lay = nb_lay
 
         hero_row = QHBoxLayout()
         hero_row.setSpacing(9)
+        self._hero_row = hero_row
         self.next_icon_lbl = QLabel("?")
         self.next_icon_lbl.setFixedSize(44, 44)
         self.next_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -570,6 +688,8 @@ class EdgeBuildDrawer(QWidget):
         sub_row = QHBoxLayout()
         sub_row.setSpacing(6)
         self.next_reason_lbl = QLabel("进局自动计算唯一优先装备")
+        self.next_reason_lbl.setWordWrap(True)
+        self.next_reason_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.next_reason_lbl.setStyleSheet("border: none; background: transparent; color: #CBD5E1; font-size: 11px;")
         self.next_source_lbl = QLabel("本地")
         self.next_source_lbl.setStyleSheet("border: none; background: transparent; color: #0AC8B9; font-size: 10px;")
@@ -623,6 +743,7 @@ class EdgeBuildDrawer(QWidget):
         rm_lay = QVBoxLayout(self.roadmap_card)
         rm_lay.setContentsMargins(8, 5, 8, 5)
         rm_lay.setSpacing(4)
+        self._rm_lay = rm_lay
 
         rm_top = QHBoxLayout()
         self.rm_hdr_lbl = QLabel("◈ 出装路线")
@@ -633,6 +754,17 @@ class EdgeBuildDrawer(QWidget):
         rm_top.addStretch(1)
         rm_top.addWidget(self.backup_item_lbl)
         rm_lay.addLayout(rm_top)
+
+        self.pivot_banner_lbl = QLabel("")
+        self.pivot_banner_lbl.setWordWrap(True)
+        self.pivot_banner_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.pivot_banner_lbl.setStyleSheet(
+            "background-color: rgba(8, 42, 54, 228); border: 1px solid #0AC8B9; "
+            "border-left: 2px solid #C8AA6E; border-radius: 2px; padding: 2px 6px; "
+            "color: #A5F3FC; font-size: 10px; font-weight: bold;"
+        )
+        self.pivot_banner_lbl.hide()
+        rm_lay.addWidget(self.pivot_banner_lbl)
 
         self.roadmap_icons_wrap = QWidget()
         self.roadmap_icons_wrap.setObjectName("RoadmapIconsWrap")
@@ -653,8 +785,10 @@ class EdgeBuildDrawer(QWidget):
         dest_lay = QHBoxLayout(self.destiny_card)
         dest_lay.setContentsMargins(8, 4, 8, 4)
         dest_lay.setSpacing(6)
+        self._dest_lay = dest_lay
         dest_title = QLabel("命运绑定:")
         dest_title.setStyleSheet("border: none; background: transparent; color: #F0E6D2; font-weight: bold; font-size: 10px;")
+        self._dest_title_lbl = dest_title
         self.destiny_body_lbl = QLabel("")
         self.destiny_body_lbl.setStyleSheet("border: none; background: transparent; color: #FDE68A; font-size: 10px;")
         dest_lay.addWidget(dest_title)
@@ -669,6 +803,7 @@ class EdgeBuildDrawer(QWidget):
         coach_lay = QVBoxLayout(self.coach_card)
         coach_lay.setContentsMargins(8, 5, 8, 5)
         coach_lay.setSpacing(3)
+        self._coach_lay = coach_lay
 
         self.coach_shimmer = HextechShimmerBar(height=3, accent="#0AC8B9")
         self.coach_shimmer.hide()
@@ -757,6 +892,7 @@ class EdgeBuildDrawer(QWidget):
         css_lay.setContentsMargins(8, 4, 8, 4)
         css_skel = QLabel("▶ 回城精准双散件 · 敌方核心反制 · 团战站位一句提醒")
         css_skel.setStyleSheet("border: none; background: transparent; color: rgba(200, 170, 110, 62); font-size: 9px;")
+        self._css_skel = css_skel
         css_lay.addWidget(css_skel)
         self.coach_seal_overlay = HextechSealOverlay(
             self.coach_seal_slot,
@@ -834,6 +970,7 @@ class EdgeBuildDrawer(QWidget):
             "QPushButton:hover { color: #F0E6D2; border-color: #C8AA6E; }"
         )
         ip_close_btn.clicked.connect(self.inline_preview_box.hide)
+        self._ip_close_btn = ip_close_btn
         ip_btns.addWidget(self.inline_preview_cta_btn)
         ip_btns.addStretch(1)
         ip_btns.addWidget(ip_close_btn)
@@ -853,6 +990,7 @@ class EdgeBuildDrawer(QWidget):
         aug_lay = QVBoxLayout(self.aug_frame)
         aug_lay.setContentsMargins(8, 5, 8, 5)
         aug_lay.setSpacing(4)
+        self._aug_lay = aug_lay
 
         aug_top = QHBoxLayout()
         aug_top.setSpacing(4)
@@ -895,6 +1033,7 @@ class EdgeBuildDrawer(QWidget):
         tb_lay = QVBoxLayout(self.transmute_bar)
         tb_lay.setContentsMargins(6, 4, 6, 4)
         tb_lay.setSpacing(3)
+        self._tb_lay = tb_lay
         tb_top = QHBoxLayout()
         tb_top.setSpacing(4)
         self.transmute_status_lbl = QLabel("⚡ 质变二次识别中 · 悬停新符文图标自动识别")
@@ -909,6 +1048,7 @@ class EdgeBuildDrawer(QWidget):
             "padding: 0px; font-size: 11px; color: #E9D5FF; background: transparent; border: none;"
         )
         tb_dismiss_btn.clicked.connect(self._handle_dismiss_transmute)
+        self._tb_dismiss_btn = tb_dismiss_btn
         tb_top.addWidget(self.transmute_status_lbl, 1)
         tb_top.addWidget(tb_dismiss_btn)
         tb_lay.addLayout(tb_top)
@@ -929,6 +1069,7 @@ class EdgeBuildDrawer(QWidget):
         tb_ok_btn.setFixedHeight(25)
         tb_ok_btn.setStyleSheet("padding: 0px 8px; font-size: 11px; border: 1px solid #D946EF; color: #F0E6D2;")
         tb_ok_btn.clicked.connect(self._handle_manual_resolve_transmute)
+        self._tb_ok_btn = tb_ok_btn
         tb_pick_row.addWidget(self.transmute_combo, 1)
         tb_pick_row.addWidget(tb_ok_btn)
         tb_lay.addLayout(tb_pick_row)
@@ -947,6 +1088,7 @@ class EdgeBuildDrawer(QWidget):
         aug_confirm_btn = QPushButton("添加")
         aug_confirm_btn.setFixedHeight(22)
         aug_confirm_btn.clicked.connect(self._handle_manual_add_augment)
+        self._aug_confirm_btn = aug_confirm_btn
         amr.addWidget(self.aug_add_combo, 1)
         amr.addWidget(aug_confirm_btn)
         self.aug_manual_row.hide()
@@ -980,30 +1122,371 @@ class EdgeBuildDrawer(QWidget):
         root_lay.addWidget(self.panel)
         self.panel.hide()
 
-        self._grip_bl = HextechCornerGrip(self.panel, "bl")
-        self._grip_br = HextechCornerGrip(self.panel, "br")
+        self._edge_l = HextechEdgeHandle(
+            self.panel, "l", show_notch=True, on_double_click=self.reset_default_size
+        )
+        self._edge_r = HextechEdgeHandle(self.panel, "r", show_notch=False)
+        self._edge_t = HextechEdgeHandle(self.panel, "t", show_notch=False)
+        self._edge_b = HextechEdgeHandle(self.panel, "b", show_notch=False)
+        self._grip_tl = HextechCornerGrip(
+            self.panel, "tl", on_double_click=self.reset_default_size, prominent=True
+        )
+        self._grip_bl = HextechCornerGrip(
+            self.panel, "bl", on_double_click=self.reset_default_size, prominent=True
+        )
+        self._grip_br = HextechCornerGrip(
+            self.panel, "br", on_double_click=self.reset_default_size, prominent=False
+        )
         self._resize_ctrl = FramelessResizeController(
             self,
             min_w=self.MIN_EXPANDED_W,
             max_w=self.MAX_EXPANDED_W,
             min_h=self.EXPANDED_MIN_H,
-            max_h=1200,
+            max_h=self.MAX_EXPANDED_H,
             can_resize=lambda: self._expanded and not self._is_full_locked,
             on_live_resize=self._on_live_resize,
             on_resize_finished=self._on_resize_finished,
             screen_provider=self._active_screen,
         )
-        self._resize_ctrl.attach(self.panel)
-        self._resize_ctrl.attach(self.panel_scroll.viewport())
-        self._resize_ctrl.attach(self._grip_bl)
-        self._resize_ctrl.attach(self._grip_br)
+        for handle in (
+            self.panel,
+            self.panel_scroll.viewport(),
+            self._edge_l,
+            self._edge_r,
+            self._edge_t,
+            self._edge_b,
+            self._grip_tl,
+            self._grip_bl,
+            self._grip_br,
+        ):
+            self._resize_ctrl.attach(handle)
 
         self._slide_anim = QVariantAnimation(self)
         self._slide_anim.setDuration(170)
         self._slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._slide_anim.valueChanged.connect(self._apply_animated_width)
         self._slide_anim.finished.connect(self._on_slide_finished)
+        self._apply_ui_scale(1.0, force=True)
         self._reposition_right_edge()
+
+    @property
+    def ui_scale(self) -> float:
+        return self._ui_scale
+
+    def _metrics(self) -> OverlayScaleMetrics:
+        return OverlayScaleMetrics(self._ui_scale)
+
+    def _fs(self, base_px: int | float, *, floor: int = 8) -> int:
+        return self._metrics().font_px(base_px, floor=floor)
+
+    def _px(self, base_px: int | float, *, floor: int = 1) -> int:
+        return self._metrics().px(base_px, floor=floor)
+
+    @classmethod
+    def compute_default_expanded_width(
+        cls,
+        logical_screen_w: int,
+        logical_screen_h: int | None = None,
+        dpr: float = 1.0,
+    ) -> int:
+        auto_scale = compute_auto_overlay_scale(logical_screen_w, logical_screen_h, dpr)
+        return max(cls.MIN_EXPANDED_W, min(cls.MAX_EXPANDED_W, int(round(cls.EXPANDED_W * auto_scale))))
+
+    def _compute_scale_for_rect(self, w: int, h: int | None = None) -> float:
+        return compute_overlay_scale(
+            w,
+            self.EXPANDED_W,
+            height=h,
+            min_comfort_height=self._MIN_COMFORT_H,
+        )
+
+    def _apply_ui_scale(self, scale: float, *, force: bool = False) -> bool:
+        q_scale = round(max(0.85, min(2.20, float(scale))), 2)
+        if not force and abs(q_scale - self._applied_ui_scale) < 0.03:
+            return False
+        self._ui_scale = q_scale
+        self._applied_ui_scale = q_scale
+        m = OverlayScaleMetrics(q_scale)
+
+        self._panel_lay.setContentsMargins(m.px(10), m.px(9), m.px(10), m.px(9))
+        self._panel_lay.setSpacing(m.px(6))
+        self._hdr_lay.setContentsMargins(m.px(2), 0, 0, 0)
+        self._hdr_lay.setSpacing(m.px(4))
+        self._body_lay.setContentsMargins(0, 0, m.px(3), 0)
+        self._body_lay.setSpacing(m.px(6))
+        self._rd_lay.setContentsMargins(m.px(8), m.px(5), m.px(8), m.px(5))
+        self._rd_lay.setSpacing(m.px(3))
+        self._ob_lay.setContentsMargins(m.px(8), m.px(6), m.px(8), m.px(6))
+        self._ob_lay.setSpacing(m.px(4))
+        self._nb_lay.setContentsMargins(m.px(9), m.px(7), m.px(9), m.px(7))
+        self._nb_lay.setSpacing(m.px(6))
+        self._hero_row.setSpacing(m.px(9))
+        self._rm_lay.setContentsMargins(m.px(8), m.px(5), m.px(8), m.px(5))
+        self._rm_lay.setSpacing(m.px(4))
+        self.roadmap_icons_lay.setSpacing(m.px(3))
+        self._dest_lay.setContentsMargins(m.px(8), m.px(4), m.px(8), m.px(4))
+        self._dest_lay.setSpacing(m.px(6))
+        self._coach_lay.setContentsMargins(m.px(8), m.px(5), m.px(8), m.px(5))
+        self._coach_lay.setSpacing(m.px(3))
+        self._aug_lay.setContentsMargins(m.px(8), m.px(5), m.px(8), m.px(5))
+        self._aug_lay.setSpacing(m.px(4))
+        self.aug_chips_lay.setHorizontalSpacing(m.px(4))
+        self.aug_chips_lay.setVerticalSpacing(m.px(4))
+        self._tb_lay.setContentsMargins(m.px(6), m.px(4), m.px(6), m.px(4))
+        self._tb_lay.setSpacing(m.px(3))
+
+        sb_w = max(6, min(14, m.px(6)))
+        self.panel_scroll.verticalScrollBar().setStyleSheet(
+            f"QScrollBar:vertical {{ width: {sb_w}px; background: #010A13; border: none; }}"
+            f"QScrollBar::handle:vertical {{ background: #785A28; border-radius: 2px; min-height: {m.px(24)}px; }}"
+            "QScrollBar::handle:vertical:hover { background: #C8AA6E; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: #010A13; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+        )
+
+        # Header
+        hdr_ico_sz = m.px(22, floor=18)
+        self.hdr_icon.setFixedSize(hdr_ico_sz, hdr_ico_sz)
+        self.hdr_icon.setPixmap(load_app_pixmap(hdr_ico_sz))
+        self.hero_lbl.setFont(display_font(m.pt(11), bold=True, letter_spacing=0.3))
+        self.hero_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F0E6D2; font-size: {m.font_px(12)}px; font-weight: bold;"
+        )
+        self.gold_lbl.setFont(latin_serif_font(m.pt(10), bold=True, letter_spacing=0.3))
+        self.gold_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #FBBF24; font-size: {m.font_px(11)}px; font-weight: bold;"
+        )
+        self.mode_badge_lbl.setStyleSheet(
+            "background-color: rgba(10, 200, 185, 36); border: 1px solid #0AC8B9; "
+            f"border-radius: 2px; padding: 0px {m.px(4)}px; color: #A5F3FC; "
+            f"font-size: {m.font_px(9)}px; font-weight: bold;"
+        )
+        self.coach_btn.set_scaled_metrics(
+            height=m.px(24, floor=20),
+            min_width=m.px(42, floor=38),
+            font_pt=m.pt(10),
+        )
+        btn_sq = m.px(20, floor=18)
+        self.settings_menu_btn.setFixedSize(btn_sq, btn_sq)
+        self.settings_menu_btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: {m.font_px(12)}px; color: #C8AA6E; background: transparent; border: none; }}"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); }"
+        )
+        self.close_btn.setFixedSize(btn_sq, btn_sq)
+        self.close_btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: {m.font_px(14)}px; color: #A09B8C; background: transparent; border: none; }}"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); }"
+        )
+
+        # Warning & Lobby Radar
+        self.warn_lbl.setStyleSheet(
+            "background-color: rgba(127, 29, 29, 220); color: #FECACA; "
+            f"border: 1px solid #DC2626; border-radius: 2px; padding: {m.px(3)}px {m.px(6)}px; "
+            f"font-size: {m.font_px(10)}px;"
+        )
+        self.radar_title_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {m.font_px(10)}px;"
+        )
+        self.radar_premade_lbl.setStyleSheet(
+            "background-color: rgba(127, 29, 29, 175); border: 1px solid rgba(248, 113, 113, 165); "
+            f"border-radius: 2px; padding: 0px {m.px(4)}px; color: #FECACA; font-size: {m.font_px(9)}px; font-weight: bold;"
+        )
+        self.radar_detail_btn.setFixedHeight(m.px(17, floor=16))
+        self.radar_detail_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(8, 30, 44, 210); border: 1px solid #463714; "
+            f"color: #0AC8B9; font-size: {m.font_px(9)}px; font-weight: bold; padding: 0px {m.px(6)}px; border-radius: 2px; }}"
+            "QPushButton:hover { border-color: #0AC8B9; color: #F0E6D2; }"
+        )
+        sm_x = m.px(16, floor=14)
+        self.radar_dismiss_btn.setFixedSize(sm_x, sm_x)
+        self.radar_dismiss_btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: {m.font_px(12)}px; color: #A09B8C; background: transparent; border: none; }}"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); border-radius: 2px; }"
+        )
+        self.radar_summary_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F0E6D2; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+
+        # Opening Brief & Seal Preview
+        self.opening_brief_title_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {m.font_px(10)}px;"
+        )
+        self.opening_brief_dismiss_btn.setFixedSize(sm_x, sm_x)
+        self.opening_brief_dismiss_btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: {m.font_px(12)}px; color: #A09B8C; background: transparent; border: none; }}"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); border-radius: 2px; }"
+        )
+        tag_w = m.px(58, floor=48)
+        for tag_lbl, tag_color, tag_bg in self._ob_tag_specs:
+            tag_lbl.setFixedWidth(tag_w)
+            tag_lbl.setStyleSheet(
+                f"background-color: {tag_bg}; border: 1px solid {tag_color}; border-radius: 2px; "
+                f"padding: {m.px(1)}px {m.px(3)}px; color: {tag_color}; font-size: {m.font_px(9)}px; font-weight: bold;"
+            )
+        self.opening_brief_threat_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F0E6D2; font-size: {m.font_px(10)}px;"
+        )
+        self.opening_brief_augment_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #E2E8F0; font-size: {m.font_px(10)}px;"
+        )
+        self.opening_brief_buy_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #FDE68A; font-size: {m.font_px(10)}px;"
+        )
+        self._obsw_skel.setStyleSheet(
+            f"border: none; background: transparent; color: rgba(200, 170, 110, 75); font-size: {m.font_px(9)}px;"
+        )
+        self.opening_brief_seal_close_btn.setFixedSize(sm_x, sm_x)
+        self.opening_brief_seal_close_btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: {m.font_px(12)}px; color: #A09B8C; background: transparent; border: none; }}"
+            "QPushButton:hover { color: #F0E6D2; background: rgba(200, 170, 110, 45); border-radius: 2px; }"
+        )
+
+        # Hero Next-Buy Card
+        hero_ico_sz = m.px(44, floor=34)
+        self.next_icon_lbl.setFixedSize(hero_ico_sz, hero_ico_sz)
+        self.next_icon_lbl.setStyleSheet(
+            "background-color: #091428; border: 2px solid #C89B3C; border-radius: 2px; "
+            f"color: #C8AA6E; font-weight: bold; font-size: {m.font_px(16)}px;"
+        )
+        self.next_item_title_lbl.setFont(display_font(m.pt(13), bold=True, letter_spacing=0.4))
+        self.next_item_title_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F0E6D2; font-size: {m.font_px(15)}px; font-weight: bold;"
+        )
+        self.next_reason_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #CBD5E1; font-size: {m.font_px(11)}px;"
+        )
+        self.next_source_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #0AC8B9; font-size: {m.font_px(10)}px;"
+        )
+        self.buy_now_lbl.setStyleSheet(
+            "background-color: rgba(50, 35, 12, 230); border: 1px solid #C89B3C; "
+            f"border-radius: 2px; padding: {m.px(5)}px {m.px(8)}px; color: #FDE68A; "
+            f"font-size: {m.font_px(12)}px; font-weight: bold;"
+        )
+        self.boots_hint_lbl.setStyleSheet(
+            "background-color: rgba(10, 200, 185, 28); border: 1px solid rgba(10, 200, 185, 130); "
+            f"border-radius: 2px; padding: {m.px(1)}px {m.px(5)}px; color: #A5F3FC; "
+            f"font-size: {m.font_px(9)}px; font-weight: bold;"
+        )
+        self.top_threat_lbl.setStyleSheet(
+            "background-color: rgba(127, 29, 29, 175); border: 1px solid rgba(248, 113, 113, 165); "
+            f"border-radius: 2px; padding: {m.px(1)}px {m.px(5)}px; color: #FECACA; "
+            f"font-size: {m.font_px(9)}px; font-weight: bold;"
+        )
+        if self._cost_badge_state is not None:
+            self._set_cost_badge(*self._cost_badge_state)
+
+        # Roadmap & Destiny
+        self.rm_hdr_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: {self._rm_hdr_color}; "
+            f"font-weight: bold; font-size: {m.font_px(10)}px;"
+        )
+        self.backup_item_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #A09B8C; font-size: {m.font_px(10)}px;"
+        )
+        self.pivot_banner_lbl.setStyleSheet(
+            "background-color: rgba(8, 42, 54, 228); border: 1px solid #0AC8B9; "
+            f"border-left: 2px solid #C8AA6E; border-radius: 2px; padding: {m.px(2)}px {m.px(6)}px; "
+            f"color: #A5F3FC; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self._dest_title_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F0E6D2; font-weight: bold; font-size: {m.font_px(10)}px;"
+        )
+        self.destiny_body_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #FDE68A; font-size: {m.font_px(10)}px;"
+        )
+
+        # Coach / Tactical Bar
+        self.coach_status_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: {self._coach_status_color}; "
+            f"font-weight: bold; font-size: {m.font_px(10)}px;"
+        )
+        self.threat_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #0AC8B9; font-size: {m.font_px(10)}px;"
+        )
+        self.coach_time_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #64748B; font-size: {m.font_px(10)}px;"
+        )
+        tier_h = m.px(18, floor=16)
+        for tb in (self.tier_auto_pill, self.tier_a_pill, self.tier_b_pill):
+            tb.setFixedHeight(tier_h)
+        self.set_coach_tier(self._coach_tier)
+        self.coach_balance_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: {self._coach_balance_color}; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self.tier_nudge_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #C8AA6E; font-size: {m.font_px(9)}px;"
+        )
+        self.coach_content_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #E2E8F0; font-size: {m.font_px(11)}px;"
+        )
+        self.coach_seal_slot.setFixedHeight(m.px(52, floor=44))
+        self._css_skel.setStyleSheet(
+            f"border: none; background: transparent; color: rgba(200, 170, 110, 62); font-size: {m.font_px(9)}px;"
+        )
+        self.cutoff_banner_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: {self._cutoff_banner_color}; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        act_h = m.px(20, floor=18)
+        self.cutoff_action_btn.setFixedHeight(act_h)
+        self.cutoff_action_btn.setStyleSheet(
+            "QPushButton { background-color: #0E3746; border: 1px solid #0AC8B9; color: #F0E6D2; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold; padding: 0px {m.px(8)}px; border-radius: 2px; }}"
+            "QPushButton:hover { border-color: #5EEAD4; color: #FFFFFF; }"
+        )
+        self.inline_preview_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #E2D9C5; font-size: {m.font_px(10)}px;"
+        )
+        self.inline_preview_cta_btn.setFixedHeight(act_h)
+        self.inline_preview_cta_btn.setStyleSheet(
+            "QPushButton { background-color: #0E3746; border: 1px solid #0AC8B9; color: #F0E6D2; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold; padding: 0px {m.px(8)}px; border-radius: 2px; }}"
+            "QPushButton:hover { border-color: #7CF8EE; color: #FFFFFF; }"
+        )
+        self._ip_close_btn.setFixedHeight(act_h)
+        self._ip_close_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: 1px solid #463714; color: #A09B8C; "
+            f"font-size: {m.font_px(10)}px; padding: 0px {m.px(8)}px; border-radius: 2px; }}"
+            "QPushButton:hover { color: #F0E6D2; border-color: #C8AA6E; }"
+        )
+
+        # Augments, Transmute & Tools Row
+        self.aug_hdr_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {m.font_px(10)}px;"
+        )
+        self.aug_toggle_add_btn.setFixedSize(m.px(20, floor=18), m.px(18, floor=16))
+        self.aug_toggle_add_btn.setStyleSheet(f"padding: 0px; font-size: {m.font_px(12)}px;")
+        self.transmute_status_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F5D0FE; font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
+        self._tb_dismiss_btn.setFixedSize(sm_x, sm_x)
+        self._tb_dismiss_btn.setStyleSheet(
+            f"padding: 0px; font-size: {m.font_px(11)}px; color: #E9D5FF; background: transparent; border: none;"
+        )
+        tx_h = m.px(25, floor=22)
+        self.transmute_combo.setFixedHeight(tx_h)
+        self.transmute_combo.setStyleSheet(
+            f"QComboBox {{ padding: 1px {m.px(6)}px; font-size: {m.font_px(11)}px; border: 1px solid #9333EA; }}"
+        )
+        if self.transmute_combo.lineEdit():
+            self.transmute_combo.lineEdit().setStyleSheet(f"padding: 0px 2px; font-size: {m.font_px(11)}px;")
+        self._tb_ok_btn.setFixedHeight(tx_h)
+        self._tb_ok_btn.setStyleSheet(
+            f"padding: 0px {m.px(8)}px; font-size: {m.font_px(11)}px; border: 1px solid #D946EF; color: #F0E6D2;"
+        )
+        tool_h = m.px(22, floor=20)
+        self.aug_add_combo.setFixedHeight(tool_h)
+        self.aug_add_combo.setStyleSheet(f"QComboBox {{ font-size: {m.font_px(11)}px; }}")
+        self._aug_confirm_btn.setFixedHeight(tool_h)
+        self._aug_confirm_btn.setStyleSheet(f"padding: 0px {m.px(8)}px; font-size: {m.font_px(11)}px;")
+        self.dataset_combo.setFixedHeight(tool_h)
+        self.dataset_combo.setStyleSheet(f"QComboBox {{ font-size: {m.font_px(11)}px; }}")
+        self.hero_combo.setFixedWidth(m.px(104, floor=86))
+        self.hero_combo.setFixedHeight(tool_h)
+        self.hero_combo.setStyleSheet(f"QComboBox {{ font-size: {m.font_px(11)}px; }}")
+        return True
 
     @staticmethod
     def _width_bucket(w: int) -> int:
@@ -1018,10 +1501,27 @@ class EdgeBuildDrawer(QWidget):
         ph = self.panel.height()
         if pw <= 20 or ph <= 20:
             return
-        self._grip_bl.move(1, ph - self._grip_bl.height() - 1)
-        self._grip_br.move(pw - self._grip_br.width() - 1, ph - self._grip_br.height() - 1)
-        self._grip_bl.raise_()
-        self._grip_br.raise_()
+        gsz = max(15, min(24, int(round(16 * self._ui_scale))))
+        eth = max(7, min(11, int(round(8 * self._ui_scale))))
+        top_eth = max(6, eth - 1)
+
+        self._edge_l.setGeometry(0, gsz, eth, max(0, ph - 2 * gsz))
+        self._edge_r.setGeometry(pw - eth, gsz, eth, max(0, ph - 2 * gsz))
+        self._edge_t.setGeometry(gsz, 0, max(0, pw - 2 * gsz), top_eth)
+        self._edge_b.setGeometry(gsz, ph - eth, max(0, pw - 2 * gsz), eth)
+
+        for grip, gx, gy in (
+            (self._grip_tl, 0, 0),
+            (self._grip_bl, 0, ph - gsz),
+            (self._grip_br, pw - gsz, ph - gsz),
+        ):
+            grip.set_grip_size(gsz)
+            grip.move(gx, gy)
+
+        for edge_w in (self._edge_l, self._edge_r, self._edge_t, self._edge_b):
+            edge_w.raise_()
+        for grip in (self._grip_tl, self._grip_bl, self._grip_br):
+            grip.raise_()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -1033,7 +1533,12 @@ class EdgeBuildDrawer(QWidget):
         self.hdr_icon.setVisible(not compact)
         self.mode_badge_lbl.setVisible(bool(self._match_mode_badge_text) and not compact)
         self.collapse_btn.setText("收" if compact else "收起")
-        self.collapse_btn.setMinimumWidth(26 if compact else 40)
+        m = self._metrics()
+        self.collapse_btn.set_scaled_metrics(
+            height=m.px(24, floor=20),
+            min_width=m.px(26 if compact else 40, floor=26),
+            font_pt=m.pt(10),
+        )
 
     def set_match_mode_badge(self, text: str) -> None:
         """Display or clear the active match dataset mode pill (e.g. '首棱彩局') in Hextech header."""
@@ -1044,46 +1549,137 @@ class EdgeBuildDrawer(QWidget):
         if clean:
             self.mode_badge_lbl.setToolTip(f"已自动切换至「{clean}」大数据胜率表，对局结束后自动恢复")
 
-    def _apply_expanded_dimensions(self, w: int, h: int, *, x: int | None = None, y: int | None = None) -> None:
+    def _rebuild_scaled_dynamic_widgets(self) -> None:
+        self._last_roadmap_sig = ()
+        self._render_decision_cards()
+        if self._store_ref is not None:
+            self._render_augment_chips(self._store_ref)
+        self._rebuild_quick_confirm()
+        if self._lobby_scout is not None and self._radar_detail_expanded:
+            self._last_radar_detail_sig = None
+            self._rebuild_radar_detail_rows(self._lobby_scout)
+
+    def _invalidate_expanded_layouts(self) -> None:
+        self.aug_chips_lay.invalidate()
+        self.aug_chips_lay.activate()
+        blay = self.panel_body.layout()
+        if blay is not None:
+            for i in range(blay.count()):
+                sub_w = blay.itemAt(i).widget()
+                if sub_w is not None and not sub_w.isHidden():
+                    sl = sub_w.layout()
+                    if sl is not None:
+                        sl.invalidate()
+                        sl.activate()
+            blay.invalidate()
+            blay.activate()
+        play = self.panel.layout()
+        if play is not None:
+            play.invalidate()
+            play.activate()
+
+    def _compute_auto_expanded_height(self, w: int, geo: QRect) -> int:
+        m = self._metrics()
+        inner_w = max(200, w - m.px(22))
+        minimap_guard_h = int(geo.height() * 0.25)
+        blay = self.panel_body.layout()
+        body_h_for_w = self.panel_body.heightForWidth(inner_w)
+        explicit_h = 0
+        if blay is not None:
+            b_sp = max(0, blay.spacing())
+            vis_cnt = 0
+            for i in range(blay.count()):
+                w_child = blay.itemAt(i).widget()
+                if w_child is not None and not w_child.isHidden():
+                    hfw = w_child.heightForWidth(inner_w)
+                    ch = hfw if hfw > 0 else max(w_child.sizeHint().height(), w_child.minimumSizeHint().height())
+                    explicit_h += ch + (b_sp if vis_cnt > 0 else 0)
+                    vis_cnt += 1
+        body_hint_h = explicit_h if explicit_h > 0 else max(body_h_for_w if body_h_for_w > 0 else 0, self.panel_body.sizeHint().height())
+        header_chrome_h = m.px(56)
+        max_h = max(
+            self.EXPANDED_MIN_H,
+            (geo.height() - minimap_guard_h - 24) if self._anchor_right else (geo.height() - 48),
+        )
+        return min(max_h, max(self.EXPANDED_MIN_H, header_chrome_h + body_hint_h + m.px(28)))
+
+    def _apply_expanded_dimensions(
+        self,
+        w: int,
+        h: int,
+        *,
+        x: int | None = None,
+        y: int | None = None,
+        force_scale: bool = False,
+        auto_fit_h: bool = False,
+    ) -> None:
         w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(w)))
-        h = max(self.EXPANDED_MIN_H, int(h))
+        h_for_scale = None if auto_fit_h else max(self.EXPANDED_MIN_H, int(h))
         self._expanded_w = w
+        new_scale = self._compute_scale_for_rect(w, h_for_scale)
+        scale_changed = self._apply_ui_scale(new_scale, force=force_scale)
         self._apply_header_density(w)
-        self.setFixedWidth(w)
-        self.setFixedHeight(h)
         self.panel.setFixedWidth(w)
-        self.panel.setFixedHeight(h)
-        inner_w = max(200, w - 22)
-        self.panel_body.setFixedWidth(inner_w)
-        if x is not None and y is not None:
-            self.setGeometry(int(x), int(y), w, h)
-        self._layout_corner_grips()
+        self.panel_body.setMinimumWidth(0)
+        self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
 
         new_bucket = self._width_bucket(w)
-        if new_bucket != self._last_layout_bucket or abs(w - self._last_rendered_w) >= 24:
+        if scale_changed or new_bucket != self._last_layout_bucket or abs(w - self._last_rendered_w) >= 24:
             self._last_layout_bucket = new_bucket
             self._last_rendered_w = w
-            self._last_roadmap_sig = ()
-            self._render_decision_cards()
-            if self._store_ref is not None:
-                self._render_augment_chips(self._store_ref)
+            self._rebuild_scaled_dynamic_widgets()
 
-    def _on_live_resize(self, target: QRect, _edge: str) -> None:
+        self._invalidate_expanded_layouts()
+        if auto_fit_h:
+            screen = self._active_screen()
+            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+            eff_h = self._compute_auto_expanded_height(w, geo)
+            eff_y = max(geo.top() + 12, min(geo.bottom() - eff_h - 12, int(y) if y is not None else self.y()))
+        else:
+            eff_h = max(self.EXPANDED_MIN_H, int(h))
+            eff_y = int(y) if y is not None else self.y()
+
+        self.setFixedWidth(w)
+        self.setFixedHeight(eff_h)
+        self.panel.setFixedHeight(eff_h)
+        if x is not None and y is not None:
+            self.setGeometry(int(x), eff_y, w, eff_h)
+        self._layout_corner_grips()
+
+    def _on_live_resize(self, target: QRect, edge: str) -> None:
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
-        self._custom_h = target.height()
-        self._apply_expanded_dimensions(target.width(), target.height(), x=target.x(), y=target.y())
+        self._has_custom_w = True
+        has_v = ("t" in edge) or ("b" in edge)
+        if has_v:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+        auto_fit_h = (not has_v) and (self._custom_h is None)
+        eff_h = self._custom_h if self._custom_h is not None else target.height()
+        self._apply_expanded_dimensions(
+            target.width(),
+            eff_h,
+            x=target.x(),
+            y=target.y(),
+            force_scale=False,
+            auto_fit_h=auto_fit_h,
+        )
 
-    def _on_resize_finished(self, target: QRect, _edge: str) -> None:
-        self._expanded_w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
-        self._custom_h = max(self.EXPANDED_MIN_H, target.height())
-        if self._expanded_w != self._last_rendered_w:
-            self._last_layout_bucket = self._width_bucket(self._expanded_w)
-            self._last_rendered_w = self._expanded_w
-            self._last_roadmap_sig = ()
-            self._render_decision_cards()
-            if self._store_ref is not None:
-                self._render_augment_chips(self._store_ref)
+    def _on_resize_finished(self, target: QRect, edge: str) -> None:
+        self._has_custom_w = True
+        w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
+        has_v = ("t" in edge) or ("b" in edge)
+        if has_v:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+        auto_fit_h = (not has_v) and (self._custom_h is None)
+        eff_h = self._custom_h if self._custom_h is not None else target.height()
+        self._apply_expanded_dimensions(
+            w,
+            eff_h,
+            x=target.x(),
+            y=target.y(),
+            force_scale=True,
+            auto_fit_h=auto_fit_h,
+        )
         screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
         if screen is not None:
             self._target_screen = screen
@@ -1094,22 +1690,33 @@ class EdgeBuildDrawer(QWidget):
             else:
                 self._custom_pos = self.pos()
         if self._on_size_changed:
-            self._on_size_changed([self._expanded_w, self._custom_h])
+            saved_h = self._custom_h if self._custom_h is not None else 0
+            self._on_size_changed([self._expanded_w, saved_h])
+        if self._on_scale_changed:
+            self._on_scale_changed(round(self._ui_scale, 3))
         if self._on_pos_changed and self._custom_pos is not None:
             self._on_pos_changed([self._custom_pos.x(), self._custom_pos.y()])
 
     def reset_default_size(self) -> None:
-        self._expanded_w = self.EXPANDED_W
+        self._has_custom_w = False
         self._custom_h = None
+        screen = self._active_screen()
+        if screen is not None:
+            geo = screen.geometry()
+            dpr = max(1.0, float(screen.devicePixelRatio() or 1.0))
+            self._expanded_w = self.compute_default_expanded_width(geo.width(), geo.height(), dpr)
+        else:
+            self._expanded_w = self.EXPANDED_W
+        self._applied_ui_scale = 0.0
+        self._apply_ui_scale(self._compute_scale_for_rect(self._expanded_w, None), force=True)
         self._last_layout_bucket = self._width_bucket(self._expanded_w)
         self._last_rendered_w = self._expanded_w
-        self._last_roadmap_sig = ()
-        self._render_decision_cards()
-        if self._store_ref is not None:
-            self._render_augment_chips(self._store_ref)
+        self._rebuild_scaled_dynamic_widgets()
         self._reposition_right_edge()
         if self._on_size_changed:
             self._on_size_changed(None)
+        if self._on_scale_changed:
+            self._on_scale_changed(None)
 
     def _get_item_pixmap(self, item_id: str, size: int) -> QPixmap | None:
         norm = normalize_item_id(item_id)
@@ -1236,50 +1843,28 @@ class EdgeBuildDrawer(QWidget):
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
         geo = screen.geometry()
+        dpr = max(1.0, float(screen.devicePixelRatio() or 1.0))
+        if self._expanded and not self._has_custom_w:
+            self._expanded_w = self.compute_default_expanded_width(geo.width(), geo.height(), dpr)
         w = min(self._expanded_w, max(self.MIN_EXPANDED_W, geo.width() - 24)) if self._expanded else self.COLLAPSED_W
         minimap_guard_h = int(geo.height() * 0.25)
         if self._expanded:
+            target_scale = self._compute_scale_for_rect(w, self._custom_h)
+            scale_changed = self._apply_ui_scale(target_scale, force=False)
             self._apply_header_density(w)
             if self.panel.width() != w:
                 self.panel.setFixedWidth(w)
-            inner_w = max(200, w - 22)
-            if self.panel_body.width() != inner_w:
-                self.panel_body.setFixedWidth(inner_w)
-            self.aug_chips_lay.invalidate()
-            self.aug_chips_lay.activate()
-            blay = self.panel_body.layout()
-            if blay is not None:
-                for i in range(blay.count()):
-                    sub_w = blay.itemAt(i).widget()
-                    if sub_w is not None and not sub_w.isHidden():
-                        sl = sub_w.layout()
-                        if sl is not None:
-                            sl.invalidate()
-                            sl.activate()
-                blay.invalidate()
-                blay.activate()
+            self.panel_body.setMinimumWidth(0)
+            self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
+            if scale_changed or self._width_bucket(w) != self._last_layout_bucket or abs(w - self._last_rendered_w) >= 24:
+                self._last_layout_bucket = self._width_bucket(w)
+                self._last_rendered_w = w
+                self._rebuild_scaled_dynamic_widgets()
+            self._invalidate_expanded_layouts()
             if self._custom_h is not None:
                 h = min(geo.height() - 32, max(self.EXPANDED_MIN_H, self._custom_h))
             else:
-                body_h_for_w = self.panel_body.heightForWidth(inner_w)
-                explicit_h = 0
-                if blay is not None:
-                    b_sp = max(0, blay.spacing())
-                    vis_cnt = 0
-                    for i in range(blay.count()):
-                        w_child = blay.itemAt(i).widget()
-                        if w_child is not None and not w_child.isHidden():
-                            ch = max(w_child.heightForWidth(inner_w), w_child.sizeHint().height(), w_child.minimumSizeHint().height())
-                            explicit_h += ch + (b_sp if vis_cnt > 0 else 0)
-                            vis_cnt += 1
-                body_hint_h = max(body_h_for_w if body_h_for_w > 0 else 0, self.panel_body.sizeHint().height(), explicit_h)
-                header_chrome_h = 46
-                # Reserve bottom-right LoL minimap band (~25% height) when anchored to right edge
-                max_h = max(
-                    self.EXPANDED_MIN_H,
-                    (geo.height() - minimap_guard_h - 24) if self._anchor_right else (geo.height() - 48),
-                )
-                h = min(max_h, max(self.EXPANDED_MIN_H, header_chrome_h + body_hint_h + 18))
+                h = self._compute_auto_expanded_height(w, geo)
             if self.panel.height() != h or self.panel.minimumHeight() != h or self.panel.maximumHeight() != h:
                 self.panel.setFixedHeight(h)
         else:
@@ -1338,7 +1923,13 @@ class EdgeBuildDrawer(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            if (not self._expanded) or event.position().y() <= 40:
+            if self._resize_ctrl.is_resizing or (
+                self._expanded and self._resize_ctrl.hit_test_global(event.globalPosition().toPoint())
+            ):
+                event.ignore()
+                return
+            header_drag_h = self._px(40, floor=36)
+            if (not self._expanded) or event.position().y() <= header_drag_h:
                 self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 event.accept()
                 return
@@ -1346,7 +1937,7 @@ class EdgeBuildDrawer(QWidget):
             menu = QMenu(self)
             a_toggle = QAction("收起成小条" if self._expanded else "展开抽屉", menu)
             a_toggle.triggered.connect(self.toggle_expanded)
-            a_reset_size = QAction("恢复默认尺寸", menu)
+            a_reset_size = QAction("恢复默认尺寸（适配屏幕）", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_reset = QAction("复位到屏幕右侧", menu)
             a_reset.triggered.connect(self.reset_to_right_edge)
@@ -1644,7 +2235,7 @@ class EdgeBuildDrawer(QWidget):
             and (self._match_game_time_s <= 180.0)
         )
         if show_ob_seal:
-            compact_h = 30 if self._opening_brief_seal_dismissed_count >= 3 else 54
+            compact_h = self._px(30 if self._opening_brief_seal_dismissed_count >= 3 else 54, floor=26)
             self.opening_brief_seal_wrap.setFixedHeight(compact_h)
             ob_sub = self._peephole_hint if compact_h >= 50 else ""
             self.opening_brief_seal.set_snoozed(self._lifecycle.snoozed)
@@ -1671,19 +2262,25 @@ class EdgeBuildDrawer(QWidget):
             self._opening_brief_seal_dismissed_count = max(0, int(dismissed_count))
         self._sync_seal_slots()
         if snapshot is not None and snapshot.is_low_energy and self.coach_balance_lbl.isVisible():
+            self._coach_balance_color = "#FDE68A"
             self.coach_balance_lbl.setStyleSheet(
-                "border: none; background: transparent; color: #FDE68A; font-size: 10px; font-weight: bold;"
+                f"border: none; background: transparent; color: #FDE68A; font-size: {self._fs(10)}px; font-weight: bold;"
             )
         elif self.coach_balance_lbl.isVisible():
+            self._coach_balance_color = "#5EEAD4"
             self.coach_balance_lbl.setStyleSheet(
-                "border: none; background: transparent; color: #5EEAD4; font-size: 10px; font-weight: bold;"
+                f"border: none; background: transparent; color: #5EEAD4; font-size: {self._fs(10)}px; font-weight: bold;"
             )
         if self._expanded and self.isVisible():
             self._reposition_right_edge()
 
     def set_live_vital_state(self, *, is_dead: bool = False, game_time_s: float = 0.0) -> None:
+        prev_collapsed = self._match_game_time_s >= 90.0
         self._is_player_dead = bool(is_dead)
         self._match_game_time_s = max(0.0, float(game_time_s or 0.0))
+        now_collapsed = self._match_game_time_s >= 90.0
+        if self._lobby_scout is not None and prev_collapsed != now_collapsed:
+            self._sync_lobby_radar()
         if self._commercial and self._lifecycle is not None and self._lifecycle.is_sealed_dormant:
             self._sync_seal_slots()
 
@@ -1730,13 +2327,15 @@ class EdgeBuildDrawer(QWidget):
         raw = (tier or "a").strip().lower()
         norm = raw if raw in ("a", "b", "auto") else "a"
         self._coach_tier = norm
+        fs = self._fs(9)
+        pad_x = self._px(5)
         active_qss = (
             "QPushButton { background-color: rgba(10, 200, 185, 65); border: 1px solid #0AC8B9; "
-            "color: #F0E6D2; font-weight: bold; font-size: 9px; padding: 0px 5px; border-radius: 2px; }"
+            f"color: #F0E6D2; font-weight: bold; font-size: {fs}px; padding: 0px {pad_x}px; border-radius: 2px; }}"
         )
         idle_qss = (
             "QPushButton { background-color: rgba(8, 18, 32, 195); border: 1px solid #463714; "
-            "color: #A09B8C; font-size: 9px; padding: 0px 5px; border-radius: 2px; }"
+            f"color: #A09B8C; font-size: {fs}px; padding: 0px {pad_x}px; border-radius: 2px; }}"
             "QPushButton:hover { border-color: #C8AA6E; color: #F0E6D2; }"
         )
         self.tier_auto_pill.setStyleSheet(active_qss if norm == "auto" else idle_qss)
@@ -1787,8 +2386,9 @@ class EdgeBuildDrawer(QWidget):
         if self._coach_loading and not self._ai_cutoff:
             self.pill_coach_dot.setStyleSheet("color: #FBBF24; font-size: 10px;")
             self.coach_status_lbl.setText(label)
+            self._coach_status_color = "#FBBF24"
             self.coach_status_lbl.setStyleSheet(
-                "border: none; background: transparent; color: #FBBF24; font-weight: bold; font-size: 10px;"
+                f"border: none; background: transparent; color: #FBBF24; font-weight: bold; font-size: {self._fs(10)}px;"
             )
             if self._balance_credits is None:
                 self.coach_balance_lbl.setText("余额同步中")
@@ -1853,16 +2453,18 @@ class EdgeBuildDrawer(QWidget):
                 self.cutoff_gate_bar.setStyleSheet(
                     "QFrame { background-color: rgba(120, 28, 28, 225); border: 1px solid #F59E0B; border-radius: 2px; }"
                 )
+                self._cutoff_banner_color = "#FEF3C7"
                 self.cutoff_banner_lbl.setStyleSheet(
-                    "border: none; background: transparent; color: #FEF3C7; font-size: 10px; font-weight: bold;"
+                    f"border: none; background: transparent; color: #FEF3C7; font-size: {self._fs(10)}px; font-weight: bold;"
                 )
             else:
                 self.cutoff_gate_bar.setStyleSheet(
                     "QFrame { background-color: rgba(6, 20, 34, 232); border: 1px solid #785A28; "
                     "border-left: 2px solid #0AC8B9; border-radius: 2px; }"
                 )
+                self._cutoff_banner_color = "#E2D9C5"
                 self.cutoff_banner_lbl.setStyleSheet(
-                    "border: none; background: transparent; color: #E2D9C5; font-size: 10px; font-weight: bold;"
+                    f"border: none; background: transparent; color: #E2D9C5; font-size: {self._fs(10)}px; font-weight: bold;"
                 )
             if eff_code == "SERVICE_LOCKED":
                 self.coach_status_lbl.setText("● 服务维护中")
@@ -1892,8 +2494,9 @@ class EdgeBuildDrawer(QWidget):
                 )
                 self.cutoff_action_btn.setText("扫码充值")
                 self.cutoff_action_btn.show()
+            self._coach_status_color = status_color
             self.coach_status_lbl.setStyleSheet(
-                f"border: none; background: transparent; color: {status_color}; font-weight: bold; font-size: 10px;"
+                f"border: none; background: transparent; color: {status_color}; font-weight: bold; font-size: {self._fs(10)}px;"
             )
             self.cutoff_banner.show()
             if self._coach_advice is None or self._is_full_locked:
@@ -1911,6 +2514,7 @@ class EdgeBuildDrawer(QWidget):
             self.opening_brief_card.hide()
         else:
             self._render_opening_brief()
+        self._sync_lobby_radar()
         self.next_buy_card.setVisible(not full_locked)
         self.roadmap_card.setVisible(not full_locked)
         self.aug_frame.setVisible(not full_locked)
@@ -1930,7 +2534,10 @@ class EdgeBuildDrawer(QWidget):
             self.coach_shimmer.set_active(True)
             self.pill_coach_dot.setStyleSheet("border: none; background: transparent; color: #FBBF24; font-size: 10px;")
             self.coach_status_lbl.setText(pending_label or "● 参谋同步中…")
-            self.coach_status_lbl.setStyleSheet("border: none; background: transparent; color: #FBBF24; font-weight: bold; font-size: 10px;")
+            self._coach_status_color = "#FBBF24"
+            self.coach_status_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #FBBF24; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
         else:
             self.coach_shimmer.set_active(False)
             self.coach_shimmer.hide()
@@ -1943,7 +2550,10 @@ class EdgeBuildDrawer(QWidget):
         self.coach_shimmer.set_active(False)
         self.coach_shimmer.hide()
         self.coach_status_lbl.setText("● 参谋调用异常")
-        self.coach_status_lbl.setStyleSheet("border: none; background: transparent; color: #F87171; font-weight: bold; font-size: 10px;")
+        self._coach_status_color = "#F87171"
+        self.coach_status_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #F87171; font-weight: bold; font-size: {self._fs(10)}px;"
+        )
         if message:
             self.coach_content_lbl.setText(_clip_text(message, 46))
             self.coach_content_lbl.setToolTip(message)
@@ -1955,13 +2565,19 @@ class EdgeBuildDrawer(QWidget):
         if online:
             self.pill_coach_dot.setStyleSheet("color: #09C269; font-size: 11px;")
             self.coach_status_lbl.setText(label or "● 参谋在线")
-            self.coach_status_lbl.setStyleSheet("border: none; background: transparent; color: #09C269; font-weight: bold; font-size: 10px;")
+            self._coach_status_color = "#09C269"
+            self.coach_status_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #09C269; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
             if self._coach_advice is None:
                 self.coach_content_lbl.setText(ready_hint or "参谋就绪 · 死亡或按 F6 自动更新战术提示")
         else:
             self.pill_coach_dot.setStyleSheet("color: #5B5A56; font-size: 10px;")
             self.coach_status_lbl.setText(label or ("● 未登录" if self._commercial else "● 参谋未接入"))
-            self.coach_status_lbl.setStyleSheet("border: none; background: transparent; color: #A09B8C; font-weight: bold; font-size: 10px;")
+            self._coach_status_color = "#A09B8C"
+            self.coach_status_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #A09B8C; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
             if self._coach_advice is None:
                 fallback_hint = (
                     "本地 5ms 大数据引擎接管中（登录后开启云端 AI）"
@@ -1981,13 +2597,22 @@ class EdgeBuildDrawer(QWidget):
         self._overhaul_reason = overhaul_reason
         if overhaul_reason:
             self.rm_hdr_lbl.setText(f"⚡ {_clip_text(overhaul_reason, 14)}")
-            self.rm_hdr_lbl.setStyleSheet("border: none; background: transparent; color: #0AC8B9; font-weight: bold; font-size: 10px;")
+            self._rm_hdr_color = "#0AC8B9"
+            self.rm_hdr_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #0AC8B9; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
         elif self._locked_next_item:
             self.rm_hdr_lbl.setText("◈ 本局锁定路线")
-            self.rm_hdr_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: 10px;")
+            self._rm_hdr_color = "#C8AA6E"
+            self.rm_hdr_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
         else:
             self.rm_hdr_lbl.setText("◈ 出装路线")
-            self.rm_hdr_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: 10px;")
+            self._rm_hdr_color = "#C8AA6E"
+            self.rm_hdr_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
 
     def dismiss_opening_brief(self) -> None:
         """Hide the opening 10-player brief card for the remainder of the current match."""
@@ -2031,6 +2656,248 @@ class EdgeBuildDrawer(QWidget):
             return True
         self.opening_brief_card.hide()
         return False
+
+    @staticmethod
+    def _format_radar_summary(snapshot: LobbyScoutSnapshot) -> str:
+        mvp = snapshot.mvp_card
+        enemy = snapshot.top_enemy_card
+        gap = f" (+{snapshot.mvp_lead_gap})" if snapshot.mvp_lead_gap > 0 else ""
+        if mvp is not None and enemy is not None:
+            same_player = bool(
+                (mvp.puuid and mvp.puuid == enemy.puuid)
+                or (mvp.team == enemy.team and mvp.champion_name == enemy.champion_name and mvp.hex_rating == enemy.hex_rating)
+            )
+            if same_player:
+                ally_top = snapshot.my_team[0] if snapshot.my_team else None
+                left = f"RANK 01 敌大腿 {enemy.champion_name} {enemy.hex_rating}{gap}"
+                right = f" · 我方 {ally_top.champion_name} {ally_top.hex_rating}" if ally_top is not None else ""
+                return left + right
+            return f"RANK 01 {mvp.champion_name} {mvp.hex_rating}{gap} · 敌大腿 {enemy.champion_name} {enemy.hex_rating}"
+        if mvp is not None:
+            return f"RANK 01 {mvp.champion_name} {mvp.hex_rating}{gap}"
+        if enemy is not None:
+            return f"敌大腿 {enemy.champion_name} {enemy.hex_rating}"
+        return ""
+
+    def _rebuild_radar_detail_rows(self, snapshot: LobbyScoutSnapshot) -> None:
+        if self._last_radar_detail_sig == snapshot:
+            return
+        self._last_radar_detail_sig = snapshot
+
+        while self.radar_detail_lay.count():
+            it = self.radar_detail_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+
+        def _append_section(title: str, cards: tuple[PlayerScoutCard, ...], accent: str) -> None:
+            if not cards:
+                return
+            fs9 = self._fs(9)
+            sec_lbl = QLabel(title)
+            sec_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: {accent}; font-size: {fs9}px; font-weight: bold;"
+            )
+            self.radar_detail_lay.addWidget(sec_lbl)
+            sec_lbl.show()
+            for card in cards[:5]:
+                row = QWidget()
+                row.setStyleSheet("background: transparent; border: none;")
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(self._px(2), 0, self._px(2), 0)
+                rl.setSpacing(self._px(4))
+                prefix = "★" if card.is_mvp_carry else "·"
+                name_lbl = QLabel(f"{prefix}{_clip_text(card.champion_name, 6)}")
+                name_lbl.setStyleSheet(
+                    f"border: none; background: transparent; color: {'#FDE68A' if card.is_mvp_carry else '#E2E8F0'}; "
+                    f"font-size: {fs9}px; font-weight: bold;"
+                )
+                meta_parts = [str(card.hex_rating)]
+                if card.rank_label:
+                    meta_parts.append(card.rank_label)
+                if card.aram_games > 0:
+                    meta_parts.append(f"{int(round(card.aram_wr * 100))}%")
+                elif card.hidden_history:
+                    meta_parts.append("隐")
+                if card.streak_tag:
+                    meta_parts.append(card.streak_tag)
+                if card.premade_group:
+                    meta_parts.append(card.premade_group)
+                meta_lbl = QLabel(" · ".join(meta_parts))
+                meta_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                meta_lbl.setStyleSheet(
+                    f"border: none; background: transparent; color: #A09B8C; font-size: {fs9}px;"
+                )
+                rl.addWidget(name_lbl)
+                rl.addStretch(1)
+                rl.addWidget(meta_lbl)
+                self.radar_detail_lay.addWidget(row)
+                row.show()
+
+        _append_section("我方战力", snapshot.my_team, "#0AC8B9")
+        _append_section("敌方战力", snapshot.enemy_team, "#FCA5A5")
+
+    def _toggle_radar_detail(self) -> None:
+        self._radar_detail_expanded = not self._radar_detail_expanded
+        self._sync_lobby_radar()
+
+    def _dismiss_lobby_radar(self) -> None:
+        self._radar_dismissed = True
+        self._radar_detail_expanded = False
+        self._sync_lobby_radar()
+
+    def _sync_top_threat_badge(self, *, threat_chars: int | None = None) -> bool:
+        """Render top_threat_lbl with priority: live fed KDA > auto-collapsed LobbyScout top enemy carry."""
+        eff_w = max(self.MIN_EXPANDED_W, self._expanded_w)
+        max_chars = threat_chars if threat_chars is not None else max(13, int((eff_w - 120) / 11.0))
+
+        threat_txt = ""
+        tooltip = ""
+        if self._threat is not None and self._threat.top_threat_name:
+            sp_tags = [s for s in self._threat.top_threat_spells if s in ("雪球", "虚弱", "净化", "点燃")]
+            sp_suffix = f"/{sp_tags[0]}" if sp_tags else ""
+            threat_txt = f"盯:{_clip_text(self._threat.top_threat_name, 5)} {self._threat.top_threat_kda}{sp_suffix}"
+            full_sp = "+".join(self._threat.top_threat_spells) if self._threat.top_threat_spells else ""
+            tooltip = f"敌方头号威胁：{self._threat.top_threat_name} ({self._threat.top_threat_kda}) {full_sp}".strip()
+        elif (
+            self._lobby_scout is not None
+            and self._lobby_scout.top_enemy_card is not None
+            and (self._match_game_time_s >= 90.0 or self._radar_dismissed)
+        ):
+            ec = self._lobby_scout.top_enemy_card
+            threat_txt = f"敌大腿:{_clip_text(ec.champion_name, 6)} {ec.hex_rating}"
+            detail_parts = [f"{ec.hex_rating}分"]
+            if ec.rank_label:
+                detail_parts.append(ec.rank_label)
+            if ec.aram_games > 0:
+                detail_parts.append(f"近{ec.aram_games}场胜率{int(round(ec.aram_wr * 100))}%")
+            elif ec.hidden_history:
+                detail_parts.append("隐藏战绩")
+            if ec.streak_tag:
+                detail_parts.append(ec.streak_tag)
+            if ec.premade_group:
+                detail_parts.append(ec.premade_group)
+            tooltip = f"开局十人雷达 · 敌方最高战力：{ec.champion_name} ({' · '.join(detail_parts)})"
+
+        clipped = _clip_text(threat_txt, max_chars) if threat_txt else ""
+        has_threat = bool(clipped)
+        sig = (clipped, tooltip, has_threat)
+        if sig != self._last_top_threat_sig:
+            self._last_top_threat_sig = sig
+            if has_threat:
+                if self.top_threat_lbl.text() != clipped:
+                    self.top_threat_lbl.setText(clipped)
+                if self.top_threat_lbl.toolTip() != tooltip:
+                    self.top_threat_lbl.setToolTip(tooltip)
+                if self.top_threat_lbl.isHidden():
+                    self.top_threat_lbl.show()
+            else:
+                if self.top_threat_lbl.text():
+                    self.top_threat_lbl.setText("")
+                if not self.top_threat_lbl.isHidden():
+                    self.top_threat_lbl.hide()
+
+        want_micro = bool((not self.boots_hint_lbl.isHidden()) or has_threat)
+        if self.tactical_micro_wrap.isHidden() == want_micro:
+            self.tactical_micro_wrap.setVisible(want_micro)
+        return has_threat
+
+    def _sync_lobby_radar(self) -> None:
+        snap = self._lobby_scout
+        is_collapsed_by_time = self._match_game_time_s >= 90.0
+        sig = (
+            snap,
+            is_collapsed_by_time,
+            self._radar_dismissed,
+            self._radar_detail_expanded,
+            self._is_full_locked,
+        )
+        if sig == self._last_radar_sig:
+            return
+        self._last_radar_sig = sig
+
+        was_card_visible = not self.radar_card.isHidden()
+        was_detail_visible = not self.radar_detail_wrap.isHidden()
+
+        summary_txt = self._format_radar_summary(snap) if snap is not None else ""
+        show_card = bool(
+            snap is not None
+            and summary_txt
+            and not self._is_full_locked
+            and not self._radar_dismissed
+            and not is_collapsed_by_time
+        )
+
+        if show_card and snap is not None:
+            if self.radar_summary_lbl.text() != summary_txt:
+                self.radar_summary_lbl.setText(summary_txt)
+            tip_lines = [summary_txt]
+            if snap.premade_notes:
+                tip_lines.append("车队：" + " / ".join(snap.premade_notes))
+            if snap.degraded_count > 0:
+                tip_lines.append(f"注：{snap.degraded_count} 人隐藏战绩，已按段位估算")
+            full_tip = "\n".join(tip_lines)
+            if self.radar_summary_lbl.toolTip() != full_tip:
+                self.radar_summary_lbl.setToolTip(full_tip)
+
+            if snap.premade_notes:
+                pm_short = _clip_text(snap.premade_notes[0], 10)
+                if self.radar_premade_lbl.text() != pm_short:
+                    self.radar_premade_lbl.setText(pm_short)
+                pm_tip = " / ".join(snap.premade_notes)
+                if self.radar_premade_lbl.toolTip() != pm_tip:
+                    self.radar_premade_lbl.setToolTip(pm_tip)
+                if self.radar_premade_lbl.isHidden():
+                    self.radar_premade_lbl.show()
+            elif not self.radar_premade_lbl.isHidden():
+                self.radar_premade_lbl.hide()
+
+            btn_txt = "收起" if self._radar_detail_expanded else "详情"
+            if self.radar_detail_btn.text() != btn_txt:
+                self.radar_detail_btn.setText(btn_txt)
+
+            if self._radar_detail_expanded:
+                self._rebuild_radar_detail_rows(snap)
+                if self.radar_detail_wrap.isHidden():
+                    self.radar_detail_wrap.show()
+            elif not self.radar_detail_wrap.isHidden():
+                self.radar_detail_wrap.hide()
+
+            if self.radar_card.isHidden():
+                self.radar_card.show()
+        else:
+            if not self.radar_detail_wrap.isHidden():
+                self.radar_detail_wrap.hide()
+            if not self.radar_card.isHidden():
+                self.radar_card.hide()
+
+        self._sync_top_threat_badge()
+
+        now_card_visible = not self.radar_card.isHidden()
+        now_detail_visible = not self.radar_detail_wrap.isHidden()
+        if (was_card_visible != now_card_visible or was_detail_visible != now_detail_visible) and self._expanded and self.isVisible():
+            self._reposition_right_edge()
+
+    def set_lobby_scout(
+        self,
+        snapshot: LobbyScoutSnapshot | None,
+        game_time_s: float | None = None,
+    ) -> None:
+        """Bind or clear the 10-player LobbyScout snapshot inside the existing right-edge drawer."""
+        if game_time_s is not None:
+            self._match_game_time_s = max(0.0, float(game_time_s))
+        if snapshot is None:
+            self._lobby_scout = None
+            self._radar_dismissed = False
+            self._radar_detail_expanded = False
+            self._last_radar_detail_sig = None
+        else:
+            if self._lobby_scout is None:
+                self._radar_dismissed = False
+            self._lobby_scout = snapshot
+        self._sync_lobby_radar()
 
     def set_coach_advice(
         self,
@@ -2152,29 +3019,33 @@ class EdgeBuildDrawer(QWidget):
             return
 
         # Case A: An augment was auto-recorded -> show compact 1-click swap buttons for the OTHER 2 cards
+        m = self._metrics()
         if self._recent_auto_committed_id and self._recent_auto_committed_id in self._selected_augments:
             alts = [a for a in self._recent_offered if a.augment_id != self._recent_auto_committed_id]
             if not alts:
                 self.quick_confirm_wrap.hide()
                 return
             lbl = QLabel("改选:")
-            lbl.setStyleSheet("border: none; background: transparent; color: #A09B8C; font-size: 10px;")
+            lbl.setStyleSheet(f"border: none; background: transparent; color: #A09B8C; font-size: {m.font_px(10)}px;")
             self.quick_confirm_lay.addWidget(lbl)
             for aug in alts[:2]:
                 btn = QPushButton(_clip_text(aug.name, 7))
-                btn.setFixedHeight(20)
+                btn.setFixedHeight(m.px(20, floor=18))
                 btn.setToolTip(f"若自动记错，点此替换为【{aug.name}】")
                 btn.setStyleSheet(
-                    "QPushButton { padding: 0px 6px; font-size: 10px; border: 1px solid #475569; color: #CBD5E1; }"
+                    f"QPushButton {{ padding: 0px {m.px(6)}px; font-size: {m.font_px(10)}px; border: 1px solid #475569; color: #CBD5E1; }}"
                     "QPushButton:hover { border-color: #0AC8B9; color: #F0E6D2; }"
                 )
                 btn.clicked.connect(lambda _=False, aid=aug.augment_id: self._swap_last_augment(aid))
                 self.quick_confirm_lay.addWidget(btn)
             self.quick_confirm_lay.addStretch(1)
             dismiss = QPushButton("✓")
-            dismiss.setFixedSize(20, 20)
+            d_sz = m.px(20, floor=18)
+            dismiss.setFixedSize(d_sz, d_sz)
             dismiss.setToolTip("确认无误，隐藏改选栏")
-            dismiss.setStyleSheet("padding: 0px; font-size: 11px; color: #09C269; border: none; background: transparent;")
+            dismiss.setStyleSheet(
+                f"padding: 0px; font-size: {m.font_px(11)}px; color: #09C269; border: none; background: transparent;"
+            )
             dismiss.clicked.connect(lambda: self.set_recent_offered([]))
             self.quick_confirm_lay.addWidget(dismiss)
             self.quick_confirm_wrap.show()
@@ -2186,16 +3057,16 @@ class EdgeBuildDrawer(QWidget):
             self.quick_confirm_wrap.hide()
             return
         lbl = QLabel("刚选了:")
-        lbl.setStyleSheet("border: none; background: transparent; color: #FBBF24; font-size: 10px;")
+        lbl.setStyleSheet(f"border: none; background: transparent; color: #FBBF24; font-size: {m.font_px(10)}px;")
         self.quick_confirm_lay.addWidget(lbl)
         shown_unrec = unrecorded[:4]
         clip_len = 5 if len(shown_unrec) >= 4 else 6
         for aug in shown_unrec:
             btn = QPushButton(_clip_text(aug.name, clip_len))
-            btn.setFixedHeight(20)
+            btn.setFixedHeight(m.px(20, floor=18))
             btn.setToolTip(f"点选记录【{aug.name}】")
             btn.setStyleSheet(
-                "QPushButton { padding: 0px 5px; font-size: 10px; border: 1px solid #C89B3C; color: #F0E6D2; }"
+                f"QPushButton {{ padding: 0px {m.px(5)}px; font-size: {m.font_px(10)}px; border: 1px solid #C89B3C; color: #F0E6D2; }}"
                 "QPushButton:hover { border-color: #0AC8B9; background: rgba(10, 200, 185, 45); }"
             )
             btn.clicked.connect(lambda _=False, aid=aug.augment_id: self._quick_pick_augment(aid))
@@ -2318,6 +3189,7 @@ class EdgeBuildDrawer(QWidget):
 
     def _render_decision_cards(self) -> None:
         if self._is_full_locked:
+            self.radar_card.hide()
             self.opening_brief_card.hide()
             self.next_buy_card.hide()
             self.roadmap_card.hide()
@@ -2409,12 +3281,13 @@ class EdgeBuildDrawer(QWidget):
         pill_gap = 0
 
         eff_w = max(self.MIN_EXPANDED_W, self._expanded_w)
-        reason_chars = max(14, int((eff_w - 110) / 11))
-        buy_chars = max(24, int((eff_w - 40) / 8.5))
-        boots_chars = max(12, int((eff_w - 130) / 11.5))
-        threat_chars = max(13, int((eff_w - 120) / 11.0))
-        coach_tip_chars = max(22, int((eff_w - 48) / 10.5))
-        coach_sum_chars = max(34, int((eff_w - 30) / 7.2))
+        norm_w = max(288.0, float(eff_w) / max(0.85, self._ui_scale))
+        reason_chars = max(16, int((norm_w - 104.0) / 9.5))
+        buy_chars = max(26, int((norm_w - 36.0) / 8.0))
+        boots_chars = max(12, int((norm_w - 130.0) / 11.5))
+        threat_chars = max(13, int((norm_w - 120.0) / 11.0))
+        coach_tip_chars = max(22, int((norm_w - 48.0) / 10.5))
+        coach_sum_chars = max(36, int((norm_w - 30.0) / 7.0))
         self.next_source_lbl.setVisible(eff_w >= 312)
 
         if coach_primary is not None:
@@ -2484,8 +3357,9 @@ class EdgeBuildDrawer(QWidget):
             self.buy_now_lbl.setText("◇ 进局后显示当前金币立刻买什么件")
             self.backup_item_lbl.setText("")
 
-        # Update 44x44 Hero Item Icon + Collapsed Live Pill Gold-Readiness Ring (0ms sync!)
-        pm = self._get_item_pixmap(target_id, 40) if target_id else None
+        # Update Scaled Hero Item Icon + Collapsed Live Pill Gold-Readiness Ring (0ms sync!)
+        hero_ico_px = max(24, self.next_icon_lbl.width() - 4)
+        pm = self._get_item_pixmap(target_id, hero_ico_px) if target_id else None
         if pm is not None:
             self.next_icon_lbl.setPixmap(pm)
             self.next_icon_lbl.setText("")
@@ -2571,12 +3445,34 @@ class EdgeBuildDrawer(QWidget):
         if is_full_build:
             final_steps: list[tuple[str, str, str]] = list(steps_visual[:6])
             self.rm_hdr_lbl.setText("◈ 六神已毕业 (6/6)")
-            self.rm_hdr_lbl.setStyleSheet("border: none; background: transparent; color: #09C269; font-weight: bold; font-size: 10px;")
+            self._rm_hdr_color = "#09C269"
+            self.rm_hdr_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #09C269; font-weight: bold; font-size: {self._fs(10)}px;"
+            )
         else:
             final_steps = list(steps_visual[:5])
             max_future = max(1, 6 - len(final_steps))
             for idx, (iid, nm) in enumerate(rem_pairs[:max_future]):
                 final_steps.append((iid, nm, "next" if idx == 0 else "future"))
+
+        # Explicit build-pivot comparison strip inside roadmap_card (signature-deduplicated)
+        pivot_txt = (
+            plan.pivot_banner_text.strip()
+            if (plan is not None and not is_full_build and plan.pivot_banner_text)
+            else ""
+        )
+        if pivot_txt != self._last_pivot_banner_text:
+            self._last_pivot_banner_text = pivot_txt
+            if pivot_txt:
+                self.pivot_banner_lbl.setText(pivot_txt)
+                self.pivot_banner_lbl.setToolTip(pivot_txt)
+                if self.pivot_banner_lbl.isHidden():
+                    self.pivot_banner_lbl.show()
+            else:
+                self.pivot_banner_lbl.setText("")
+                self.pivot_banner_lbl.setToolTip("")
+                if not self.pivot_banner_lbl.isHidden():
+                    self.pivot_banner_lbl.hide()
 
         # Update text mirror for tests & accessibility
         text_tokens = [
@@ -2586,36 +3482,27 @@ class EdgeBuildDrawer(QWidget):
         self.roadmap_body_lbl.setText("  ›  ".join(text_tokens))
         self._rebuild_roadmap_icons(final_steps)
 
-        # Update compact tactical micro-bar (counter Tier-2 boots + top enemy threat KDA/spells)
+        # Update compact tactical micro-bar (counter Tier-2 boots + top enemy threat KDA/spells or collapsed radar)
         boots_txt = ""
         if plan is not None and not is_full_build and plan.recommended_boots_name:
             short_boot = _short_item_name(plan.recommended_boots_name)
             boots_txt = f"鞋:{short_boot}({plan.recommended_boots_reason})" if plan.recommended_boots_reason else f"鞋:{short_boot}"
         if boots_txt:
-            self.boots_hint_lbl.setText(_clip_text(boots_txt, boots_chars))
-            self.boots_hint_lbl.setToolTip(f"推荐二级鞋：{plan.recommended_boots_name}（{plan.recommended_boots_reason}）")
-            self.boots_hint_lbl.show()
-        else:
+            clipped_boots = _clip_text(boots_txt, boots_chars)
+            if self.boots_hint_lbl.text() != clipped_boots:
+                self.boots_hint_lbl.setText(clipped_boots)
+            boots_tip = f"推荐二级鞋：{plan.recommended_boots_name}（{plan.recommended_boots_reason}）"
+            if self.boots_hint_lbl.toolTip() != boots_tip:
+                self.boots_hint_lbl.setToolTip(boots_tip)
+            if self.boots_hint_lbl.isHidden():
+                self.boots_hint_lbl.show()
+        elif not self.boots_hint_lbl.isHidden():
             self.boots_hint_lbl.hide()
 
-        threat_txt = ""
-        if self._threat is not None and self._threat.top_threat_name:
-            sp_tags = [s for s in self._threat.top_threat_spells if s in ("雪球", "虚弱", "净化", "点燃")]
-            sp_suffix = f"/{sp_tags[0]}" if sp_tags else ""
-            threat_txt = f"盯:{_clip_text(self._threat.top_threat_name, 5)} {self._threat.top_threat_kda}{sp_suffix}"
-        if threat_txt:
-            self.top_threat_lbl.setText(_clip_text(threat_txt, threat_chars))
-            full_sp = "+".join(self._threat.top_threat_spells) if (self._threat and self._threat.top_threat_spells) else ""
-            self.top_threat_lbl.setToolTip(
-                f"敌方头号威胁：{self._threat.top_threat_name} ({self._threat.top_threat_kda}) {full_sp}"
-                if self._threat
-                else threat_txt
-            )
-            self.top_threat_lbl.show()
-        else:
-            self.top_threat_lbl.hide()
-
-        self.tactical_micro_wrap.setVisible(bool(boots_txt or threat_txt))
+        has_threat = self._sync_top_threat_badge(threat_chars=threat_chars)
+        want_micro = bool(boots_txt or has_threat)
+        if self.tactical_micro_wrap.isHidden() == want_micro:
+            self.tactical_micro_wrap.setVisible(want_micro)
 
         # Ultra-concise Coach Tactical Tip (ZERO stale 3-card tips after picker closed!)
         if adv is not None:
@@ -2631,21 +3518,25 @@ class EdgeBuildDrawer(QWidget):
             self.coach_content_lbl.setToolTip(adv.tactical_summary or adv.augment_pick_advice or txt)
 
     def _set_cost_badge(self, eff_cost: int, affordable: bool, gap: int) -> None:
+        self._cost_badge_state = (eff_cost, affordable, gap) if eff_cost > 0 else None
         if eff_cost <= 0:
             if not self.next_cost_badge.isHidden():
                 self.next_cost_badge.hide()
             return
+        m = self._metrics()
         if affordable:
             txt = f"可直买 {eff_cost}G"
             qss = (
                 "background-color: rgba(9, 194, 105, 45); border: 1px solid #09C269; "
-                "border-radius: 2px; padding: 1px 5px; color: #6EE7B7; font-size: 10px; font-weight: bold;"
+                f"border-radius: 2px; padding: {m.px(1)}px {m.px(5)}px; color: #6EE7B7; "
+                f"font-size: {m.font_px(10)}px; font-weight: bold;"
             )
         else:
             txt = f"差 {gap}G"
             qss = (
                 "background-color: rgba(200, 155, 60, 40); border: 1px solid #C89B3C; "
-                "border-radius: 2px; padding: 1px 5px; color: #FDE68A; font-size: 10px; font-weight: bold;"
+                f"border-radius: 2px; padding: {m.px(1)}px {m.px(5)}px; color: #FDE68A; "
+                f"font-size: {m.font_px(10)}px; font-weight: bold;"
             )
         if self.next_cost_badge.text() != txt:
             self.next_cost_badge.setText(txt)
@@ -2655,7 +3546,7 @@ class EdgeBuildDrawer(QWidget):
             self.next_cost_badge.show()
 
     def _rebuild_roadmap_icons(self, steps: list[tuple[str, str, str]]) -> None:
-        sig = tuple(steps)
+        sig = (round(self._ui_scale, 2), self._expanded_w, tuple(steps))
         if sig == self._last_roadmap_sig:
             return
         self._last_roadmap_sig = sig
@@ -2668,21 +3559,35 @@ class EdgeBuildDrawer(QWidget):
                 w.setParent(None)
                 w.deleteLater()
 
+        m = self._metrics()
         if not steps:
             empty = QLabel("◇ 进局后生成图标路线")
-            empty.setStyleSheet("border: none; background: transparent; color: #64748B; font-size: 10px;")
+            empty.setStyleSheet(
+                f"border: none; background: transparent; color: #64748B; font-size: {m.font_px(10)}px;"
+            )
             self.roadmap_icons_lay.addWidget(empty)
             empty.show()
             return
 
-        compact_6 = len(steps) >= 6
+        n_steps = len(steps)
+        compact_6 = n_steps >= 6
         bucket = self._width_bucket(self._expanded_w)
-        cap_len = 2 if bucket == 0 else (5 if bucket == 2 else 3)
+        cap_len = 2 if bucket == 0 else (4 if self._ui_scale >= 1.35 else (5 if bucket == 2 else 3))
+
+        # Compute guaranteed non-overflowing icon pixel budget for the current expanded width & scale
+        avail_w = max(180, self._expanded_w - m.px(22) - m.px(16) - m.px(6))
+        sep_w = m.px(9, floor=7)
+        sp = m.px(3, floor=2)
+        cell_budget = max(22, int((avail_w - max(0, n_steps - 1) * (sep_w + 2 * sp)) / max(1, n_steps)))
+
         for idx, (iid, name, state) in enumerate(steps):
             if idx > 0:
                 sep = QLabel("›")
                 sep.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                sep.setStyleSheet("border: none; background: transparent; color: #785A28; font-size: 12px; font-weight: bold;")
+                sep.setStyleSheet(
+                    f"border: none; background: transparent; color: #785A28; "
+                    f"font-size: {m.font_px(12)}px; font-weight: bold;"
+                )
                 self.roadmap_icons_lay.addWidget(sep)
                 sep.show()
 
@@ -2690,18 +3595,19 @@ class EdgeBuildDrawer(QWidget):
             cell.setStyleSheet("background: transparent; border: none;")
             cl = QVBoxLayout(cell)
             cl.setContentsMargins(0, 0, 0, 0)
-            cl.setSpacing(2)
+            cl.setSpacing(m.px(2))
 
+            base_ico = (32 if state == "next" else 28) if (compact_6 and self._ui_scale >= 1.2) else (
+                (28 if state == "next" else 24) if compact_6 else (32 if state == "next" else 28)
+            )
             if bucket == 0:
-                ico_size = 24 if state == "next" else 20
-            elif bucket == 2:
-                ico_size = (34 if state == "next" else 30) if compact_6 else (38 if state == "next" else 34)
-            else:
-                ico_size = (28 if state == "next" else 24) if compact_6 else (32 if state == "next" else 28)
+                base_ico = 24 if state == "next" else 20
+            desired_ico = m.px(base_ico, floor=18)
+            ico_size = max(18, min(desired_ico, cell_budget - 2))
             ico = QLabel()
             ico.setFixedSize(ico_size, ico_size)
             ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pm = self._get_item_pixmap(iid, ico_size - 4)
+            pm = self._get_item_pixmap(iid, max(14, ico_size - 4))
             if pm is not None:
                 ico.setPixmap(pm)
             else:
@@ -2725,7 +3631,7 @@ class EdgeBuildDrawer(QWidget):
 
             ico.setStyleSheet(
                 f"background-color: #091428; border: {border}; border-radius: 2px; "
-                "color: #C8AA6E; font-size: 9px; font-weight: bold;"
+                f"color: #C8AA6E; font-size: {m.font_px(9)}px; font-weight: bold;"
             )
             ico.setToolTip(tip)
 
@@ -2733,7 +3639,7 @@ class EdgeBuildDrawer(QWidget):
             cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cap.setStyleSheet(
                 f"border: none; background: transparent; color: {cap_color}; "
-                f"font-size: 9px; {'font-weight: bold;' if state == 'next' else ''}"
+                f"font-size: {m.font_px(9)}px; {'font-weight: bold;' if state == 'next' else ''}"
             )
             cap.setToolTip(tip)
 
@@ -2763,9 +3669,12 @@ class EdgeBuildDrawer(QWidget):
                 w.setParent(None)
                 w.deleteLater()
 
+        m = self._metrics()
         if not self._selected_augments:
             empty = QLabel("◇ 选卡后自动记入")
-            empty.setStyleSheet("border: none; background: transparent; color: #64748B; font-size: 10px;")
+            empty.setStyleSheet(
+                f"border: none; background: transparent; color: #64748B; font-size: {m.font_px(10)}px;"
+            )
             self.aug_chips_lay.addWidget(empty, 0, 0, 1, 2)
             empty.show()
             return
@@ -2775,7 +3684,7 @@ class EdgeBuildDrawer(QWidget):
         if self._expanded_w < 330:
             max_chars = 6
         elif self._expanded_w >= 450:
-            max_chars = 9
+            max_chars = 8 if self._ui_scale >= 1.3 else 9
         else:
             max_chars = 9 if len(self._selected_augments) <= 2 else 7
         for idx, aid in enumerate(self._selected_augments):
@@ -2797,9 +3706,10 @@ class EdgeBuildDrawer(QWidget):
                 f"QFrame {{ background-color: {bg_css}; border: 1px solid {color}; border-radius: 2px; }}"
             )
             cl = QHBoxLayout(chip)
-            cl.setContentsMargins(6, 2, 4, 2)
-            cl.setSpacing(3)
+            cl.setContentsMargins(m.px(6), m.px(2), m.px(4), m.px(2))
+            cl.setSpacing(m.px(3))
             lbl = QLabel(disp_name)
+            lbl.setMinimumWidth(0)
             if is_tx:
                 tip_txt = f"{name}（等待二次识别质变结果）"
             elif sp is not None:
@@ -2807,11 +3717,16 @@ class EdgeBuildDrawer(QWidget):
             else:
                 tip_txt = name
             lbl.setToolTip(tip_txt)
-            lbl.setStyleSheet(f"border: none; background: transparent; color: {color}; font-weight: bold; font-size: 10px;")
+            lbl.setStyleSheet(
+                f"border: none; background: transparent; color: {color}; font-weight: bold; font-size: {m.font_px(10)}px;"
+            )
             rm = QPushButton("×")
-            rm.setFixedSize(14, 14)
+            rm_sz = m.px(14, floor=12)
+            rm.setFixedSize(rm_sz, rm_sz)
             rm.setToolTip(f"移除 {name}")
-            rm.setStyleSheet("padding: 0px; font-size: 11px; color: #A09B8C; background: transparent; border: none;")
+            rm.setStyleSheet(
+                f"padding: 0px; font-size: {m.font_px(11)}px; color: #A09B8C; background: transparent; border: none;"
+            )
             rm.clicked.connect(lambda _=False, i=idx: self._on_remove_augment and self._on_remove_augment(i))
             cl.addWidget(lbl, 1)
             cl.addWidget(rm)

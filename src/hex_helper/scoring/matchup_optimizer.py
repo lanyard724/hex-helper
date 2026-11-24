@@ -210,6 +210,87 @@ class NextBuyPlan:
     recommended_boots_name: str = ""
     recommended_boots_reason: str = ""
     is_opening_buy: bool = False
+    pivot_from_label: str = ""
+    pivot_to_label: str = ""
+    pivot_banner_text: str = ""
+
+
+_PROFILE_CN_LABELS: dict[str, str] = {
+    "AD": "物理",
+    "AP": "法强",
+    "TANK": "坦克",
+}
+
+
+def _infer_static_default_profile(store: DataStore, hero_id: str) -> str:
+    """Infer champion's conventional damage/tank archetype from static core builds (ignoring augment overrides)."""
+    ad_s = 0.0
+    ap_s = 0.0
+    tank_s = 0.0
+
+    sample_ids: list[str] = []
+    for cb in store.get_core_builds(hero_id)[:2]:
+        sample_ids.extend(cb.items)
+    if not sample_ids:
+        recs = store.get_hero_item_recs(hero_id)
+        if recs:
+            top_recs = sorted(recs.values(), key=lambda r: r.games, reverse=True)[:4]
+            sample_ids = [r.item_id for r in top_recs]
+
+    for iid in sample_ids:
+        info = store.get_item_info(iid)
+        ad_s += info.stats.get("FlatPhysicalDamageMod", 0.0) * 1.1
+        ad_s += info.stats.get("FlatCritChanceMod", 0.0) * 100.0
+        ap_s += info.stats.get("FlatMagicDamageMod", 0.0) * 0.85
+        tank_s += (
+            info.stats.get("FlatArmorMod", 0.0) * 1.1
+            + info.stats.get("FlatSpellBlockMod", 0.0) * 1.1
+            + info.stats.get("FlatHPPoolMod", 0.0) * 0.10
+        )
+
+    if tank_s >= max(ad_s, ap_s) * 1.15 and tank_s > 60:
+        return "TANK"
+    if ap_s > ad_s * 1.15:
+        return "AP"
+    return "AD"
+
+
+def _detect_build_pivot(
+    store: DataStore,
+    hero_id: str,
+    selected_augments: tuple[str, ...] | list[str],
+) -> tuple[str, str, str]:
+    """Return (pivot_from_label, pivot_to_label, pivot_banner_text) when an augment overhauls default build archetype."""
+    if not selected_augments:
+        return "", "", ""
+    specials = resolve_special_builds(store, selected_augments)
+    if not specials:
+        return "", "", ""
+
+    default_profile = _infer_static_default_profile(store, hero_id)
+    from_cn = _PROFILE_CN_LABELS.get(default_profile, default_profile)
+    override = detect_profile_override(store, selected_augments)
+
+    if override and override != default_profile:
+        sp = next((e for e in specials if e.shifts_profile == override), specials[0])
+        to_cn = _PROFILE_CN_LABELS.get(override, override)
+        to_label = f"{to_cn}流"
+        return from_cn, to_label, f"⚡ 已按【{sp.name}】切换{to_label}（替代常规{from_cn}）"
+
+    core_ids = {
+        normalize_item_id(x)
+        for cb in store.get_core_builds(hero_id)[:2]
+        for x in cb.items
+    }
+    for sp in specials:
+        if not sp.shifts_profile and sp.transformative and sp.allow_off_profile and sp.force_items:
+            if any(normalize_item_id(fi) not in core_ids for fi in sp.force_items):
+                arch = (sp.archetype or "").strip()
+                to_clean = arch[:-1] if arch.endswith("流") else arch
+                to_label = f"{to_clean}流" if to_clean else "专属流"
+                return from_cn, to_label, f"⚡ 已按【{sp.name}】切换{to_label}（替代常规{from_cn}）"
+
+    return "", "", ""
 
 
 def _player_weight(p: PlayerLiveInfo) -> float:
@@ -1283,6 +1364,8 @@ def build_next_buy_plan(
                         has_gw_in_path = True
                     path_ids.append(nid)
                     path_names.append(nm)
+    pivot_from, pivot_to, pivot_banner = _detect_build_pivot(store, str(hero_id), selected_augments)
+
     return NextBuyPlan(
         target=target,
         effective_cost=effective_cost,
@@ -1296,6 +1379,9 @@ def build_next_buy_plan(
         recommended_boots_name=boots_name,
         recommended_boots_reason=boots_reason,
         is_opening_buy=is_opening,
+        pivot_from_label=pivot_from,
+        pivot_to_label=pivot_to,
+        pivot_banner_text=pivot_banner,
     )
 
 
