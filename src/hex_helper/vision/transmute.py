@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import ctypes
 import re
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
 import numpy as np
@@ -87,6 +89,45 @@ def get_cursor_pos() -> tuple[int, int] | None:
     return None
 
 
+def _classify_cursor_zone_with_rel(
+    cursor_pos: tuple[int, int] | None,
+    game_rect: WindowRect | None,
+    frame_width: int = 0,
+    frame_height: int = 0,
+) -> tuple[str, float | None, float | None]:
+    """Classify screen cursor coordinates into ('bottom_hud' | 'tab_zone' | 'other', x_rel, y_rel)."""
+    if cursor_pos is None or game_rect is None:
+        return "other", None, None
+    cx_scr, cy_scr = cursor_pos
+    if not (
+        game_rect.left <= cx_scr <= game_rect.right
+        and game_rect.top <= cy_scr <= game_rect.bottom
+    ):
+        return "other", None, None
+    fw = frame_width if frame_width > 0 else max(1, game_rect.width)
+    fh = frame_height if frame_height > 0 else max(1, game_rect.height)
+    rx = cx_scr - game_rect.left
+    ry = cy_scr - game_rect.top
+    x_rel = rx / max(1, fw)
+    y_rel = ry / max(1, fh)
+    if (0.14 <= x_rel <= 0.86) and (y_rel >= 0.72):
+        return "bottom_hud", round(x_rel, 4), round(y_rel, 4)
+    if (0.12 <= x_rel <= 0.88) and (0.16 <= y_rel < 0.72):
+        return "tab_zone", round(x_rel, 4), round(y_rel, 4)
+    return "other", round(x_rel, 4), round(y_rel, 4)
+
+
+def classify_cursor_zone(
+    cursor_pos: tuple[int, int] | None,
+    game_rect: WindowRect | None,
+    frame_width: int = 0,
+    frame_height: int = 0,
+) -> str:
+    """Classify screen cursor position into 'bottom_hud' | 'tab_zone' | 'other'."""
+    zone, _, _ = _classify_cursor_zone_with_rel(cursor_pos, game_rect, frame_width, frame_height)
+    return zone
+
+
 def is_transmute_augment(augment_id: str) -> bool:
     return str(augment_id) in TRANSMUTE_SPECS
 
@@ -117,14 +158,16 @@ class PendingTransmute:
 class ResolvedTransmuteHit:
     augment: AugmentInfo
     confidence: float
-    channel: str  # "chat" | "reveal_banner" | "hover_tooltip"
+    channel: str  # "chat" | "reveal_banner" | "hover_tooltip" | "hud_hover_sync"
     raw_text: str
+    cursor_zone: str = "other"  # "bottom_hud" | "tab_zone" | "other"
 
 
 class TransmuteRevealWatcher:
     """Multi-channel WinRT OCR watcher that resolves what augment(s) rolled from a Transmute pick."""
 
     ACTIVE_REVEAL_WINDOW_S = 12.0
+    FAST_CHAT_FIRST_WINDOW_S = 1.2
     FADING_PICKER_GRACE_S = 1.8
     HOVER_POLL_INTERVAL_S = 0.55
 
@@ -139,6 +182,9 @@ class TransmuteRevealWatcher:
         self._passive_steady_since: float = 0.0
         self._passive_last_scan_mono: float = 0.0
         self._passive_last_thumb: np.ndarray | None = None
+        self._passive_tab_pending_id: str = ""
+        self._passive_tab_pending_mono: float = 0.0
+        self._last_trace_diagnostics: dict[str, Any] = {}
         self.update_catalog(augments)
 
     def update_catalog(self, augments: list[AugmentInfo]) -> None:
@@ -153,6 +199,13 @@ class TransmuteRevealWatcher:
         self._passive_steady_since = 0.0
         self._passive_last_scan_mono = 0.0
         self._passive_last_thumb = None
+        self._passive_tab_pending_id = ""
+        self._passive_tab_pending_mono = 0.0
+        self._last_trace_diagnostics = {}
+
+    def last_trace_diagnostics(self) -> dict[str, Any]:
+        """Return a shallow copy of the latest privacy-safe channel/cursor_zone trace diagnostics (never stores chat OCR text)."""
+        return dict(self._last_trace_diagnostics)
 
     def _allowed_candidates(
         self,
@@ -281,7 +334,8 @@ class TransmuteRevealWatcher:
                     needed = 1 if has_strong_cue else 2
                     if self._record_vote(m[0].augment_id, now_mono, needed=needed):
                         found_ids.add(m[0].augment_id)
-                        hits.append(ResolvedTransmuteHit(m[0], m[1], "chat", raw))
+                        # Privacy redline: never persist raw chat OCR text
+                        hits.append(ResolvedTransmuteHit(m[0], m[1], "chat", "", cursor_zone="other"))
 
             # 2) Strong chat notification sentence without brackets (e.g. "你获得了 死亡之环", "质变：混沌 获得 珠光护手 炼狱导管")
             if has_strong_cue:
@@ -301,7 +355,7 @@ class TransmuteRevealWatcher:
                         if len(c_norm) <= 2 and remaining_seg != c_norm:
                             continue
                         found_ids.add(aug.augment_id)
-                        hits.append(ResolvedTransmuteHit(aug, 0.98, "chat", raw))
+                        hits.append(ResolvedTransmuteHit(aug, 0.98, "chat", "", cursor_zone="other"))
                         remaining_seg = remaining_seg.replace(c_norm, "", 1)
                         if len(hits) >= pending.remaining_count:
                             return hits
@@ -315,7 +369,7 @@ class TransmuteRevealWatcher:
                     )
                     if m is not None and m[0].augment_id not in found_ids:
                         found_ids.add(m[0].augment_id)
-                        hits.append(ResolvedTransmuteHit(m[0], m[1], "chat", raw))
+                        hits.append(ResolvedTransmuteHit(m[0], m[1], "chat", "", cursor_zone="other"))
         return hits
 
     def _scan_reveal_or_tooltip_lines(
@@ -325,6 +379,7 @@ class TransmuteRevealWatcher:
         pending: PendingTransmute,
         channel: str,
         now_mono: float,
+        cursor_zone: str = "other",
     ) -> list[ResolvedTransmuteHit]:
         if not lines:
             return []
@@ -360,7 +415,7 @@ class TransmuteRevealWatcher:
 
             if self._record_vote(aug.augment_id, now_mono, needed=needed):
                 found_ids.add(aug.augment_id)
-                hits.append(ResolvedTransmuteHit(aug, conf, channel, line.text))
+                hits.append(ResolvedTransmuteHit(aug, conf, channel, line.text, cursor_zone=cursor_zone))
                 if len(hits) >= pending.remaining_count:
                     break
         return hits
@@ -371,6 +426,8 @@ class TransmuteRevealWatcher:
         crop_box: tuple[int, int, int, int],
         game_rect: WindowRect,
         exclude_rects: list[tuple[int, int, int, int]],
+        *,
+        dual_pass: bool = True,
     ) -> list[OcrLine]:
         x0, y0, x1, y1 = crop_box
         crop = frame_bgr[y0:y1, x0:x1]
@@ -379,7 +436,10 @@ class TransmuteRevealWatcher:
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         if float(np.std(gray)) < 10.0:
             return []
-        raw_lines = self.ocr.recognize_lines(crop, dual_pass=True)
+        try:
+            raw_lines = self.ocr.recognize_lines(crop, dual_pass=dual_pass)
+        except TypeError:
+            raw_lines = self.ocr.recognize_lines(crop)
         return filter_excluded_lines(raw_lines, game_rect.left + x0, game_rect.top + y0, exclude_rects)
 
     def process_frame(
@@ -404,8 +464,14 @@ class TransmuteRevealWatcher:
         excl = exclude_rects or []
         fh, fw = frame_bgr.shape[:2]
         elapsed = now_mono - pending.started_mono
+        cursor_zone, x_rel, y_rel = _classify_cursor_zone_with_rel(cursor_pos, game_rect, fw, fh)
         collected: list[ResolvedTransmuteHit] = []
         seen_ids: set[str] = set()
+        channels_scanned: list[str] = []
+        chat_lines_count = 0
+        reveal_lines_count = 0
+        hover_lines_count = 0
+        total_ocr_ms = 0.0
 
         def _merge(new_hits: list[ResolvedTransmuteHit]) -> None:
             for h in new_hits:
@@ -413,21 +479,67 @@ class TransmuteRevealWatcher:
                     seen_ids.add(h.augment.augment_id)
                     collected.append(h)
 
+        def _finalize(out_hits: list[ResolvedTransmuteHit]) -> list[ResolvedTransmuteHit]:
+            winning_channel = out_hits[0].channel if out_hits else ""
+            winning_zone = out_hits[0].cursor_zone if out_hits else cursor_zone
+            # Privacy redline: never store raw chat OCR text in trace diagnostics
+            self._last_trace_diagnostics = {
+                "mode": "active_transmute",
+                "source_augment_id": pending.source_augment_id,
+                "target_rarity": pending.target_rarity,
+                "elapsed_s": round(elapsed, 3),
+                "channels_scanned": list(channels_scanned),
+                "channel": winning_channel,
+                "cursor_zone": winning_zone,
+                "cursor_rel_x": x_rel,
+                "cursor_rel_y": y_rel,
+                "chat_lines_count": chat_lines_count,
+                "reveal_lines_count": reveal_lines_count,
+                "hover_lines_count": hover_lines_count,
+                "ocr_ms": round(total_ocr_ms, 3),
+                "matched_ids": [h.augment.augment_id for h in out_hits],
+                "matched_channels": [h.channel for h in out_hits],
+                "matched_confidences": [round(float(h.confidence), 4) for h in out_hits],
+            }
+            return out_hits
+
         # Channel 1 & 2: Active post-pick reveal window (first 12s after selecting a Transmute augment)
         if elapsed <= self.ACTIVE_REVEAL_WINDOW_S:
-            # 1) Bottom-left chat box (system grant announcement)
+            in_fast_chat_window = 0.0 <= elapsed <= self.FAST_CHAT_FIRST_WINDOW_S
+            # 1) Bottom-left chat box (system grant announcement) — fast ~36ms single-pass first during 0..1.2s
+            channels_scanned.append("chat")
             chat_box = (0, int(fh * 0.48), int(fw * 0.44), int(fh * 0.88))
-            chat_lines = self._scan_crop(frame_bgr, chat_box, game_rect, excl)
-            _merge(self._scan_chat_lines(chat_lines, candidates, matcher, pending, now_mono))
+            t0 = time.perf_counter()
+            chat_lines = self._scan_crop(
+                frame_bgr,
+                chat_box,
+                game_rect,
+                excl,
+                dual_pass=not in_fast_chat_window,
+            )
+            total_ocr_ms += (time.perf_counter() - t0) * 1000.0
+            chat_lines_count = len(chat_lines)
+            chat_hits = self._scan_chat_lines(chat_lines, candidates, matcher, pending, now_mono)
+            _merge(chat_hits)
             if len(collected) >= pending.remaining_count:
-                return collected[: pending.remaining_count]
+                return _finalize(collected[: pending.remaining_count])
 
             # 2) Center / upper-center reveal toast / single-or-double card popup
-            reveal_box = (int(fw * 0.16), int(fh * 0.12), int(fw * 0.84), int(fh * 0.72))
-            reveal_lines = self._scan_crop(frame_bgr, reveal_box, game_rect, excl)
-            _merge(self._scan_reveal_or_tooltip_lines(reveal_lines, matcher, pending, "reveal_banner", now_mono))
-            if len(collected) >= pending.remaining_count:
-                return collected[: pending.remaining_count]
+            # During first 0..1.2s, skip heavy reveal_banner OCR if fast chat already hit
+            if not (in_fast_chat_window and bool(chat_hits)):
+                channels_scanned.append("reveal_banner")
+                reveal_box = (int(fw * 0.16), int(fh * 0.12), int(fw * 0.84), int(fh * 0.72))
+                t0 = time.perf_counter()
+                reveal_lines = self._scan_crop(frame_bgr, reveal_box, game_rect, excl, dual_pass=True)
+                total_ocr_ms += (time.perf_counter() - t0) * 1000.0
+                reveal_lines_count = len(reveal_lines)
+                _merge(
+                    self._scan_reveal_or_tooltip_lines(
+                        reveal_lines, matcher, pending, "reveal_banner", now_mono, cursor_zone="other"
+                    )
+                )
+                if len(collected) >= pending.remaining_count:
+                    return _finalize(collected[: pending.remaining_count])
 
         # Channel 3: Live cursor hover-tooltip auto-capture (always available while transmute is pending!)
         if cursor_pos is not None:
@@ -473,10 +585,23 @@ class TransmuteRevealWatcher:
                     self._last_hover_thumb = thumb
                     self._last_hover_cursor = (cx_scr, cy_scr)
                     if changed and float(np.std(gray)) >= 10.0:
+                        channels_scanned.append("hover_tooltip")
+                        t0 = time.perf_counter()
                         hover_lines = self._scan_crop(frame_bgr, (hx0, hy0, hx1, hy1), game_rect, excl)
-                        _merge(self._scan_reveal_or_tooltip_lines(hover_lines, matcher, pending, "hover_tooltip", now_mono))
+                        total_ocr_ms += (time.perf_counter() - t0) * 1000.0
+                        hover_lines_count = len(hover_lines)
+                        _merge(
+                            self._scan_reveal_or_tooltip_lines(
+                                hover_lines,
+                                matcher,
+                                pending,
+                                "hover_tooltip",
+                                now_mono,
+                                cursor_zone=cursor_zone,
+                            )
+                        )
 
-        return collected[: pending.remaining_count]
+        return _finalize(collected[: pending.remaining_count])
 
     def scan_passive_hud_hover(
         self,
@@ -486,12 +611,16 @@ class TransmuteRevealWatcher:
         exclude_rects: list[tuple[int, int, int, int]] | None = None,
         cursor_pos: tuple[int, int] | None = None,
         now_mono: float = 0.0,
+        *,
+        require_rarity_match: bool = True,
     ) -> ResolvedTransmuteHit | None:
         """Low-cost passive HUD/Tab hover sync that auto-fills any missing owned augment without manual clicking.
 
         Runs OCR ONLY when the cursor pauses on the bottom HUD or Tab scoreboard tooltip zone,
         and strictly requires BOTH a valid augment title AND an explicit augment rarity/type cue
         (白银/黄金/棱彩/强化符文) so champion skills and shop items never false-trigger.
+        Single-frame auto-commit is restricted to `bottom_hud`; `tab_zone` requires either
+        2 consecutive identical frames or explicit `强化符文` header text.
         """
         if cursor_pos is None or frame_bgr is None or frame_bgr.size == 0 or not self._all_augments:
             return None
@@ -508,14 +637,40 @@ class TransmuteRevealWatcher:
         fh, fw = frame_bgr.shape[:2]
         rx = cx_scr - game_rect.left
         ry = cy_scr - game_rect.top
-        x_rel = rx / max(1, fw)
-        y_rel = ry / max(1, fh)
+        cursor_zone, x_rel, y_rel = _classify_cursor_zone_with_rel(cursor_pos, game_rect, fw, fh)
 
-        in_bottom_hud = (0.14 <= x_rel <= 0.86) and (y_rel >= 0.72)
-        in_tab_zone = (0.12 <= x_rel <= 0.88) and (0.16 <= y_rel < 0.72)
+        def _record_passive_trace(
+            *,
+            ocr_ran: bool,
+            ocr_ms: float = 0.0,
+            lines_count: int = 0,
+            inferred_rarity: str | None = None,
+            hit: ResolvedTransmuteHit | None = None,
+            rejected_reason: str = "",
+        ) -> None:
+            self._last_trace_diagnostics = {
+                "mode": "passive_hud_hover",
+                "channel": "hud_hover_sync",
+                "cursor_zone": cursor_zone,
+                "cursor_rel_x": x_rel,
+                "cursor_rel_y": y_rel,
+                "ocr_ran": ocr_ran,
+                "ocr_ms": round(ocr_ms, 3),
+                "lines_count": lines_count,
+                "inferred_rarity": inferred_rarity,
+                "matched_ids": [hit.augment.augment_id] if hit is not None else [],
+                "matched_channels": [hit.channel] if hit is not None else [],
+                "matched_confidences": [round(float(hit.confidence), 4)] if hit is not None else [],
+                "rejected_reason": rejected_reason,
+            }
+
+        in_bottom_hud = cursor_zone == "bottom_hud"
+        in_tab_zone = cursor_zone == "tab_zone"
         if not (in_bottom_hud or in_tab_zone):
             self._passive_last_cursor = cursor_pos
             self._passive_steady_since = now_mono
+            self._passive_tab_pending_id = ""
+            _record_passive_trace(ocr_ran=False, rejected_reason="outside_zone")
             return None
 
         # Track cursor steadiness so fast mouse kiting in combat NEVER invokes OCR (~0% CPU in fights)
@@ -526,12 +681,16 @@ class TransmuteRevealWatcher:
         ):
             self._passive_last_cursor = cursor_pos
             self._passive_steady_since = now_mono
+            self._passive_tab_pending_id = ""
+            _record_passive_trace(ocr_ran=False, rejected_reason="cursor_moving")
             return None
 
         min_dwell = 0.18 if in_bottom_hud else 0.32
         if (now_mono - self._passive_steady_since) < min_dwell:
+            _record_passive_trace(ocr_ran=False, rejected_reason="dwell_wait")
             return None
         if (now_mono - self._passive_last_scan_mono) < 0.70:
+            _record_passive_trace(ocr_ran=False, rejected_reason="scan_cooldown")
             return None
 
         half_w = max(240, int(fw * 0.16))
@@ -543,37 +702,71 @@ class TransmuteRevealWatcher:
         hy1 = min(fh, ry + below_h)
         hover_crop = frame_bgr[hy0:hy1, hx0:hx1]
         if hover_crop.size == 0 or hover_crop.shape[0] < 40 or hover_crop.shape[1] < 80:
+            _record_passive_trace(ocr_ran=False, rejected_reason="crop_too_small")
             return None
 
         gray = cv2.cvtColor(hover_crop, cv2.COLOR_BGR2GRAY)
         if float(np.std(gray)) < 10.0:
+            _record_passive_trace(ocr_ran=False, rejected_reason="flat_crop")
             return None
         thumb = cv2.resize(gray, (96, 64), interpolation=cv2.INTER_AREA)
+        awaiting_tab_confirm = bool(
+            in_tab_zone
+            and self._passive_tab_pending_id
+            and (now_mono - self._passive_tab_pending_mono) <= 4.0
+        )
         if (
-            self._passive_last_thumb is not None
+            not awaiting_tab_confirm
+            and self._passive_last_thumb is not None
             and self._passive_last_thumb.shape == thumb.shape
             and float(np.mean(np.abs(thumb.astype(np.int16) - self._passive_last_thumb.astype(np.int16)))) < 0.8
         ):
+            _record_passive_trace(ocr_ran=False, rejected_reason="unchanged_crop")
             return None
         self._passive_last_thumb = thumb
         self._passive_last_scan_mono = now_mono
 
+        t0 = time.perf_counter()
         lines = self._scan_crop(frame_bgr, (hx0, hy0, hx1, hy1), game_rect, excl)
+        ocr_ms = (time.perf_counter() - t0) * 1000.0
         if not lines:
+            self._passive_tab_pending_id = ""
+            _record_passive_trace(ocr_ran=True, ocr_ms=ocr_ms, lines_count=0, rejected_reason="no_ocr_lines")
             return None
         joined_all = "".join(_compact_ws(l.text) for l in lines)
         if any(bad in joined_all for bad in _NON_AUGMENT_TOOLTIP_CUES):
+            self._passive_tab_pending_id = ""
+            _record_passive_trace(
+                ocr_ran=True, ocr_ms=ocr_ms, lines_count=len(lines), rejected_reason="non_augment_tooltip"
+            )
             return None
 
         inferred_rarity = self._infer_rarity_hint(lines)
         if inferred_rarity is None and "强化符文" not in joined_all:
+            self._passive_tab_pending_id = ""
+            _record_passive_trace(
+                ocr_ran=True,
+                ocr_ms=ocr_ms,
+                lines_count=len(lines),
+                inferred_rarity=None,
+                rejected_reason="no_rarity_cue",
+            )
             return None
 
         blocked = set(NON_TARGET_AUGMENT_IDS) | set(already_owned_ids)
         candidates = [a for a in self._all_augments if a.augment_id not in blocked]
         if not candidates:
+            self._passive_tab_pending_id = ""
+            _record_passive_trace(
+                ocr_ran=True,
+                ocr_ms=ocr_ms,
+                lines_count=len(lines),
+                inferred_rarity=inferred_rarity,
+                rejected_reason="no_candidates",
+            )
             return None
         matcher = AugmentMatcher(candidates)
+        saw_rarity_mismatch = False
         for line in lines:
             has_desc = self._has_supporting_desc_below(line, lines)
             if not has_desc:
@@ -584,6 +777,57 @@ class TransmuteRevealWatcher:
                 rarity_hint=inferred_rarity,
                 has_strong_context=True,
             )
-            if m is not None:
-                return ResolvedTransmuteHit(m[0], m[1], "hud_hover_sync", line.text)
+            if m is None:
+                continue
+            aug, conf = m
+            # Rarity consistency guard: reject when tooltip explicitly names a different rarity tier
+            if require_rarity_match and inferred_rarity is not None and aug.rarity and aug.rarity != inferred_rarity:
+                saw_rarity_mismatch = True
+                continue
+            # Single-frame auto-commit restricted to bottom_hud; tab_zone needs header "强化符文" or 2 consecutive frames
+            if in_tab_zone:
+                has_header_cue = any(
+                    "强化符文" in _compact_ws(ol.text) and (ol.y <= line.y + 90.0)
+                    for ol in lines
+                )
+                if not has_header_cue:
+                    if (
+                        self._passive_tab_pending_id == aug.augment_id
+                        and (now_mono - self._passive_tab_pending_mono) <= 4.0
+                    ):
+                        self._passive_tab_pending_id = ""
+                    else:
+                        self._passive_tab_pending_id = aug.augment_id
+                        self._passive_tab_pending_mono = now_mono
+                        _record_passive_trace(
+                            ocr_ran=True,
+                            ocr_ms=ocr_ms,
+                            lines_count=len(lines),
+                            inferred_rarity=inferred_rarity,
+                            rejected_reason="tab_zone_await_confirm",
+                        )
+                        return None
+                else:
+                    self._passive_tab_pending_id = ""
+            else:
+                self._passive_tab_pending_id = ""
+
+            hit = ResolvedTransmuteHit(aug, conf, "hud_hover_sync", line.text, cursor_zone=cursor_zone)
+            _record_passive_trace(
+                ocr_ran=True,
+                ocr_ms=ocr_ms,
+                lines_count=len(lines),
+                inferred_rarity=inferred_rarity,
+                hit=hit,
+            )
+            return hit
+
+        self._passive_tab_pending_id = ""
+        _record_passive_trace(
+            ocr_ran=True,
+            ocr_ms=ocr_ms,
+            lines_count=len(lines),
+            inferred_rarity=inferred_rarity,
+            rejected_reason="rarity_mismatch" if saw_rarity_mismatch else "no_match",
+        )
         return None

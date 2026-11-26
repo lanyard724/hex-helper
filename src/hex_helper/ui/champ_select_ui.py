@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import threading
+from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QRectF, Qt
+from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QVBoxLayout,
     QWidget,
 )
@@ -24,6 +26,7 @@ from hex_helper.data.store import DataStore
 from hex_helper.game.models import ChampSelectState
 from hex_helper.scoring.team_comp import (
     BestFiveComp,
+    TeamCompAnalysis,
     analyze_champ_select_pool,
     classify_hero_role,
 )
@@ -158,6 +161,10 @@ def summarize_team_composition(team_hero_ids: tuple[str, ...] | list[str], store
 class ChampSelectOverlay(QWidget):
     """Draggable, resizable, non-activating LoL Hextech panel docked beside LeagueClient during Champ Select."""
 
+    closed_by_user = Signal()
+    geometry_changed = Signal(dict)
+    subcard_action = Signal(str, str, dict)
+
     DEFAULT_W = 366
     MIN_W = 310
     MAX_W = 580
@@ -172,12 +179,19 @@ class ChampSelectOverlay(QWidget):
         on_core_action: Callable[[str], None] | None = None,
         on_goal_mode_changed: Callable[[str], None] | None = None,
         initial_goal_mode: str = "climb",
+        on_closed_by_user: Callable[[], None] | None = None,
+        on_geometry_changed: Callable[[dict[str, Any]], None] | None = None,
+        on_subcard_action: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__()
         self._on_pos_changed = on_pos_changed
         self._on_size_changed = on_size_changed
         self._on_core_action = on_core_action
         self._on_goal_mode_changed = on_goal_mode_changed
+        self._on_closed_by_user = on_closed_by_user
+        self._on_geometry_changed = on_geometry_changed
+        self._on_subcard_action = on_subcard_action
+        self._gesture_start_norm_rect: list[float] | None = None
         self._goal_mode: str = "fun" if str(initial_goal_mode or "climb").strip().lower() == "fun" else "climb"
         self._applied_goal_mode_style: str = ""
         self._best_five_expanded: bool = False
@@ -186,11 +200,14 @@ class ChampSelectOverlay(QWidget):
         self._last_rows_content_h: int = 64
         self._ai_bar_action: str = ""
         self._drag_offset: QPoint | None = None
+        self._drag_press_global: QPoint | None = None
+        self._did_drag: bool = False
         self._icon_cache: dict[tuple[str, str], QPixmap] = {}
         self._fetching: set[str] = set()
         self._icon_invoker = UiBridgeInvoker()
         self._last_state: ChampSelectState | None = None
         self._last_store: DataStore | None = None
+        self._last_analysis: TeamCompAnalysis | None = None
         self._fade_anim: QPropertyAnimation | None = None
         self._custom_w: int | None = None
         self._custom_h: int | None = None
@@ -238,7 +255,9 @@ class ChampSelectOverlay(QWidget):
         close_btn = QPushButton("×")
         close_btn.setObjectName("WinCtrlBtn")
         close_btn.setFixedSize(22, 20)
-        close_btn.clicked.connect(self.hide)
+        close_btn.setToolTip("关闭本轮选人浮窗")
+        close_btn.clicked.connect(self._close_by_user)
+        self.close_btn = close_btn
         header.addWidget(self.icon_lbl)
         header.addWidget(self.title_lbl)
         header.addStretch(1)
@@ -402,8 +421,12 @@ class ChampSelectOverlay(QWidget):
         self.layout_main.addWidget(self.ai_readiness_bar)
 
         # Frameless edge/corner resize grips & controller
-        self._grip_bl = HextechCornerGrip(self.root, corner="bl")
-        self._grip_br = HextechCornerGrip(self.root, corner="br")
+        self._grip_bl = HextechCornerGrip(
+            self.root, corner="bl", on_double_click=self.reset_default_size
+        )
+        self._grip_br = HextechCornerGrip(
+            self.root, corner="br", on_double_click=self.reset_default_size
+        )
         self._resizer = FramelessResizeController(
             self,
             min_w=self.MIN_W,
@@ -454,7 +477,98 @@ class ChampSelectOverlay(QWidget):
         super().resizeEvent(event)
         self._layout_corner_grips()
 
+    def get_tracked_scrollbars(self) -> dict[str, QScrollBar]:
+        """Return key internal vertical scrollbars for optional DevLab overflow observation."""
+        return {"champ_select.rows": self.rows_scroll.verticalScrollBar()}
+
+    def _close_by_user(self) -> None:
+        self.closed_by_user.emit()
+        if self._on_closed_by_user is not None:
+            self._on_closed_by_user()
+        self.hide()
+
+    def _emit_subcard_action(
+        self,
+        card: str,
+        action: str,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        payload = dict(meta) if isinstance(meta, dict) else {}
+        self.subcard_action.emit(card, action, payload)
+        if self._on_subcard_action is not None:
+            self._on_subcard_action(card, action, payload)
+
+    def _capture_norm_rect(self) -> tuple[list[float], QRect, int, int, float]:
+        screens = list(QGuiApplication.screens())
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            dpr = max(1.0, float(screen.devicePixelRatio() or 1.0))
+            try:
+                screen_idx = screens.index(screen)
+            except ValueError:
+                screen_idx = 0
+        else:
+            geo = QRect(0, 0, 1920, 1080)
+            dpr = 1.0
+            screen_idx = 0
+        sw = max(1, geo.width())
+        sh = max(1, geo.height())
+        norm = [
+            round((self.x() - geo.x()) / sw, 4),
+            round((self.y() - geo.y()) / sh, 4),
+            round(self.width() / sw, 4),
+            round(self.height() / sh, 4),
+        ]
+        return norm, geo, screen_idx, max(1, len(screens)), dpr
+
+    def _compute_snapped_edge(self, geo: QRect) -> str:
+        tol = max(72, int(geo.width() * 0.05))
+        dist_l = abs(self.x() - geo.left())
+        dist_r = abs((geo.right() + 1) - (self.x() + self.width()))
+        if dist_r <= tol and dist_r <= dist_l:
+            return "right"
+        if dist_l <= tol:
+            return "left"
+        dist_t = abs(self.y() - geo.top())
+        dist_b = abs((geo.bottom() + 1) - (self.y() + self.height()))
+        if dist_t <= 36 and dist_t <= dist_b:
+            return "top"
+        if dist_b <= 36:
+            return "bottom"
+        return "detached"
+
+    def _emit_geometry_changed(self, action: str) -> None:
+        norm, geo, screen_idx, screen_cnt, dpr = self._capture_norm_rect()
+        prev_norm = self._gesture_start_norm_rect
+        self._gesture_start_norm_rect = None
+        saved_size = [int(self._custom_w), int(self._custom_h)] if (self._custom_w is not None and self._custom_h is not None) else None
+        payload: dict[str, Any] = {
+            "overlay": "champ_select",
+            "action": action,
+            "x": int(self.x()),
+            "y": int(self.y()),
+            "width": int(self.width()),
+            "height": int(self.height()),
+            "pos": [int(self.x()), int(self.y())],
+            "size": saved_size,
+            "scale": None,
+            "expanded": True,
+            "snapped_edge": self._compute_snapped_edge(geo),
+            "screen_rect": [int(geo.x()), int(geo.y()), int(geo.width()), int(geo.height())],
+            "screen_index": int(screen_idx),
+            "screen_count": int(screen_cnt),
+            "dpr": round(float(dpr), 3),
+            "norm_rect": norm,
+            "prev_norm_rect": prev_norm,
+        }
+        self.geometry_changed.emit(payload)
+        if self._on_geometry_changed is not None:
+            self._on_geometry_changed(payload)
+
     def _on_live_resize(self, target: QRect, _edge: str) -> None:
+        if self._gesture_start_norm_rect is None:
+            self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         w = max(self.MIN_W, min(self.MAX_W, target.width()))
         h = max(self.MIN_H, target.height())
         self._custom_w = w
@@ -471,7 +585,7 @@ class ChampSelectOverlay(QWidget):
         if new_bucket != self._last_density_bucket:
             self._last_density_bucket = new_bucket
             if self._last_state is not None and self._last_store is not None:
-                self.update_state(self._last_state, self._last_store)
+                self.update_state(self._last_state, self._last_store, team_comp_analysis=self._last_analysis)
                 self.setGeometry(target.x(), target.y(), w, h)
                 self._layout_corner_grips()
 
@@ -482,21 +596,23 @@ class ChampSelectOverlay(QWidget):
         if new_bucket != self._last_density_bucket:
             self._last_density_bucket = new_bucket
             if self._last_state is not None and self._last_store is not None:
-                self.update_state(self._last_state, self._last_store)
+                self.update_state(self._last_state, self._last_store, team_comp_analysis=self._last_analysis)
         self._layout_corner_grips()
         if self._on_size_changed:
             self._on_size_changed([self._custom_w, self._custom_h])
         if self._on_pos_changed:
             self._on_pos_changed([self.x(), self.y()])
+        self._emit_geometry_changed("resize")
 
     def reset_default_size(self) -> None:
+        self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         self._custom_w = None
         self._custom_h = None
         self._last_density_bucket = self._width_bucket(self.DEFAULT_W)
         self._apply_header_density(self.DEFAULT_W)
         self.setFixedWidth(self.DEFAULT_W)
         if self._last_state is not None and self._last_store is not None:
-            self.update_state(self._last_state, self._last_store)
+            self.update_state(self._last_state, self._last_store, team_comp_analysis=self._last_analysis)
         else:
             self.rows_scroll.setMinimumHeight(64)
             self.rows_scroll.setMaximumHeight(self._QWIDGETSIZE_MAX)
@@ -504,6 +620,7 @@ class ChampSelectOverlay(QWidget):
         self._layout_corner_grips()
         if self._on_size_changed:
             self._on_size_changed(None)
+        self._emit_geometry_changed("reset_size")
 
     def _get_portrait(self, hid: str, store: DataStore, border_hex: str) -> QPixmap | None:
         key = (hid, border_hex)
@@ -627,8 +744,11 @@ class ChampSelectOverlay(QWidget):
         self._sync_goal_mode_buttons()
         if not changed:
             return
-        if emit_callback and self._on_goal_mode_changed is not None:
-            self._on_goal_mode_changed(norm)
+        self._last_analysis = None
+        if emit_callback:
+            self._emit_subcard_action("goal_mode", norm, {"goal_mode": norm})
+            if self._on_goal_mode_changed is not None:
+                self._on_goal_mode_changed(norm)
         if self._last_state is not None and self._last_store is not None:
             self.update_state(self._last_state, self._last_store)
 
@@ -640,7 +760,13 @@ class ChampSelectOverlay(QWidget):
         self._sync_window_height(self._last_rows_content_h)
 
     def _toggle_best_five(self) -> None:
-        self.set_best_five_expanded(not self._best_five_expanded)
+        next_exp = not self._best_five_expanded
+        self.set_best_five_expanded(next_exp)
+        self._emit_subcard_action(
+            "best_five",
+            "expand" if next_exp else "collapse",
+            {"expanded": next_exp},
+        )
 
     def _render_best_five(
         self,
@@ -781,9 +907,14 @@ class ChampSelectOverlay(QWidget):
 
     def _refresh_last_state(self) -> None:
         if self._last_state is not None and self._last_store is not None and self.isVisible():
-            self.update_state(self._last_state, self._last_store)
+            self.update_state(self._last_state, self._last_store, team_comp_analysis=self._last_analysis)
 
-    def update_state(self, state: ChampSelectState, store: DataStore) -> None:
+    def update_state(
+        self,
+        state: ChampSelectState,
+        store: DataStore,
+        team_comp_analysis: TeamCompAnalysis | None = None,
+    ) -> None:
         self._last_state = state
         self._last_store = store
 
@@ -802,13 +933,17 @@ class ChampSelectOverlay(QWidget):
 
         ally_ids = list(dict.fromkeys(([state.my_hero_id] if state.my_hero_id else []) + list(state.team_hero_ids)))
         ally_set = set(ally_ids)
-        analysis = analyze_champ_select_pool(
-            state.my_hero_id,
-            state.team_hero_ids,
-            state.bench_hero_ids,
-            store,
-            goal_mode=self._goal_mode,
-        )
+        if team_comp_analysis is not None and team_comp_analysis.goal_mode == self._goal_mode:
+            analysis = team_comp_analysis
+        else:
+            analysis = analyze_champ_select_pool(
+                state.my_hero_id,
+                state.team_hero_ids,
+                state.bench_hero_ids,
+                store,
+                goal_mode=self._goal_mode,
+            )
+        self._last_analysis = analysis
         needed_roles = analysis.needed_roles
         best_swap_id = analysis.best_swap.hero_id if analysis.best_swap is not None else ""
 
@@ -1160,7 +1295,11 @@ class ChampSelectOverlay(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._gesture_start_norm_rect = self._capture_norm_rect()[0]
+            gpos = event.globalPosition().toPoint()
+            self._drag_press_global = gpos
+            self._drag_offset = gpos - self.frameGeometry().topLeft()
+            self._did_drag = False
             event.accept()
             return
         if event.button() == Qt.MouseButton.RightButton:
@@ -1168,7 +1307,7 @@ class ChampSelectOverlay(QWidget):
             a_reset_size = QAction("恢复默认尺寸", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_hide = QAction("隐藏选人悬浮窗", menu)
-            a_hide.triggered.connect(self.hide)
+            a_hide.triggered.connect(self._close_by_user)
             menu.addAction(a_reset_size)
             menu.addSeparator()
             menu.addAction(a_hide)
@@ -1177,18 +1316,49 @@ class ChampSelectOverlay(QWidget):
             return
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= 38:
+            self._drag_offset = None
+            self._drag_press_global = None
+            self._did_drag = False
+            self._gesture_start_norm_rect = None
+            self.reset_default_size()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_offset is not None:
-            pos = event.globalPosition().toPoint() - self._drag_offset
-            scr = QGuiApplication.screenAt(event.globalPosition().toPoint()) or QGuiApplication.primaryScreen()
+            gpos = event.globalPosition().toPoint()
+            if not self._did_drag:
+                if self._drag_press_global is None or (gpos - self._drag_press_global).manhattanLength() < 4:
+                    event.accept()
+                    return
+                self._did_drag = True
+            pos = gpos - self._drag_offset
+            scr = QGuiApplication.screenAt(gpos) or QGuiApplication.primaryScreen()
             if scr is not None:
                 geo = scr.availableGeometry()
                 cx, cy = clamp_to_screen_rect(pos.x(), pos.y(), self.width(), self.height(), geo, margin=4)
                 pos = QPoint(cx, cy)
             self.move(pos)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_offset is not None:
+            did_drag = self._did_drag
             self._drag_offset = None
+            self._drag_press_global = None
+            self._did_drag = False
+            if not did_drag:
+                self._gesture_start_norm_rect = None
+                event.accept()
+                return
             if self._on_pos_changed:
                 self._on_pos_changed([self.x(), self.y()])
+            self._emit_geometry_changed("drag")
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)

@@ -369,8 +369,8 @@ def test_smart_picker_gate_skip_vs_close_delta_and_reroll_debounce(
         assert res_tx is not None
         assert submit_spy.call_count == 3
 
-        # D. 1.8s reroll debounce timer restarts cleanly on rapid dice clicks
-        assert ctrl._picker_coach_debounce_timer.interval() == 1800
+        # D. 0.6s picker debounce timer restarts cleanly on rapid dice clicks
+        assert ctrl._picker_coach_debounce_timer.interval() == 600
         ctrl.sm.active_cards = close_cards
         ctrl._schedule_picker_coach_trigger()
         assert ctrl._picker_coach_debounce_timer.isActive() is True

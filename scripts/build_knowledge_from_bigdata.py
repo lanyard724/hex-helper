@@ -736,7 +736,7 @@ def run_build(dataset_dir: Path, static_dir: Path, assets_dir: Path) -> dict[str
 
 
 def main() -> None:
-    local_app = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    local_app = Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Administrator\AppData\Local"))
     default_dataset = local_app / "HexHelper" / "cache" / "datasets" / "16.23" / "normal"
     default_static = local_app / "HexHelper" / "cache" / "static"
     default_assets = Path(__file__).resolve().parents[1] / "src" / "hex_helper" / "assets"

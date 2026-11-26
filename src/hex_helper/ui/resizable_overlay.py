@@ -45,7 +45,8 @@ def compute_auto_overlay_scale(
 ) -> float:
     """Compute automatic initial overlay scale for the active display.
 
-    - 1080p @ 100% (1920x1080), 2K @ 100% (2560x1440), and 4K @ 200% (1920x1080, dpr=2.0) stay at 1.0x.
+    - 1080p @ 100% (1920x1080) and 4K @ 200% (1920x1080, dpr=2.0) stay at 1.0x.
+    - 2K QHD @ 100% (2560x1440, dpr=1.0) auto-scales to ~1.24x (~456px drawer width).
     - 4K UHD @ 100% (3840x2160, dpr=1.0) scales to ~1.72x so fonts/icons are immediately legible.
     - 4K UHD @ 125% (3072x1728, dpr=1.25) scales to ~1.43x.
     - 4K UHD @ 150% (2560x1440, dpr=1.5) scales to ~1.24x.
@@ -57,7 +58,7 @@ def compute_auto_overlay_scale(
     phys_w = lw * eff_dpr
     raw_ratio = min(lw / 1920.0, lh / 1080.0)
 
-    if lw >= 2600 or lh >= 1500 or (phys_w >= 3200.0 and eff_dpr < 1.85 and raw_ratio > 1.05):
+    if lw >= 2400 or lh >= 1350 or (phys_w >= 3200.0 and eff_dpr < 1.85 and raw_ratio > 1.05):
         scale = 1.0 + max(0.0, raw_ratio - 1.0) * 0.72
         return round(max(1.0, min(2.0, scale)), 2)
     return 1.0

@@ -16,6 +16,11 @@ from hex_helper.data.augment_combos import (
 from hex_helper.data.provider import AugmentInfo
 from hex_helper.data.special_builds import get_special_augment_db
 from hex_helper.data.store import DataStore
+from hex_helper.scoring.build_synergy import normalize_item_id
+from hex_helper.scoring.matchup_optimizer import (
+    ENCHANTER_SUPPORT_ITEM_IDS,
+    infer_unified_hero_profile,
+)
 
 AXIS_LABELS: dict[str, str] = {
     "AP_SPELL": "法术技能",
@@ -30,10 +35,16 @@ AXIS_LABELS: dict[str, str] = {
     "ULT_CYCLE": "大招循环",
     "MOBILITY_DASH": "位移机动",
     "GAMBLE_HIGHROLL": "高上限赌狗",
+    "UTILITY_SUSTAIN": "通用续航",
 }
 
 _HYBRID_BRIDGE_AUGMENT_IDS: frozenset[str] = frozenset({"1054", "1029", "1129", "1205", "1206"})
-_META_NON_COMBAT_AXES: frozenset[str] = frozenset({"GAMBLE_HIGHROLL", "MOBILITY_DASH"})
+_META_NON_COMBAT_AXES: frozenset[str] = frozenset({"GAMBLE_HIGHROLL", "MOBILITY_DASH", "UTILITY_SUSTAIN"})
+INSTANT_PRISMATIC_TRANSMUTE_IDS: frozenset[str] = frozenset({"1238"})
+LATE_STACKER_AUGMENT_DISCOUNTS: dict[str, float] = {
+    "1353": -4.2,  # 坦克引擎：第4轮/12分钟后叠层收益大幅折价
+    "1152": -4.6,  # 钢化你心：第4轮/12分钟后心之钢叠层周期不足
+}
 
 _RARITY_PRIORITY: dict[str, float] = {
     "prismatic": 1.2,
@@ -224,8 +235,6 @@ def infer_match_build_profile(
             _bump_axis(ax, 2.4)
             if ax in ("AP_SPELL", "BURN_DOT"):
                 profile_scores["AP"] += 2.2
-            elif ax == "HASTE_LOOP":
-                profile_scores["AP"] += 1.4
             elif ax in ("AD_ATTACK", "AUTO_ONHIT", "CRIT_ATTACK"):
                 profile_scores["AD"] += 2.1
             elif ax == "CRIT_SPELL":
@@ -253,11 +262,12 @@ def infer_match_build_profile(
                 if len(evidence) < 3 and nm not in " ".join(evidence):
                     evidence.append(f"已选【{nm}】触发「{rule.name}」")
 
-    # 2. Live inventory signal (detects AP Miss Fortune / AP Kai'Sa / Tank pivots immediately)
+    # 2. Live inventory signal (detects AP Miss Fortune / AP Kai'Sa / Enchanter Taric / Tank pivots immediately)
     if store is not None:
         ap_item_w = 0.0
         ad_item_w = 0.0
         tank_item_w = 0.0
+        support_item_w = 0.0
         for raw_iid in my_items:
             iid = str(raw_iid).strip()
             if not iid:
@@ -265,13 +275,14 @@ def infer_match_build_profile(
             info = store.get_item_info(iid)
             if not info.name or info.category == "consumable":
                 continue
+            nid = normalize_item_id(iid)
             stats = info.stats or {}
             tags = set(info.tags or ())
             if info.category == "boots":
-                if iid.endswith("3020"):
+                if nid == "3020":
                     ap_item_w += 0.6
                     _bump_axis("AP_SPELL", 0.6)
-                elif iid.endswith("3006"):
+                elif nid == "3006":
                     ad_item_w += 0.6
                     _bump_axis("AUTO_ONHIT", 0.6)
                 continue
@@ -284,41 +295,61 @@ def infer_match_build_profile(
             mr_v = float(stats.get("FlatSpellBlockMod", 0.0) or 0.0)
             hp_v = float(stats.get("FlatHPPoolMod", 0.0) or 0.0)
 
+            is_enchanter = (nid in ENCHANTER_SUPPORT_ITEM_IDS) or (
+                ("ManaRegen" in tags or "Heal" in tags) and ap_v <= 75 and ad_v <= 0
+            )
+            if is_enchanter:
+                support_item_w += w
+                _bump_axis("SHIELD_HEAL", w * 1.1)
+                profile_scores["SUPPORT"] += w * 1.25
+                if ap_v > 0:
+                    profile_scores["AP"] += w * 0.25
+                continue
+
             if ap_v > 0:
                 ap_item_w += w
                 _bump_axis("AP_SPELL", w)
                 profile_scores["AP"] += w * 1.15
-            if ad_v > 0:
+            if ad_v > 0 or ("Damage" in tags and ap_v <= 0):
                 ad_item_w += w
                 _bump_axis("AD_ATTACK", w)
                 profile_scores["AD"] += w * 1.15
-            if as_v > 0:
+            if as_v > 0 and ap_v <= 0:
                 _bump_axis("AUTO_ONHIT", w * 0.9)
                 profile_scores["AD"] += w * 0.45
-            if crit_v > 0:
+            if crit_v > 0 and ap_v <= 0:
                 _bump_axis("CRIT_ATTACK", w * 0.9)
                 profile_scores["AD"] += w * 0.45
-            if (armor_v > 0 or mr_v > 0 or hp_v >= 350) and ap_v <= 0 and ad_v <= 0:
+            if (armor_v > 0 or mr_v > 0 or hp_v >= 350) and ap_v <= 0 and ad_v <= 0 and "Damage" not in tags:
                 tank_item_w += w
                 _bump_axis("TANK_HP", w)
                 profile_scores["TANK"] += w * 1.1
-            if ("ManaRegen" in tags or "Heal" in tags) and ap_v <= 75 and ad_v <= 0:
-                _bump_axis("SHIELD_HEAL", w * 0.85)
-                profile_scores["SUPPORT"] += w * 0.85
 
-        if ap_item_w >= 1.8 and ap_item_w >= ad_item_w + 1.2:
+        if support_item_w >= 1.8 and support_item_w >= max(ap_item_w, ad_item_w, tank_item_w):
+            evidence.append("当前已出软辅盾奶装")
+        elif ap_item_w >= 1.8 and ap_item_w >= ad_item_w + 1.2:
             evidence.append("当前已出 AP 装备")
         elif ad_item_w >= 1.8 and ad_item_w >= ap_item_w + 1.2:
             evidence.append("当前已出物理装备")
         elif tank_item_w >= 1.8:
             evidence.append("当前已出坦克防御装")
 
-    # 3. Determine primary_profile & favored/penalized axes
+    # 3. Determine primary_profile via unified hero profile (preserving CRIT_SPELL combo specialization)
     ranked_profiles = sorted(profile_scores.items(), key=lambda kv: kv[1], reverse=True)
     top_prof, top_score = ranked_profiles[0]
     second_prof, second_score = ranked_profiles[1]
 
-    if top_score < 1.6:
+    has_live_commitment = bool(owned_ids) or bool(my_items)
+    if top_prof == "CRIT_SPELL" and top_score >= 2.6 and top_score >= second_score:
+        primary_profile = "CRIT_SPELL"
+    elif store is not None and (hid or owned_ids or my_items):
+        primary_profile = infer_unified_hero_profile(
+            hid,
+            store,
+            my_items=my_items,
+            selected_augments=owned_ids,
+        )
+    elif top_score < 1.6:
         primary_profile = "BALANCED"
     elif has_hybrid_bridge and top_prof in ("AP", "AD") and second_prof in ("AP", "AD") and second_score >= 1.5:
         primary_profile = "HYBRID"
@@ -338,23 +369,24 @@ def infer_match_build_profile(
                 return
             penalized.append(ax)
 
-    if primary_profile == "AP" and not has_hybrid_bridge:
-        for ax in ("AD_ATTACK", "AUTO_ONHIT", "CRIT_ATTACK"):
-            _penalize(ax)
-    elif primary_profile == "AD" and not has_hybrid_bridge:
-        for ax in ("AP_SPELL", "SHIELD_HEAL"):
-            _penalize(ax)
-    elif primary_profile == "CRIT_SPELL":
-        for ax in ("TANK_HP", "SHIELD_HEAL"):
-            _penalize(ax)
-    elif primary_profile == "TANK":
-        for ax in ("CRIT_ATTACK", "AUTO_ONHIT"):
-            _penalize(ax)
-        if axis_scores.get("AP_SPELL", 0.0) < 1.2:
-            _penalize("AP_SPELL")
-    elif primary_profile == "SUPPORT":
-        for ax in ("AD_ATTACK", "AUTO_ONHIT", "CRIT_ATTACK"):
-            _penalize(ax)
+    if has_live_commitment:
+        if primary_profile == "AP" and not has_hybrid_bridge:
+            for ax in ("AD_ATTACK", "AUTO_ONHIT", "CRIT_ATTACK"):
+                _penalize(ax)
+        elif primary_profile == "AD" and not has_hybrid_bridge:
+            for ax in ("AP_SPELL", "SHIELD_HEAL"):
+                _penalize(ax)
+        elif primary_profile == "CRIT_SPELL":
+            for ax in ("TANK_HP", "SHIELD_HEAL"):
+                _penalize(ax)
+        elif primary_profile == "TANK":
+            for ax in ("CRIT_ATTACK", "AUTO_ONHIT"):
+                _penalize(ax)
+            if axis_scores.get("AP_SPELL", 0.0) < 1.2:
+                _penalize("AP_SPELL")
+        elif primary_profile == "SUPPORT":
+            for ax in ("AD_ATTACK", "AUTO_ONHIT", "CRIT_ATTACK"):
+                _penalize(ax)
 
     for ax, vote in sorted(anti_votes.items(), key=lambda kv: kv[1], reverse=True):
         if vote >= 1.7 and not (has_hybrid_bridge and ax in ("AP_SPELL", "AD_ATTACK", "AUTO_ONHIT")):
@@ -419,6 +451,14 @@ def _build_progress(store: DataStore | None, rule: AugmentComboRule, owned_set: 
     )
 
 
+def _rule_matches_profile(rule_profile: str, primary_profile: str) -> bool:
+    if rule_profile == primary_profile:
+        return True
+    if rule_profile == "CRIT_SPELL" and primary_profile in ("AP", "AD", "HYBRID"):
+        return True
+    return False
+
+
 def build_combo_plan(
     store: DataStore | None,
     hero_id: str | None,
@@ -454,7 +494,7 @@ def build_combo_plan(
             + len(owned_fups) * 3.0
             + (4.5 if h_match else 0.0)
             + (1.8 if rule.gamble else 0.0)
-            + (2.5 if rule.profile == profile.primary_profile else 0.0)
+            + (2.5 if _rule_matches_profile(rule.profile, profile.primary_profile) else 0.0)
             - (12.0 if not has_anchor else 0.0)
         )
         scored_active.append((rank_score, rule, prog))
@@ -469,7 +509,7 @@ def build_combo_plan(
         hero_rules_sorted = sorted(
             hero_rules,
             key=lambda r: (
-                1 if r.profile == profile.primary_profile else 0,
+                1 if _rule_matches_profile(r.profile, profile.primary_profile) else 0,
                 1 if r.gamble else 0,
                 len(r.core_augments),
             ),
@@ -610,6 +650,8 @@ def evaluate_picker_combos(
     selected_augments: Sequence[str],
     my_items: Sequence[str],
     offered: Sequence[tuple[int, AugmentInfo | None]],
+    *,
+    game_time_s: float = 0.0,
 ) -> PickerComboVerdict:
     """Evaluate 3 live offered augments strictly on combo synergy, gamble upside, and conflict downgrade."""
     db = get_augment_combo_db()
@@ -617,6 +659,7 @@ def evaluate_picker_combos(
     owned_ids = [str(a).strip() for a in selected_augments if str(a).strip()]
     owned_set = set(owned_ids)
     round_index = min(4, len(owned_ids) + 1)
+    is_late_stacker_window = (round_index >= 4) or (float(game_time_s or 0.0) >= 720.0)
 
     profile = infer_match_build_profile(store, hid or None, owned_ids, my_items)
     favored_set = set(profile.favored_axes)
@@ -635,6 +678,30 @@ def evaluate_picker_combos(
         rar = aug.rarity
         cand_axes = infer_augment_axes(store, aid)
         cand_axis_set = set(cand_axes)
+
+        # 0. Late-game stacker discount (Round 4 or >=12min): 1353 (坦克引擎) & 1152 (钢化你心) lack stacking runway!
+        if is_late_stacker_window and aid in LATE_STACKER_AUGMENT_DISCOUNTS:
+            disc = LATE_STACKER_AUGMENT_DISCOUNTS[aid]
+            time_reason = (
+                f"局末({int(game_time_s)}s)叠层周期不足 · 优先即时战力"
+                if float(game_time_s or 0.0) >= 720.0
+                else "第4轮收官叠层周期不足 · 叠层卡大幅折价，优先即时战力"
+            )
+            advices.append(
+                PickerCardComboAdvice(
+                    slot_index=slot_index,
+                    augment_id=aid,
+                    name=nm,
+                    rarity=rar,
+                    verdict="conflict",
+                    verdict_label="末轮叠层折价",
+                    combo_delta=disc,
+                    reason=time_reason,
+                    combo_name="",
+                    gamble=False,
+                )
+            )
+            continue
 
         # 1. Check JACKPOT: completes/amplifies core of an active owned combo
         best_jackpot: tuple[float, AugmentComboRule, str] | None = None
@@ -725,9 +792,27 @@ def evaluate_picker_combos(
             continue
 
         # 4. Round-aware HIGH-CEILING GAMBLE OPENER:
-        #    - Round 1-2: encourage high-ceiling gamble openers (more rounds left to hit partners)
-        #    - Round 3: only hero-signature gambles needing <=1 more partner, modest boost
-        #    - Round 4 (finale): NEVER push unstarted multi-card gambles (no future augment rounds!)
+        #    - Single-card instant prismatic transmute (1238 质变：棱彩阶): decoupled from multi-card combos,
+        #      preserves +4.2 gamble upside bonus across rounds 1-3 (no partner cards required!).
+        #    - Multi-card gambles: Round 1-2 encourage openers; Round 3 only hero-signature needing <=1 partner;
+        #      Round 4 NEVER push unstarted multi-card gambles.
+        if round_index <= 3 and aid in INSTANT_PRISMATIC_TRANSMUTE_IDS:
+            advices.append(
+                PickerCardComboAdvice(
+                    slot_index=slot_index,
+                    augment_id=aid,
+                    name=nm,
+                    rarity=rar,
+                    verdict="gamble",
+                    verdict_label="保底棱彩·高上限",
+                    combo_delta=4.2,
+                    reason=f"第{round_index}轮单卡即时质变 · 保底棱彩阶高上限（不依赖多卡凑齐）",
+                    combo_name="单卡质变：棱彩阶",
+                    gamble=True,
+                )
+            )
+            continue
+
         best_gamble: tuple[float, AugmentComboRule, str] | None = None
         if round_index <= 3:
             for rule in db.combos_for_augment(aid):
@@ -781,7 +866,7 @@ def evaluate_picker_combos(
             continue
 
         # 4b. Round 4 finale anti-gamble guard: warn against unstarted multi-piece gamble seeds!
-        if round_index >= 4:
+        if round_index >= 4 and aid not in INSTANT_PRISMATIC_TRANSMUTE_IDS:
             unstarted_gamble = next(
                 (
                     r

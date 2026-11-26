@@ -172,7 +172,7 @@ def test_p1_responsive_widths_dpi_clamp_and_modal_heights(qapp, tmp_path):
     assert cy + 500 <= 720 - 8
 
     # RechargeDialog with active QR stays compact (<=500px tall) and consumes dynamic pricing_summary
-    cloud = CloudGatewayClient("https://api.hexhelper.example.com")
+    cloud = CloudGatewayClient("https://api.priswebtool.site")
     dlg = RechargeDialog(cloud, auto_load=False)
     dlg._populate_packages(
         {

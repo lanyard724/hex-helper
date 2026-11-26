@@ -79,7 +79,7 @@ def test_format_package_unit_hint_jiao_yuan_and_reassurance() -> None:
 
 
 def test_recharge_dialog_match_friendly_pills_balance_and_compact_height(qapp: QApplication) -> None:
-    cloud = CloudGatewayClient("https://api.hexhelper.example.com")
+    cloud = CloudGatewayClient("https://api.priswebtool.site")
     dlg = RechargeDialog(cloud, auto_load=False, tier="auto", current_balance=4850.0)
     try:
         assert "约剩 15 局 (4,850 积分)" in dlg.balance_lbl.text()
@@ -263,3 +263,77 @@ def test_lookup_window_940x610_match_friendly_balance_recap_button_and_tier_card
         qapp.processEvents()
     finally:
         edition_mod._COMPILED_EDITION = prev_ed
+
+
+def test_recharge_dialog_notify_paid_button_and_service_hours_closed(qapp: QApplication) -> None:
+    import time
+
+    from hex_helper.ui.account_dialogs import RechargeDialog
+
+    class _DummyClient:
+        def __init__(self) -> None:
+            self.notified: list[str] = []
+            self.polled: list[str] = []
+
+        def notify_order_paid(self, order_no: str) -> dict:
+            self.notified.append(order_no)
+            return {
+                "ok": True,
+                "notified": True,
+                "already_paid": False,
+                "cooldown_seconds": 60,
+                "message": "已通知管理员核验到账",
+            }
+
+        def poll_order(self, order_no: str) -> dict:
+            self.polled.append(order_no)
+            return {"order_no": order_no, "status": "pending"}
+
+    dummy = _DummyClient()
+    dlg = RechargeDialog(dummy, auto_load=False)  # type: ignore[arg-type]
+    try:
+        # 1. Closed service hours disables order creation and displays schedule notice
+        dlg._populate_packages(
+            {
+                "packages": [{"id": "pkg_10", "label": "畅玩包", "amount_fen": 1000, "credits": 10000}],
+                "channels": [],
+                "service_hours": {
+                    "enabled": True,
+                    "is_open": False,
+                    "window_label": "10:00 - 24:00",
+                    "message": "当前为夜间休息时段（每日 10:00 - 24:00 开放人工确认补能）",
+                },
+            }
+        )
+        assert dlg.create_order_btn.isEnabled() is False
+        assert "10:00 - 24:00" in dlg.status_lbl.text()
+
+        # 2. Active order shows "我已扫码支付 · 通知确认", clicking fires notify_order_paid + 60s cooldown
+        dlg.show_created_order(
+            {
+                "order_no": "ORD-UI-NOTIFY-1",
+                "memo_code": "8K4M",
+                "pay_amount_fen": 1002,
+                "pay_amount_yuan": "10.02",
+                "channel": "manual_alipay",
+                "channel_label": "支付宝扫码支付",
+                "credits_amount": 10000,
+            }
+        )
+        assert "我已扫码支付" in dlg.refresh_order_btn.text()
+        assert dlg.refresh_order_btn.isEnabled() is True
+
+        dlg.refresh_order_btn.click()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and dlg._notify_cooldown_left == 0:
+            qapp.processEvents()
+            time.sleep(0.02)
+
+        assert dummy.notified == ["ORD-UI-NOTIFY-1"]
+        assert dlg._notify_cooldown_left > 0
+        assert dlg.refresh_order_btn.isEnabled() is False
+        assert "已通知确认" in dlg.refresh_order_btn.text()
+        assert "已通知管理员核验到账" in dlg.status_lbl.text()
+    finally:
+        dlg.close()
+        qapp.processEvents()

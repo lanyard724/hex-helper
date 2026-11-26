@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -19,6 +21,7 @@ class OcrLine:
     y: float  # top in input image pixels
     w: float
     h: float
+    pass_id: int = 1
 
     @property
     def cx(self) -> float:
@@ -37,12 +40,21 @@ class WinRtOcrEngine:
         from winrt.windows.media.ocr import OcrEngine
 
         self.language_tag = language_tag
+        self.actual_language_tag: str = ""
+        self.last_shadowed_pass2: list[dict[str, Any]] = []
+        self.last_pass_timings_ms: dict[str, float] = {"ocr_p1_ms": 0.0, "ocr_p2_ms": 0.0}
         lang = Language(language_tag)
         self._engine = OcrEngine.try_create_from_language(lang)
         if self._engine is None:
             self._engine = OcrEngine.try_create_from_user_profile_languages()
         if self._engine is None:
             raise RuntimeError(f"Windows WinRT OCR unavailable for {language_tag}")
+        try:
+            rec_lang = getattr(self._engine, "recognizer_language", None)
+            tag = getattr(rec_lang, "language_tag", None) if rec_lang is not None else None
+            self.actual_language_tag = str(tag or "")
+        except Exception:
+            self.actual_language_tag = ""
         self._max_dim = int(OcrEngine.max_image_dimension or 2600)
         self._loop = asyncio.new_event_loop()
 
@@ -52,7 +64,7 @@ class WinRtOcrEngine:
         except Exception:
             pass
 
-    async def _recognize_bgra_async(self, bgra: np.ndarray) -> list[OcrLine]:
+    async def _recognize_bgra_async(self, bgra: np.ndarray, pass_id: int = 1) -> list[OcrLine]:
         from winrt.windows.graphics.imaging import (
             BitmapAlphaMode,
             BitmapPixelFormat,
@@ -86,20 +98,32 @@ class WinRtOcrEngine:
                 y1 = max(y1, float(r.y + r.height))
             if x1 <= x0 or y1 <= y0:
                 continue
-            lines.append(OcrLine(text=text, x=x0, y=y0, w=x1 - x0, h=y1 - y0))
+            lines.append(OcrLine(text=text, x=x0, y=y0, w=x1 - x0, h=y1 - y0, pass_id=pass_id))
         return lines
 
-    def _run_bgra(self, bgra: np.ndarray, scale: float) -> list[OcrLine]:
-        raw_lines = self._loop.run_until_complete(self._recognize_bgra_async(bgra))
+    def _run_bgra(self, bgra: np.ndarray, scale: float, pass_id: int = 1) -> list[OcrLine]:
+        raw_lines = self._loop.run_until_complete(self._recognize_bgra_async(bgra, pass_id=pass_id))
         if scale == 1.0:
             return raw_lines
         inv = 1.0 / scale
         return [
-            OcrLine(text=l.text, x=l.x * inv, y=l.y * inv, w=l.w * inv, h=l.h * inv)
+            OcrLine(
+                text=l.text,
+                x=l.x * inv,
+                y=l.y * inv,
+                w=l.w * inv,
+                h=l.h * inv,
+                pass_id=l.pass_id,
+            )
             for l in raw_lines
         ]
 
-    def _prepare_variants(self, image_bgr: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    def _prepare_variants(
+        self,
+        image_bgr: np.ndarray,
+        *,
+        need_inverted: bool = True,
+    ) -> tuple[float, np.ndarray, np.ndarray | None]:
         h, w = image_bgr.shape[:2]
         # Scale small/medium title bands up for crisp Chinese glyphs while respecting max_dim
         target_h = 340.0
@@ -123,27 +147,80 @@ class WinRtOcrEngine:
         enhanced = clahe.apply(gray)
         v1 = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGRA)
 
+        if not need_inverted:
+            return scale, v1, None
+
         # Variant 2: Inverted dark-text-on-bright-background (helps white/gold text on dark Hextech cards)
         inv = 255 - enhanced
         v2 = cv2.cvtColor(inv, cv2.COLOR_GRAY2BGRA)
         return scale, v1, v2
 
-    def recognize_lines(self, image_bgr: np.ndarray, dual_pass: bool = True) -> list[OcrLine]:
+    def recognize_lines(
+        self,
+        image_bgr: np.ndarray,
+        dual_pass: bool = True,
+        force_dual_pass: bool = False,
+    ) -> list[OcrLine]:
         """Run WinRT OCR on a BGR crop and return bounding-boxed lines in input pixel coordinates."""
+        self.last_shadowed_pass2 = []
+        self.last_pass_timings_ms = {"ocr_p1_ms": 0.0, "ocr_p2_ms": 0.0}
         if image_bgr is None or image_bgr.size == 0:
             return []
-        scale, v1, v2 = self._prepare_variants(image_bgr)
-        lines1 = self._run_bgra(v1, scale)
-        if not dual_pass or len(lines1) >= 3:
+        allow_p2 = bool(dual_pass or force_dual_pass)
+        scale, v1, v2 = self._prepare_variants(image_bgr, need_inverted=allow_p2)
+        t_p1 = time.perf_counter()
+        lines1 = self._run_bgra(v1, scale, pass_id=1)
+        self.last_pass_timings_ms["ocr_p1_ms"] = round((time.perf_counter() - t_p1) * 1000.0, 3)
+        if not force_dual_pass and (not dual_pass or len(lines1) >= 3):
+            return lines1
+        if v2 is None:
             return lines1
 
         # Second pass on inverted image for glowing white-on-dark titles; merge deduplicated lines
-        lines2 = self._run_bgra(v2, scale)
+        t_p2 = time.perf_counter()
+        lines2 = self._run_bgra(v2, scale, pass_id=2)
+        self.last_pass_timings_ms["ocr_p2_ms"] = round((time.perf_counter() - t_p2) * 1000.0, 3)
         merged = list(lines1)
+        shadowed: list[dict[str, Any]] = []
         for cand in lines2:
-            duplicate = any(
-                abs(cand.cx - ex.cx) < 40 and abs(cand.cy - ex.cy) < 24 for ex in merged
+            keeper = next(
+                (ex for ex in merged if abs(cand.cx - ex.cx) < 40 and abs(cand.cy - ex.cy) < 24),
+                None,
             )
-            if not duplicate:
+            if keeper is None:
                 merged.append(cand)
+            elif keeper.pass_id == 1:
+                k_compact = "".join(keeper.text.split())
+                c_compact = "".join(cand.text.split())
+                if c_compact and c_compact != k_compact:
+                    shadowed.append(
+                        {
+                            "kept_pass1_text": keeper.text,
+                            "dropped_pass2_text": cand.text,
+                            "kept_bbox": [
+                                round(keeper.x, 1),
+                                round(keeper.y, 1),
+                                round(keeper.w, 1),
+                                round(keeper.h, 1),
+                            ],
+                            "dropped_bbox": [
+                                round(cand.x, 1),
+                                round(cand.y, 1),
+                                round(cand.w, 1),
+                                round(cand.h, 1),
+                            ],
+                            "dx": round(abs(cand.cx - keeper.cx), 1),
+                            "dy": round(abs(cand.cy - keeper.cy), 1),
+                        }
+                    )
+        self.last_shadowed_pass2 = shadowed
         return merged
+
+    def recognize_bgr(
+        self,
+        image_bgr: np.ndarray,
+        dual_pass: bool = True,
+        force_dual_pass: bool = False,
+    ) -> list[OcrLine]:
+        """Alias of `recognize_lines` accepting a BGR image crop."""
+        return self.recognize_lines(image_bgr, dual_pass=dual_pass, force_dual_pass=force_dual_pass)

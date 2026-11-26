@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
 APP_NAME = "HexHelper"
 _COMPILED_EDITION = "commercial"
 
@@ -19,3 +19,13 @@ DEFAULT_CLOUD_API_BASE: str = os.environ.get(
 def is_commercial_edition() -> bool:
     """Public desktop client always runs in unified cloud-connected mode."""
     return True
+
+
+def is_devlab_allowed() -> bool:
+    """Public commercial client never enables local DevLab flight recording."""
+    return False
+
+
+def get_dev_build_tag() -> str:
+    """Return canonical release version for public desktop builds."""
+    return APP_VERSION

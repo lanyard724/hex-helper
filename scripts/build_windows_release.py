@@ -134,21 +134,64 @@ def _patch_edition_text(
     return patched
 
 
+def _is_forbidden_devlab_path(rel_norm: str) -> bool:
+    low = rel_norm.replace("\\", "/").lower()
+    if any(
+        token in low
+        for token in (
+            "hex_helper/devlab",
+            "hex_helper.devlab",
+            "/devlab/",
+            "/devlab.",
+            "flight_recorder",
+            "hex_helper/bridge/agent_bridge",
+            "hex_helper.bridge.agent_bridge",
+            "/agent_bridge.",
+            "/agent_bridge/",
+        )
+    ):
+        return True
+    return low.startswith(("devlab/", "devlab.", "agent_bridge.", "agent_bridge/")) or low in (
+        "devlab",
+        "agent_bridge",
+    )
+
+
+def _is_forbidden_devlab_module(mod_name: str) -> bool:
+    low = str(mod_name).lower()
+    return (
+        low == "hex_helper.devlab"
+        or low.startswith("hex_helper.devlab.")
+        or low == "devlab"
+        or low.startswith("devlab.")
+        or ".devlab." in low
+        or low.endswith(".devlab")
+        or "flight_recorder" in low
+        or low == "hex_helper.bridge.agent_bridge"
+        or low.startswith("hex_helper.bridge.agent_bridge.")
+    )
+
+
 def audit_commercial_bundle(bundle_dir: Path) -> dict[str, object]:
-    """Fail if any google.genai / genai / google.auth artifacts exist in _internal or PYZ."""
+    """Fail if any google.genai / google.auth or DevLab / agent_bridge artifacts exist in _internal or PYZ."""
     internal_dir = bundle_dir / "_internal"
     if not internal_dir.is_dir():
         raise FileNotFoundError(f"Expected PyInstaller _internal directory missing: {internal_dir}")
 
     offending_paths: list[str] = []
+    devlab_offending_paths: list[str] = []
     total_size = 0
     file_count = 0
     for p in bundle_dir.rglob("*"):
+        rel_norm = str(p.relative_to(bundle_dir)).replace("\\", "/").lower()
+        if p.is_dir():
+            if _is_forbidden_devlab_path(rel_norm + "/"):
+                devlab_offending_paths.append(rel_norm + "/")
+            continue
         if not p.is_file():
             continue
         file_count += 1
         total_size += p.stat().st_size
-        rel_norm = str(p.relative_to(bundle_dir)).replace("\\", "/").lower()
         if any(
             token in rel_norm
             for token in (
@@ -162,9 +205,12 @@ def audit_commercial_bundle(bundle_dir: Path) -> dict[str, object]:
             )
         ):
             offending_paths.append(rel_norm)
+        if _is_forbidden_devlab_path(rel_norm):
+            devlab_offending_paths.append(rel_norm)
 
-    # Also inspect embedded PYZ archive TOC to verify google.genai is absent from frozen bytecode
+    # Also inspect embedded PYZ archive TOC to verify google.genai and devlab/agent_bridge are absent from frozen bytecode
     pyz_hits: list[str] = []
+    devlab_pyz_hits: list[str] = []
     pyz_module_count = 0
     exe_path = bundle_dir / "HexHelper.exe"
     if exe_path.is_file():
@@ -180,22 +226,33 @@ def audit_commercial_bundle(bundle_dir: Path) -> dict[str, object]:
                     low = str(mod_name).lower()
                     if low == "google" or low.startswith("google.") or "genai" in low:
                         pyz_hits.append(str(mod_name))
+                    if _is_forbidden_devlab_module(str(mod_name)):
+                        devlab_pyz_hits.append(str(mod_name))
 
     if pyz_module_count == 0:
         raise RuntimeError(f"Audit failed: could not inspect embedded PYZ archive in {exe_path}")
 
-    if offending_paths or pyz_hits:
-        raise RuntimeError(
-            f"Commercial bundle audit FAILED! Forbidden Google/GenAI artifacts found: "
-            f"files={offending_paths}, pyz={pyz_hits}"
-        )
+    google_genai_clean = not (offending_paths or pyz_hits)
+    devlab_clean = not (devlab_offending_paths or devlab_pyz_hits)
+
+    if not google_genai_clean or not devlab_clean:
+        reasons: list[str] = []
+        if not google_genai_clean:
+            reasons.append(f"Google/GenAI artifacts found: files={offending_paths}, pyz={pyz_hits}")
+        if not devlab_clean:
+            reasons.append(
+                f"DevLab/AgentBridge artifacts found (devlab_clean=False): "
+                f"files={devlab_offending_paths}, pyz={devlab_pyz_hits}"
+            )
+        raise RuntimeError("Commercial bundle audit FAILED! " + "; ".join(reasons))
 
     return {
         "bundle_files": file_count,
         "bundle_bytes": total_size,
         "bundle_mb": round(total_size / (1024 * 1024), 2),
         "pyz_modules": pyz_module_count,
-        "google_genai_clean": True,
+        "google_genai_clean": google_genai_clean,
+        "devlab_clean": devlab_clean,
     }
 
 
@@ -245,6 +302,8 @@ def verify_clean_env_binary(exe_path: Path, expected_edition: str) -> dict[str, 
     with tempfile.TemporaryDirectory(prefix="hex_clean_verify_") as td:
         tmp_dir = Path(td)
         data_dir = tmp_dir / "appdata"
+        local_appdata_dir = tmp_dir / "localappdata"
+        local_appdata_dir.mkdir(parents=True, exist_ok=True)
         report_out = tmp_dir / "preflight_report.json"
 
         clean_env: dict[str, str] = {
@@ -256,13 +315,23 @@ def verify_clean_env_binary(exe_path: Path, expected_edition: str) -> dict[str, 
             "TMP": str(tmp_dir),
             "USERPROFILE": os.environ.get("USERPROFILE", ""),
             "APPDATA": os.environ.get("APPDATA", ""),
-            "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
+            "LOCALAPPDATA": str(local_appdata_dir),
             "PUBLIC": os.environ.get("PUBLIC", r"C:\Users\Public"),
             "ProgramData": os.environ.get("ProgramData", r"C:\ProgramData"),
             "HEX_HELPER_DATA_DIR": str(data_dir),
             "PYTHONPATH": "",
             "PYTHONHOME": "",
         }
+        if expected_edition == "commercial":
+            # Adversarial isolation gate: commercial binary must ignore all dev/devlab env overrides
+            clean_env.update(
+                {
+                    "HEX_EDITION": "dev",
+                    "HEX_DEVLAB": "1",
+                    "HEX_DEVLAB_ROI": "1",
+                    "HEX_DEVLAB_DEBUG": "1",
+                }
+            )
 
         proc = subprocess.run(
             [
@@ -304,6 +373,26 @@ def verify_clean_env_binary(exe_path: Path, expected_edition: str) -> dict[str, 
         saved_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         if not saved_cfg.get("lockfile_path"):
             raise AssertionError("Persisted config.json missing detected lockfile_path")
+
+        if expected_edition == "commercial":
+            devlab_leaks: list[str] = []
+            for root_dir in (data_dir, local_appdata_dir):
+                if not root_dir.exists():
+                    continue
+                for p in root_dir.rglob("*"):
+                    rel = str(p.relative_to(root_dir)).replace("\\", "/").lower()
+                    if "devlab" in rel:
+                        devlab_leaks.append(f"{root_dir.name}/{rel}")
+            if devlab_leaks:
+                raise AssertionError(
+                    f"Commercial binary created forbidden devlab artifacts under clean env: {devlab_leaks}"
+                )
+            for devlab_key in ("devlab_enabled", "devlab_roi_snapshots", "devlab_debug_log"):
+                if saved_cfg.get(devlab_key):
+                    raise AssertionError(
+                        f"Commercial config.json persisted {devlab_key}={saved_cfg.get(devlab_key)!r}"
+                    )
+            report["devlab_isolated"] = True
 
         extracted_datasets = list((data_dir / "cache" / "datasets").glob("*/*/heroes.json"))
         if not extracted_datasets:

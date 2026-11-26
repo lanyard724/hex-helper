@@ -29,6 +29,7 @@ VALID_MECHANIC_AXES: frozenset[str] = frozenset(
         "ULT_CYCLE",
         "MOBILITY_DASH",
         "GAMBLE_HIGHROLL",
+        "UTILITY_SUSTAIN",
     }
 )
 

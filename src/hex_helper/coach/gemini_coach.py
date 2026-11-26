@@ -1,4 +1,4 @@
-"""Compact coach prompt payload builder and item-grounding helpers for HexHelper."""
+"""Direct Gemini 4 API Coach using the official cloud-coach Interactions SDK."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from hex_helper.bridge.protocol import (
@@ -83,6 +83,15 @@ _ITEM_NICKNAME_ALIASES: dict[str, str] = {
     "无终": "无终恨意",
     "深渊": "深渊面具",
     "千变者": "千变者贾修",
+    "水银鞋": "水银之靴",
+    "铁板鞋": "铁板靴",
+    "布甲鞋": "铁板靴",
+    "法穿鞋": "法师之靴",
+    "攻速鞋": "狂战士胫甲",
+    "明朗鞋": "明朗之靴",
+    "CD鞋": "明朗之靴",
+    "轻灵鞋": "轻灵之靴",
+    "三速鞋": "轻灵之靴",
 }
 
 # Situational counter & boot anchor items guaranteed to be in reference glossary
@@ -171,10 +180,18 @@ COACH_SYSTEM_INSTRUCTION = """你是LOL海克斯大乱斗(26.23)实时参谋，�
 - item_id与name严守输入ID/item_glossary("名|金",优先4位ID)。
 - next_items[0]唯一明确下件(priority="下件必出",reason<=14字写敌我证据)；[1]备选("次选")。
 - buy_now<=24字：结合my_hero.gold与已有散件给此刻购买。
-- build_path：未出大件名(2-5件,含未升二级鞋)。
+- build_path：仅填未出成装大件名(2-5件,严禁鞋子与散件;二级鞋仅在buy_now提示)。
 - tactical_summary<=28字：1句纯团战/站位/技能提醒，禁提装备与金币。
 7.六神满格：inventory_status.status为full_6_complete或full_5_plus_boots时，禁推第7件或散件；默认next_items[0]推500G合剂(2139巫术/2140愤怒/2138钢铁,priority="满格合剂")、build_path=[]、buy_now提示磕合剂；仅胜负刚需(0重伤打高回复/频被秒/钱够卖鞋换大件)可换装(priority="必须换装",reason写"卖X换Y+理由")。
 8.开局简报：仅trigger_reason=="game_start"时填opening_brief(enemy_threat<=22字结合lobby_scout敌大腿/车队与伤害结构,augment_goal<=22字目标海克斯流派,opening_buy<=24字1400G出门与首件)；否则{}。"""
+
+PICKER_FAST_SYSTEM_INSTRUCTION = """你是LOL海克斯大乱斗(26.23)极速选卡参谋。仅据输入快速给出海克斯三/四选一结论，禁复述输入。
+要求：
+1.augment_pick_advice<=20字：结合offered_augments的win_rate/delta/combo_label、selected_augments及enemy_champs/threat_summary直给最优卡与简短对比理由。
+2.buy_now<=18字：仅结合金币与committed_build_plan一句话提示下步。
+3.build_path：仅填未出成装大件名(严禁鞋子与散件)，无变动填[]。
+4.next_items：无需变阵可填[]。
+5.tactical_summary<=22字：1句当前流派团战要点，禁提装备金币。"""
 
 
 @dataclass(frozen=True)
@@ -185,6 +202,8 @@ class GeminiCallStats:
     total_tokens: int = 0
     thought_tokens: int = 0
     output_tokens: int = 0
+    grounding_stats: dict[str, int] = field(default_factory=dict, hash=False)
+    input_tokens: int = 0
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -862,6 +881,144 @@ def build_coach_prompt_payload(req: CoachRequestPayload, store: DataStore | None
     return data
 
 
+def build_picker_fast_prompt_payload(
+    req: CoachRequestPayload,
+    store: DataStore | None = None,
+) -> dict[str, Any]:
+    """Assemble an ultra-compact (~600-token) augment-picking payload for sub-2s Flash inference.
+
+    Keeps ONLY decision-critical augment picker context: hero_static, selected_augments,
+    3/4 offered_augments with tier/win_rate/delta/combo hints, compact combo/special build
+    direction, compact enemy threat tags & champion names — stripping item_glossary,
+    hero_big_data_top_builds, full 10-player item histories, and verbose prose.
+    """
+    raw_my = dict(req.my_hero or {})
+    hid = str(raw_my.get("hero_id") or "").strip()
+    hero_obj = store.get_hero(hid) if (store is not None and hid) else None
+    if hero_obj is None and store is not None and raw_my.get("name"):
+        hero_obj = store.find_hero_by_name(str(raw_my["name"]))
+        if hero_obj is not None and not hid:
+            hid = hero_obj.hero_id
+
+    hero_name = str(raw_my.get("name") or (hero_obj.name if hero_obj else "") or "")
+    if "win_rate" in raw_my and raw_my["win_rate"] is not None:
+        hero_win_rate = raw_my["win_rate"]
+    elif hero_obj is not None:
+        hero_win_rate = round(hero_obj.win_rate, 4)
+    else:
+        hero_win_rate = 0.5
+
+    hero_static: dict[str, Any] = {
+        "hero_id": hid,
+        "name": hero_name,
+        "win_rate": hero_win_rate,
+    }
+    archetype = str((req.hero_signature_hint or {}).get("archetype") or "").strip()
+    if archetype:
+        hero_static["archetype"] = archetype
+
+    my_items_clean = _clean_item_names(raw_my.get("items"))
+    my_compact: dict[str, Any] = {}
+    if raw_my.get("level") is not None:
+        my_compact["level"] = raw_my["level"]
+    if raw_my.get("gold") is not None:
+        my_compact["gold"] = raw_my["gold"]
+    if raw_my.get("kda"):
+        my_compact["kda"] = str(raw_my["kda"]).strip()
+    if my_items_clean:
+        my_compact["items"] = my_items_clean[:6]
+
+    selected_compact: list[dict[str, Any]] = []
+    for aug in req.selected_augments or []:
+        if not isinstance(aug, dict):
+            continue
+        entry = _prune_empty(
+            {
+                "id": str(aug.get("id") or ""),
+                "name": str(aug.get("name") or ""),
+                "rarity": str(aug.get("rarity") or ""),
+            }
+        )
+        if entry:
+            selected_compact.append(entry)
+
+    offered_compact: list[dict[str, Any]] = []
+    for card in (req.offered_augments or [])[:4]:
+        if not isinstance(card, dict):
+            continue
+        cleaned_card = _prune_empty(card)
+        if cleaned_card:
+            offered_compact.append(cleaned_card)
+
+    combo_compact = _compact_augment_combo_context(
+        req.augment_combo_context or {},
+        trigger_reason="augment_picking",
+        has_offered=bool(offered_compact),
+    )
+
+    special_compact: list[dict[str, Any]] = []
+    for sp in req.special_augment_builds or []:
+        if not isinstance(sp, dict):
+            continue
+        slim_sp = _prune_empty(
+            {
+                k: v
+                for k, v in sp.items()
+                if k in ("id", "name", "archetype", "force_items", "avoid_note")
+            }
+        )
+        if slim_sp:
+            special_compact.append(slim_sp)
+
+    raw_plan = req.committed_build_plan if isinstance(req.committed_build_plan, dict) else {}
+    plan_compact: dict[str, Any] = {}
+    owned_comp = _clean_item_names(raw_plan.get("owned_complete"))
+    if owned_comp:
+        plan_compact["owned_complete"] = owned_comp
+    locked_next = _prune_empty(raw_plan.get("locked_next_item"))
+    if locked_next:
+        plan_compact["locked_next_item"] = locked_next
+
+    deduped_allies, self_kda = _dedup_allies(req.allies or [], raw_my, my_items_clean, store)
+    if self_kda and "kda" not in my_compact:
+        my_compact["kda"] = self_kda
+
+    enemy_champs = [
+        str(e.get("champion") or e.get("name") or "").strip()
+        for e in (req.enemies or [])
+        if isinstance(e, dict) and str(e.get("champion") or e.get("name") or "").strip()
+    ][:5]
+    ally_champs = [
+        str(a.get("champion") or a.get("name") or "").strip()
+        for a in deduped_allies
+        if isinstance(a, dict) and str(a.get("champion") or a.get("name") or "").strip()
+    ][:4]
+    threats = [str(t).strip() for t in (req.threat_summary or []) if str(t).strip()][:6]
+
+    data: dict[str, Any] = {
+        "dataset_patch": req.dataset_patch,
+        "trigger_reason": req.trigger_reason,
+        "hero_static": hero_static,
+    }
+    if my_compact:
+        data["my_hero"] = my_compact
+    data["selected_augments"] = selected_compact
+    data["offered_augments"] = offered_compact
+    if combo_compact:
+        data["augment_combo_context"] = combo_compact
+    if special_compact:
+        data["special_augment_builds"] = special_compact
+    if plan_compact:
+        data["committed_build_plan"] = plan_compact
+    if threats:
+        data["threat_summary"] = threats
+    if enemy_champs:
+        data["enemy_champs"] = enemy_champs
+    if ally_champs:
+        data["ally_champs"] = ally_champs
+    return data
+
+
 def _is_explicit_swap_item(priority: str, reason: str) -> bool:
     """Return True iff the coach explicitly justified selling an owned item/boots to swap in a mandatory counter."""
     p = priority or ""
@@ -875,9 +1032,15 @@ def ground_coach_advice(
     store: DataStore | None,
     model: str = "gemini-4-hydrogen",
     thinking_level: str = "medium",
+    stats_out: dict[str, int] | None = None,
 ) -> CoachAdvicePayload:
     """Validate, canonicalize item IDs/names against DataStore, drop owned duplicates, and guard 6-slot full builds."""
     id_to_name, name_to_id = _canonical_item_lookup(store)
+
+    unknown_item_blocked = 0
+    already_owned_blocked = 0
+    full_build_7th_item_blocked = 0
+    invalid_route_blocked = 0
 
     # Resolve owned complete items so Gemini can never recommend finishing an already-owned completed item
     owned_complete_norm: set[str] = set()
@@ -917,6 +1080,7 @@ def ground_coach_advice(
     has_store_catalog = bool(id_to_name)
     for it in raw_json.get("next_items") or []:
         if not isinstance(it, dict):
+            unknown_item_blocked += 1
             continue
         raw_id = canonicalize_item_id(str(it.get("item_id", "")).strip())
         raw_name_orig = str(it.get("name", "")).strip()
@@ -929,19 +1093,23 @@ def ground_coach_advice(
             canon_name = id_to_name.get(canon_id, raw_name)
         elif has_store_catalog:
             # Drop hallucinated/deleted item IDs (e.g. legacy 3151 if unmapped, or non-existent shop items)
+            unknown_item_blocked += 1
             logger.debug("Dropping ungrounded Gemini item: id=%r name=%r", raw_id, raw_name_orig)
             continue
         else:
             canon_id = raw_id
             canon_name = raw_name or raw_id
         if not canon_name or canon_name.startswith("装备#"):
+            unknown_item_blocked += 1
             continue
         if (canon_id and canon_id in owned_complete_norm) or (canon_name in owned_complete_names):
+            already_owned_blocked += 1
             continue
         priority_str = str(it.get("priority") or ("下件必出" if not grounded_items else "次选")).strip()
         reason_str = str(it.get("reason", "")).strip()
         if inv_full_build and canon_id not in ELIXIR_IDS and not _is_explicit_swap_item(priority_str, reason_str):
             # Refuse unjustified 7th major item when all 6 slots are already occupied!
+            full_build_7th_item_blocked += 1
             logger.debug("Dropping unjustified 7th item at full build: %s (%s)", canon_name, reason_str)
             continue
         if canon_id and canon_id in seen_item_ids:
@@ -975,22 +1143,69 @@ def ground_coach_advice(
         )
 
     build_path: list[str] = []
+    raw_build_path = raw_json.get("build_path") or []
     if not inv_full_build:
-        for step in raw_json.get("build_path") or []:
+        for step in raw_build_path:
             s_raw = str(step).strip()
             s = _ITEM_NICKNAME_ALIASES.get(s_raw, s_raw)
             if not s or s.startswith("装备#"):
+                if s_raw:
+                    invalid_route_blocked += 1
                 continue
             if has_store_catalog and store is not None:
                 cid = name_to_id.get(s) or (canonicalize_item_id(s) if s.isdigit() else "")
+                if not cid:
+                    m_pid = _PAREN_ITEM_ID_RE.search(s)
+                    if m_pid:
+                        cand_cid = canonicalize_item_id(m_pid.group(1))
+                        if cand_cid in id_to_name:
+                            cid = cand_cid
+                if cid:
+                    norm_cid = normalize_item_id(cid)
+                    cinfo = store.get_item_info(cid)
+                    if (
+                        norm_cid in TIER2_BOOT_IDS
+                        or cinfo.category == "boots"
+                        or "Boots" in (cinfo.tags or ())
+                    ):
+                        # Tier-2/boots belong in buy_now/boots hint rather than build_path;
+                        # strip silently without counting as an invalid_route_blocked hallucination.
+                        continue
                 if not cid or not is_valid_plan_item(store, cid):
+                    invalid_route_blocked += 1
                     continue
                 s = id_to_name.get(cid, s)
                 if cid in owned_complete_norm:
+                    already_owned_blocked += 1
                     continue
-            if s in owned_complete_names or s in build_path:
+            if s in owned_complete_names:
+                already_owned_blocked += 1
+                continue
+            if s in build_path:
+                invalid_route_blocked += 1
                 continue
             build_path.append(s)
+    else:
+        for step in raw_build_path:
+            if str(step).strip():
+                invalid_route_blocked += 1
+
+    if stats_out is not None:
+        total_blocked = (
+            unknown_item_blocked
+            + already_owned_blocked
+            + full_build_7th_item_blocked
+            + invalid_route_blocked
+        )
+        stats_out.update(
+            {
+                "unknown_item_blocked": unknown_item_blocked,
+                "already_owned_blocked": already_owned_blocked,
+                "full_build_7th_item_blocked": full_build_7th_item_blocked,
+                "invalid_route_blocked": invalid_route_blocked,
+                "total_blocked": total_blocked,
+            }
+        )
 
     pick_advice = str(raw_json.get("augment_pick_advice", "")).strip()
     if not req.offered_augments:

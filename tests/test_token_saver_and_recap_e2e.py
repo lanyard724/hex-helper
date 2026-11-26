@@ -390,6 +390,11 @@ def test_opening_brief_card_render_auto_expand_dismiss_and_balance_pill(
             qapp.processEvents()
             assert drawer.width() == EdgeBuildDrawer.EXPANDED_W
 
+            # Save headless visual audit snapshot to verify crisp LOL V16.23 Hextech styling
+            audit_dir = Path(r"C:\Users\Administrator\.gemini\antigravity\brain\c6d79029-fe63-4195-8605-30bd8143d2a5\audit_visual")
+            if audit_dir.parent.exists():
+                audit_dir.mkdir(parents=True, exist_ok=True)
+                drawer.grab().save(str(audit_dir / "edge_drawer_opening_brief.png"), "PNG")
 
             # Resizable overlay still works cleanly while opening_brief_card is visible
             drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 310, 520), "bl")
@@ -558,7 +563,7 @@ def test_end_of_game_builds_recap_unlocks_lookup_opens_dialog_and_notifies_tray(
         assert dlg.isModal() is False
         assert dlg.isVisible() is True
         assert dlg.card_image.width() == 760
-        assert dlg.card_image.height() == 430
+        assert dlg.card_image.height() == 480
         dlg.close()
 
         # Loss match without completed combo still unlocks recap button but stays quiet on tray

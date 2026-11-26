@@ -36,7 +36,7 @@ from hex_helper.ui.resizable_overlay import (
 
 
 def _make_store(tmp_path: Path) -> DataStore:
-    static = StaticAssetsManager(tmp_path)
+    static = StaticAssetsManager(tmp_path, fetcher=lambda _url: b"")
     static.items = {
         "6655": ItemStaticInfo("6655", "卢登的伙伴", 2850, ("SpellDamage",), {"FlatMagicDamageMod": 100.0}, "", "complete_equipment"),
         "3089": ItemStaticInfo("3089", "灭世者的死亡之帽", 3600, ("SpellDamage",), {"FlatMagicDamageMod": 130.0}, "", "complete_equipment"),
@@ -197,16 +197,16 @@ def test_edge_drawer_resize_adapts_columns_header_and_persists(tmp_path: Path) -
     assert drawer.collapse_btn.text() == "收"
     assert _active_aug_cols() == 2
 
-    # Resize WIDE (490 x 560) -> 3 augment columns + full header
-    drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 490, 560), "bl")
-    drawer._on_resize_finished(QRect(drawer.x(), drawer.y(), 490, 560), "bl")
+    # Resize WIDE (490 x 620) -> 3 augment columns + full header
+    drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 490, 620), "bl")
+    drawer._on_resize_finished(QRect(drawer.x(), drawer.y(), 490, 620), "bl")
     app.processEvents()
     assert drawer.width() == 490
-    assert drawer.height() == 560
+    assert drawer.height() == 620
     assert drawer.hdr_icon.isVisible()
     assert drawer.collapse_btn.text() == "收起"
     assert _active_aug_cols() == 3
-    assert saved_sizes[-1] == [490, 560]
+    assert saved_sizes[-1] == [490, 620]
 
     # Reset restores default width 368 and notifies None
     drawer.reset_default_size()
@@ -368,10 +368,13 @@ def test_app_config_persists_overlay_sizes(tmp_path: Path) -> None:
 
 
 def test_auto_overlay_scale_and_4k_default_widths() -> None:
-    # 1080p @ 100%, 2K @ 100%, and 4K @ 200% (OS already 2x) stay at 1.0x
+    # 1080p @ 100% and 4K @ 200% (OS already 2x) stay at 1.0x
     assert compute_auto_overlay_scale(1920, 1080, 1.0) == 1.0
-    assert compute_auto_overlay_scale(2560, 1440, 1.0) == 1.0
     assert compute_auto_overlay_scale(1920, 1080, 2.0) == 1.0
+
+    # WS-5: 2K QHD @ 100% (2560x1440) auto-scales to ~1.24x for immediate readability
+    s_2k_100 = compute_auto_overlay_scale(2560, 1440, 1.0)
+    assert 1.22 <= s_2k_100 <= 1.26
 
     # 4K displays at 100% / 125% / 150% DPI automatically scale up cleanly
     s_4k_100 = compute_auto_overlay_scale(3840, 2160, 1.0)
@@ -383,8 +386,10 @@ def test_auto_overlay_scale_and_4k_default_widths() -> None:
     assert s_4k_100 > s_4k_125 > s_4k_150 > 1.0
 
     assert EdgeBuildDrawer.compute_default_expanded_width(1920, 1080, 1.0) == EdgeBuildDrawer.EXPANDED_W
+    assert EdgeBuildDrawer.compute_default_expanded_width(2560, 1440, 1.0) >= 440
     assert EdgeBuildDrawer.compute_default_expanded_width(3840, 2160, 1.0) >= 600
     assert AugmentComboOverlay.compute_expanded_width(1920, 1080, 1.0) == AugmentComboOverlay.EXPANDED_W
+    assert AugmentComboOverlay.compute_expanded_width(2560, 1440, 1.0) >= 380
     assert AugmentComboOverlay.compute_expanded_width(3840, 2160, 1.0) >= 520
 
     # Scale helper clamps cleanly to [0.85, 2.20] and guards extreme shallow height
@@ -436,13 +441,27 @@ def test_frameless_resize_controller_top_edges_and_cursors() -> None:
     w.close()
 
 
-def test_edge_drawer_proportional_font_icon_scaling_and_f9_persistence(tmp_path: Path) -> None:
+def test_edge_drawer_proportional_font_icon_scaling_and_f9_persistence(
+    tmp_path: Path, monkeypatch
+) -> None:
     import re
+    from PySide6.QtGui import QGuiApplication
 
     app = QApplication.instance() or QApplication([])
     store = _make_store(tmp_path)
     saved_sizes: list[list[int] | None] = []
     saved_scales: list[float | None] = []
+
+    class _FakeScreen1080p:
+        def geometry(self) -> QRect:
+            return QRect(0, 0, 1920, 1080)
+
+        def devicePixelRatio(self) -> float:  # noqa: N802
+            return 1.0
+
+    fake_scr = _FakeScreen1080p()
+    monkeypatch.setattr(EdgeBuildDrawer, "_active_screen", lambda self: fake_scr)
+    monkeypatch.setattr(QGuiApplication, "screenAt", staticmethod(lambda _pt: fake_scr))
 
     def _extract_font_px(qss: str) -> int:
         m = re.search(r"font-size:\s*(\d+)px", qss)
@@ -628,7 +647,8 @@ def test_desktop_version_updated_to_1_4_6() -> None:
     import hex_helper
     from hex_helper.edition import APP_VERSION
 
-    assert APP_VERSION == "1.4.6"
-    assert hex_helper.__version__ == "1.4.6"
+    # Keep APP_VERSION aligned with live manifest (1.4.7) across edition, package, and pyproject
+    assert APP_VERSION == "1.4.7"
+    assert hex_helper.__version__ == APP_VERSION
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "1.4.6"' in pyproject
+    assert f'version = "{APP_VERSION}"' in pyproject

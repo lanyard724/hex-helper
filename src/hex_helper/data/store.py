@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from hex_helper.data.provider import (
@@ -33,6 +33,39 @@ TEAR_ITEM_PAIRS: tuple[tuple[str, str], ...] = (
 TEAR_STACKED_TO_BASE: dict[str, str] = {stacked: base for base, stacked in TEAR_ITEM_PAIRS}
 TEAR_STACKED_IDS: frozenset[str] = frozenset(TEAR_STACKED_TO_BASE.keys())
 _MAYHEM_ITEM_PREFIXES: tuple[str, ...] = ("12", "22", "32", "44", "77", "99")
+_TRINKET_AND_FREE_ITEM_IDS: frozenset[str] = frozenset(
+    {"2052", "2054", "220013", "3340", "3363", "3364", "3330", "3513"}
+)
+_BOOT_ITEM_IDS: frozenset[str] = frozenset(
+    {
+        "1001", "3006", "3009", "3020", "3047", "3111", "3158", "3010", "3013",
+        "3170", "3171", "3172", "3173", "3174", "3175", "3176",
+    }
+)
+_ENCHANTER_SUPPORT_ITEM_IDS: frozenset[str] = frozenset(
+    {"6617", "2526", "2530", "3504", "6616", "3107", "6621", "3222", "6620", "2065", "4011"}
+)
+
+
+def is_complete_equipment_info(info: ItemStaticInfo) -> bool:
+    """Return True if an ItemStaticInfo represents a purchasable completed legendary item (even without item_metadata)."""
+    if info.category == "complete_equipment":
+        return True
+    if info.gold < 2200:
+        return False
+    if not info.name or info.name.startswith("装备#"):
+        return False
+    if info.category in ("boots", "consumable"):
+        return False
+    tags = set(info.tags or ())
+    if tags & {"Boots", "Consumable", "Trinket"}:
+        return False
+    nid = _canonical_item_key(info.item_id)
+    if nid in _BOOT_ITEM_IDS or nid in _TRINKET_AND_FREE_ITEM_IDS or str(info.item_id) in _TRINKET_AND_FREE_ITEM_IDS:
+        return False
+    if info.name.endswith("靴") or info.name.endswith("胫甲"):
+        return False
+    return True
 
 
 def _canonical_item_key(item_id: str | int) -> str:
@@ -153,6 +186,7 @@ class DataStore:
         ad_s = 0.0
         ap_s = 0.0
         tank_s = 0.0
+        sup_s = 0.0
 
         sample_items: list[str] = []
         for cb in core_builds[:2]:
@@ -164,16 +198,29 @@ class DataStore:
         for iid in sample_items:
             info = self.static.get_item_info(iid)
             st = info.stats or {}
-            ad_s += st.get("FlatPhysicalDamageMod", 0.0) * 1.1
-            ad_s += st.get("FlatCritChanceMod", 0.0) * 100.0
-            ap_s += st.get("FlatMagicDamageMod", 0.0) * 0.85
+            tags = set(info.tags or ())
+            nid = _canonical_item_key(iid)
+            ap_v = float(st.get("FlatMagicDamageMod", 0.0) or 0.0)
+            ad_v = float(st.get("FlatPhysicalDamageMod", 0.0) or 0.0)
+            if (nid in _ENCHANTER_SUPPORT_ITEM_IDS) or (
+                ("ManaRegen" in tags or "Heal" in tags) and ap_v <= 75.0 and ad_v <= 0.0 and info.category != "consumable"
+            ):
+                sup_s += 85.0
+                ap_s += ap_v * 0.35
+                tank_s += float(st.get("FlatHPPoolMod", 0.0) or 0.0) * 0.03
+                continue
+            ad_s += ad_v * 1.1
+            ad_s += float(st.get("FlatCritChanceMod", 0.0) or 0.0) * 100.0
+            ap_s += ap_v * 0.85
             tank_s += (
-                st.get("FlatArmorMod", 0.0) * 1.1
-                + st.get("FlatSpellBlockMod", 0.0) * 1.1
-                + st.get("FlatHPPoolMod", 0.0) * 0.10
+                float(st.get("FlatArmorMod", 0.0) or 0.0) * 1.1
+                + float(st.get("FlatSpellBlockMod", 0.0) or 0.0) * 1.1
+                + float(st.get("FlatHPPoolMod", 0.0) or 0.0) * 0.10
             )
 
-        if tank_s >= max(ad_s, ap_s) * 1.15 and tank_s > 60:
+        if sup_s >= max(ad_s, ap_s, tank_s) * 1.05 and sup_s > 45.0:
+            return "SUPPORT"
+        if tank_s >= max(ad_s, ap_s, sup_s) * 1.15 and tank_s > 60:
             return "TANK"
         if ap_s > ad_s * 1.15:
             return "AP"
@@ -632,7 +679,32 @@ class DataStore:
             return dict(self._item_recs.get(str(hero_id)) or {})
 
     def get_item_info(self, item_id: str | int) -> ItemStaticInfo:
-        return self.static.get_item_info(str(item_id))
+        iid = str(item_id).strip()
+        info = self.static.get_item_info(iid)
+        # Fallback to 6-digit Mayhem variant (e.g. 124011 -> 4011 花晓之剑) when base 4-digit ID is absent
+        if info.name.startswith("装备#") and len(iid) == 4 and iid.isdigit():
+            for pfx in _MAYHEM_ITEM_PREFIXES:
+                alt_id = f"{pfx}{iid}"
+                if alt_id in self.static.items:
+                    info = replace(self.static.items[alt_id], item_id=iid)
+                    break
+        # Populate gold from dataset item_metadata if DDragon entry lacked total gold
+        if info.gold <= 0 and not info.name.startswith("装备#"):
+            with self._lock:
+                meta = self._item_meta_raw.get(iid) or self._item_meta_raw.get(info.item_id)
+                if meta is None and len(iid) == 4 and iid.isdigit():
+                    for pfx in _MAYHEM_ITEM_PREFIXES:
+                        meta = self._item_meta_raw.get(f"{pfx}{iid}")
+                        if meta is not None:
+                            break
+            if isinstance(meta, dict):
+                meta_gold = int(meta.get("total") or meta.get("gold") or 0)
+                if meta_gold > 0:
+                    info = replace(info, gold=meta_gold)
+        # Fallback complete_equipment classification for >=2200G non-boot/trinket items missing item_metadata
+        if info.category != "complete_equipment" and is_complete_equipment_info(info):
+            info = replace(info, category="complete_equipment")
+        return info
 
     def get_dataset_item_meta(self) -> dict[str, dict]:
         with self._lock:

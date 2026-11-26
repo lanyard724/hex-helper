@@ -6,7 +6,7 @@
 
 **为《英雄联盟》海克斯大乱斗打造的纯只读 Windows 桌面悬浮窗助手**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.6-C89B3C?style=flat-square)](https://priswebtool.site)
+[![Version](https://img.shields.io/badge/Version-v1.4.7-C89B3C?style=flat-square)](https://priswebtool.site)
 [![Patch](https://img.shields.io/badge/LOL%20CN-26.23-0AC8B9?style=flat-square)](https://priswebtool.site)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-091428?style=flat-square)](https://priswebtool.site)
 [![License](https://img.shields.io/badge/License-MIT-785A28?style=flat-square)](LICENSE)
@@ -39,7 +39,8 @@
 - **云端 AI 实时 10 人参谋**：国内高速直连，开箱即用无需任何复杂配置；开局 5 秒定思路、纠结选卡拍板、阵亡 2 秒按手里精准金币算好先买哪几件散件。
 - **8 向自由拖拽缩放 & 4K 等比放大（v1.4.6）**：左右推荐悬浮窗支持完整 8 方向边角自由拖动调整尺寸，字号、装备图标与卡片间距随窗口真正等比缩放（`0.85x-2.20x`），4K 高分屏首次启动自动匹配清晰倍率，双击缩放把手或设置页一键重置；9 项常用操作支持游戏级自定义改键与冲突一键互换（默认 `F9` 一键收放左右浮窗）。
 - **20 局滚动日志 & 一键问题反馈**：按局切片自动滚动保留最近 20 局运行日志（超 20 局自动清理最旧记录），遇识别异常或报错可一键脱敏压缩回传排查，也可导出本地日志包。
-- **赛后海克斯战报卡**：对局结束自动生成 `760×430` 海克斯风战报图，一键复制直接发给开黑车队。
+- **异步视觉引擎 & Plan B 双通道同步**：独立线程执行硬件采帧、单通空闲 OCR 与 BLAS 向量化图标匹配，彻底解除主线程卡顿；当本地 2999 端口被代理占用时自动降级为视觉 + 手动双同步并保留死亡灰屏自动展开。
+- **赛后海克斯战报卡 v2**：对局结束自动生成 `760×480` 海克斯战报图，内置终局属性面板（AD/AP/HP/AH/双抗/攻速）、硬核战绩（输出占比/承伤/治疗护盾/参团率/经济）、4 枚海克斯真实图标与 S+/MVP 金属评分徽章，一键复制直接发给开黑车队。
 
 <p align="center">
   <img src="docs/assets/preview_recap.png" alt="HexHelper 赛后海克斯战报卡效果" width="760" />

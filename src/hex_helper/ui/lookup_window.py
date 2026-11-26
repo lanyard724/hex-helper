@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QRectF,
     Qt,
     QTimer,
+    Signal,
 )
 from PySide6.QtGui import (
     QBrush,
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSizeGrip,
     QSizePolicy,
     QStackedWidget,
@@ -198,8 +200,121 @@ class _HextechCanvasWidget(QWidget):
         p.end()
 
 
+class HextechDevLabBadge(QPushButton):
+    """LOL V16.23 Hextech-styled topbar badge for local DevLab Flight Recorder status."""
+
+    _IDLE_BORDER = "#785A28"
+    _ACTIVE_BORDER = "#0AC8B9"
+    _TEXT_GOLD = "#C8AA6E"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("◆ LAB REC · 待机", parent)
+        self.setObjectName("HextechDevLabBadge")
+        self.setFixedHeight(26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        font = latin_serif_font(9, bold=True, letter_spacing=0.6)
+        fams = list(font.families())
+        for fallback in ("Microsoft YaHei UI", "Noto Sans SC", "Segoe UI Symbol"):
+            if fallback not in fams:
+                fams.append(fallback)
+        font.setFamilies(fams)
+        self.setFont(font)
+
+        self._recording: bool = False
+        self._apply_style()
+        self.setToolTip("HexHelper DevLab 黑匣子 · 待机中（点击打开录制目录）")
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    @property
+    def indicator_color(self) -> str:
+        return self._ACTIVE_BORDER if self._recording else self._IDLE_BORDER
+
+    def _apply_style(self) -> None:
+        border = self._ACTIVE_BORDER if self._recording else self._IDLE_BORDER
+        hover_border = "#5EEAD4" if self._recording else "#C8AA6E"
+        hover_top = "#062234" if self._recording else "#08182C"
+        self.setStyleSheet(
+            "QPushButton#HextechDevLabBadge {"
+            "  background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #040E1A, stop:1 #091428);"
+            f"  border: 1px solid {border};"
+            "  border-radius: 2px;"
+            f"  color: {self._TEXT_GOLD};"
+            "  padding: 0px 10px 0px 16px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton#HextechDevLabBadge:hover {"
+            f"  background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {hover_top}, stop:1 #091428);"
+            f"  border-color: {hover_border};"
+            "  color: #F0E6D2;"
+            "}"
+        )
+
+    def update_status(self, status: dict[str, Any] | None) -> None:
+        st = status if isinstance(status, dict) else {}
+        seq_raw = st.get("active_match_seq")
+        recording = bool(st.get("recording_match")) or (seq_raw is not None)
+        seq = int(seq_raw or 0)
+        events = max(0, int(st.get("event_count") or 0))
+
+        text = f"◆ REC #{seq:04d} · {events} evt" if recording else "◆ LAB REC · 待机"
+        if recording != self._recording:
+            self._recording = recording
+            self._apply_style()
+            self.update()
+        if self.text() != text:
+            self.setText(text)
+            self.adjustSize()
+
+        q_depth = max(0, int(st.get("queue_depth") or 0))
+        max_q = max(0, int(st.get("max_queue_depth") or 0))
+        dropped_ev = max(0, int(st.get("dropped_events") or 0))
+        dropped_roi = max(0, int(st.get("dropped_roi") or 0))
+        roi_cnt = max(0, int(st.get("roi_count") or 0))
+        roi_cap = max(1, int(st.get("roi_cap") or 15))
+        roi_mb = max(0.0, float(st.get("roi_disk_bytes") or 0.0)) / (1024.0 * 1024.0)
+        disk_mb = max(0.0, float(st.get("disk_bytes") or 0.0)) / (1024.0 * 1024.0)
+        m_cnt = max(0, int(st.get("match_count") or 0))
+        m_max = max(1, int(st.get("max_matches") or 120))
+
+        state_line = f"录制中 #{seq:04d}（{events} evt）" if recording else "待机中"
+        tip = (
+            "HexHelper DevLab 黑匣子（点击打开录制目录）\n"
+            f"状态：{state_line}\n"
+            f"队列水位：{q_depth}（峰值 {max_q}） · 丢弃：{dropped_ev} evt / {dropped_roi} roi\n"
+            f"异常 ROI：{roi_cnt}/{roi_cap}（总计 {roi_mb:.2f} MB / 30 MB）\n"
+            f"磁盘占用：{disk_mb:.2f} MB / 250 MB（已录 {m_cnt}/{m_max} 局）"
+        )
+        if self.toolTip() != tip:
+            self.setToolTip(tip)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        cx = 8.5
+        cy = float(self.height()) * 0.5
+        p.setPen(Qt.PenStyle.NoPen)
+        if self._recording:
+            p.setBrush(QColor(10, 200, 185, 72))
+            p.drawEllipse(QPointF(cx, cy), 4.2, 4.2)
+            p.setBrush(QColor(self._ACTIVE_BORDER))
+        else:
+            p.setBrush(QColor(self._IDLE_BORDER))
+        # Crisp 4px diameter indicator dot (radius = 2.0px)
+        p.drawEllipse(QPointF(cx, cy), 2.0, 2.0)
+        p.end()
+
+
 class LookupWindow(QWidget):
     """Frameless LoL V16.23 Client-inspired main window with custom Hextech controls, fonts & animations."""
+
+    _TAB_NAMES: tuple[str, ...] = ("英雄速查", "特殊流派库", "对局与参谋", "设置与诊断")
+    devlab_badge_clicked = Signal()
 
     def __init__(
         self,
@@ -225,11 +340,18 @@ class LookupWindow(QWidget):
         on_open_hotkeys: Callable[[], None] | None = None,
         on_open_feedback: Callable[[], None] | None = None,
         on_reset_overlay_sizes: Callable[[], None] | None = None,
+        *,
+        devlab_active: bool = False,
+        on_devlab_badge_clicked: Callable[[], None] | None = None,
+        on_search_settled: Callable[[int, int, str], None] | None = None,
+        on_tab_changed: Callable[[int, str], None] | None = None,
+        on_settings_changed: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__()
         init_hextech_fonts()
         self._cfg = cfg
         self._commercial = is_commercial_edition()
+        self._devlab_active = bool(devlab_active and not self._commercial)
         self._on_save_settings = on_save_settings
         self._on_sync_now = on_sync_now
         self._on_open_calibration = on_open_calibration
@@ -251,6 +373,16 @@ class LookupWindow(QWidget):
         self._on_open_hotkeys = on_open_hotkeys
         self._on_open_feedback = on_open_feedback
         self._on_reset_overlay_sizes = on_reset_overlay_sizes
+        self._on_devlab_badge_clicked = on_devlab_badge_clicked
+        self._on_search_settled = on_search_settled
+        self._on_tab_changed = on_tab_changed
+        self._on_settings_changed = on_settings_changed
+        self._search_settle_timer: QTimer | None = None
+        self._pending_search_payload: tuple[int, int, str] | None = None
+        self._last_hero_search_query: str = ""
+        self._last_special_search_query: str = ""
+        self._ui_ready: bool = False
+        self.devlab_badge: HextechDevLabBadge | None = None
         self.tab2_push_btn: HextechActionButton | None = None
         self.hotkeys_summary_lbl: QLabel | None = None
         self.open_hotkeys_btn: HextechActionButton | None = None
@@ -384,13 +516,18 @@ class LookupWindow(QWidget):
 
         # Sculpted LoL Nav Tabs with top golden spotlight cone
         self.nav_btns: list[HextechNavButton] = []
-        for idx, label in enumerate(("英雄速查", "特殊流派库", "对局与参谋", "设置与诊断")):
+        for idx, label in enumerate(self._TAB_NAMES):
             btn = HextechNavButton(label, active=(idx == 0))
             btn.clicked.connect(lambda _=False, i=idx: self._switch_page(i))
             self.nav_btns.append(btn)
             tb.addWidget(btn)
 
         tb.addStretch(1)
+
+        if self._devlab_active:
+            self.devlab_badge = HextechDevLabBadge(self.topbar)
+            self.devlab_badge.clicked.connect(self._handle_devlab_badge_clicked)
+            tb.addWidget(self.devlab_badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
         # Right Summoner-Card Live Status Box (clickable to jump to AI Coach / Claim 450 / Recharge)
         self.status_box = HextechPulseFrame()
@@ -514,6 +651,66 @@ class LookupWindow(QWidget):
         fl.addWidget(grip)
         root.addWidget(footer)
         self.update_hotkeys_display(self._cfg.hotkeys)
+        self._ui_ready = True
+
+    def _handle_devlab_badge_clicked(self) -> None:
+        self.devlab_badge_clicked.emit()
+        if self._on_devlab_badge_clicked is not None:
+            self._on_devlab_badge_clicked()
+
+    def update_devlab_badge(self, status: dict[str, Any] | None) -> None:
+        """Update topbar HextechDevLabBadge text, border state, and quota tooltip (no-op if disabled)."""
+        if self.devlab_badge is None:
+            return
+        self.devlab_badge.update_status(status)
+
+    def get_tracked_scrollbars(self) -> dict[str, QScrollBar]:
+        """Return key internal vertical scrollbars for optional DevLab overflow observation."""
+        result: dict[str, QScrollBar] = {}
+        if hasattr(self, "detail_scroll") and self.detail_scroll is not None:
+            result["lookup.detail"] = self.detail_scroll.verticalScrollBar()
+        if hasattr(self, "coach_history_scroll") and self.coach_history_scroll is not None:
+            result["lookup.coach_history"] = self.coach_history_scroll.verticalScrollBar()
+        return result
+
+    def _schedule_search_settled(self, query_len: int, result_count: int, zero_hit_query: str) -> None:
+        if self._on_search_settled is None:
+            return
+        safe_zero = zero_hit_query[:24] if (result_count == 0 and zero_hit_query) else ""
+        self._pending_search_payload = (max(0, int(query_len)), max(0, int(result_count)), safe_zero)
+        if self._search_settle_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(600)
+            timer.timeout.connect(self._flush_search_settled)
+            self._search_settle_timer = timer
+        self._search_settle_timer.start(600)
+
+    def _flush_search_settled(self) -> None:
+        payload = self._pending_search_payload
+        self._pending_search_payload = None
+        if payload is None or self._on_search_settled is None or self._closed:
+            return
+        self._on_search_settled(*payload)
+
+    def _safe_settings_snapshot(self) -> dict[str, Any]:
+        """Collect only safe boolean/enum setting values (never secrets, API keys, proxy URLs, or paths)."""
+        snap: dict[str, Any] = {
+            "auto_peek_on_death": bool(self._cfg.auto_peek_on_death),
+            "combo_overlay_enabled": bool(self._cfg.combo_overlay_enabled),
+            "force_all_modes": bool(self._cfg.force_all_modes),
+            "auto_trigger_coach": bool(self._cfg.auto_trigger_coach),
+            "auto_first_prismatic_mode": bool(self._cfg.auto_first_prismatic_mode),
+            "smart_picker_ai_gate": bool(self._cfg.smart_picker_ai_gate),
+            "telemetry_enabled": bool(self._cfg.telemetry_enabled),
+            "coach_mode": str(self._cfg.coach_mode or ""),
+            "coach_tier": str(self._cfg.coach_tier or ""),
+        }
+        if not self._commercial:
+            snap["gemini_model"] = str(self._cfg.gemini_model or "")
+            snap["gemini_thinking_level"] = str(self._cfg.gemini_thinking_level or "")
+            snap["gemini_adaptive_thinking"] = bool(self._cfg.gemini_adaptive_thinking)
+        return snap
 
     def _build_lock_all_notice_card(self, section_title: str) -> tuple[HextechInteractiveCard, QLabel, HextechActionButton]:
         card = HextechInteractiveCard("#F59E0B")
@@ -802,6 +999,13 @@ class LookupWindow(QWidget):
             self.special_list.addItem(item)
         if self._special_entries:
             self.special_list.setCurrentRow(0)
+        if self._ui_ready and self._on_search_settled is not None:
+            clean = (text or "").strip()
+            if clean != self._last_special_search_query:
+                self._last_special_search_query = clean
+                if clean:
+                    cnt = len(self._special_entries)
+                    self._schedule_search_settled(len(clean), cnt, clean[:24] if cnt == 0 else "")
 
     def _on_special_selected(self, row: int) -> None:
         if row < 0 or row >= len(self._special_entries):
@@ -1197,7 +1401,10 @@ class LookupWindow(QWidget):
     def _handle_tier_clicked(self, tier: str) -> None:
         raw = (tier or "a").strip().lower()
         norm = raw if raw in ("a", "b", "auto") else "a"
+        prev_tier = self._cfg.coach_tier
         self.set_coach_tier(norm)
+        if self._on_settings_changed is not None and norm != prev_tier:
+            self._on_settings_changed({"coach_tier": norm})
         if self._on_switch_tier:
             self._on_switch_tier(norm)
 
@@ -1830,6 +2037,15 @@ class LookupWindow(QWidget):
         fl.setContentsMargins(16, 12, 16, 12)
         fl.setSpacing(8)
 
+        if not self._commercial:
+            p_row = QHBoxLayout()
+            p_lbl = QLabel("本地代理地址（留空直连）：")
+            p_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E;")
+            self.proxy_edit = QLineEdit(self._cfg.proxy_url)
+            p_row.addWidget(p_lbl)
+            p_row.addWidget(self.proxy_edit, 1)
+            fl.addLayout(p_row)
+
         lf_row = QHBoxLayout()
         lf_lbl = QLabel("《英雄联盟》客户端 / lockfile 路径：" if self._commercial else "国服 LeagueClient lockfile 路径：")
         lf_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E;")
@@ -2013,6 +2229,9 @@ class LookupWindow(QWidget):
         self.pages.setCurrentIndex(idx)
         for i, btn in enumerate(self.nav_btns):
             btn.set_active(i == idx)
+        if self._on_tab_changed is not None:
+            tab_name = self._TAB_NAMES[idx] if 0 <= idx < len(self._TAB_NAMES) else str(idx)
+            self._on_tab_changed(idx, tab_name)
         # Smooth OutCubic fade-in transition on page change
         w = self.pages.currentWidget()
         if w is not None:
@@ -2229,6 +2448,13 @@ class LookupWindow(QWidget):
             if cached_pm is not None:
                 item.setIcon(QIcon(cached_pm))
             self.hero_list.addItem(item)
+        if self._ui_ready and self._on_search_settled is not None:
+            clean = (query or "").strip()
+            if clean != self._last_hero_search_query:
+                self._last_hero_search_query = clean
+                if clean:
+                    cnt = self.hero_list.count()
+                    self._schedule_search_settled(len(clean), cnt, clean[:24] if cnt == 0 else "")
 
     def _clear_detail(self) -> None:
         old = self.detail_scroll.takeWidget()
@@ -2591,9 +2817,15 @@ class LookupWindow(QWidget):
             self.lockfile_edit.setText(path)
 
     def _save_clicked(self) -> None:
+        before = self._safe_settings_snapshot() if self._on_settings_changed is not None else None
         cfg = self._collect_cfg_from_ui()
         if self._on_save_settings:
             self._on_save_settings(cfg)
+        if before is not None and self._on_settings_changed is not None:
+            after = self._safe_settings_snapshot()
+            changed = {k: after[k] for k in after if before.get(k) != after.get(k)}
+            if changed:
+                self._on_settings_changed(changed)
         if not self._commercial and self.gemini_conn_status_lbl is not None:
             self.gemini_conn_status_lbl.setText(self._format_initial_key_hint())
             color = "#09C269" if cfg.resolved_gemini_api_key() else "#0AC8B9"
@@ -2601,6 +2833,8 @@ class LookupWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._closed = True
+        if self._search_settle_timer is not None and self._search_settle_timer.isActive():
+            self._search_settle_timer.stop()
         super().closeEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802

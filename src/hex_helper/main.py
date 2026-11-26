@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import inspect
 import json
 import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 from hex_helper.config import get_app_data_dir, load_config, save_config
+from hex_helper.edition import is_commercial_edition, is_devlab_allowed
 from hex_helper.logging_ring import install_match_log_handler
 from hex_helper.setup.preflight import run_windows_preflight
 
@@ -84,7 +87,11 @@ def _run_preflight_cli(report_out: str | None) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HexHelper - ARAM Mayhem overlay assistant")
     parser.add_argument("--minimized", action="store_true", help="Start minimized to system tray")
     parser.add_argument(
@@ -102,10 +109,47 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip the first-run setup wizard dialog on startup",
     )
+    parser.add_argument(
+        "--devlab",
+        action="store_true",
+        help="Enable local DevLab flight recorder (non-commercial dev builds only)",
+    )
+    parser.add_argument(
+        "--devlab-roi-snapshots",
+        action="store_true",
+        help="Enable bounded anomaly ROI crop snapshots in DevLab mode",
+    )
+    parser.add_argument(
+        "--devlab-debug",
+        action="store_true",
+        help="Enable isolated per-match DEBUG runtime log in DevLab mode",
+    )
+    return parser
+
+
+def resolve_devlab_flags(args: argparse.Namespace) -> dict[str, bool]:
+    """Resolve effective DevLab flags, unconditionally returning False in commercial builds."""
+    if is_commercial_edition() or not is_devlab_allowed():
+        return {
+            "devlab": False,
+            "devlab_roi_snapshots": False,
+            "devlab_debug": False,
+        }
+    return {
+        "devlab": bool(getattr(args, "devlab", False)) or _env_truthy("HEX_DEVLAB"),
+        "devlab_roi_snapshots": bool(getattr(args, "devlab_roi_snapshots", False)) or _env_truthy("HEX_DEVLAB_ROI"),
+        "devlab_debug": bool(getattr(args, "devlab_debug", False)) or _env_truthy("HEX_DEVLAB_DEBUG"),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
 
     if args.preflight_check_only:
         return _run_preflight_cli(args.preflight_report_out or None)
+
+    devlab_flags = resolve_devlab_flags(args)
 
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication, QDialog
@@ -149,7 +193,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     try:
-        controller = HexHelperController(qt_app, show_lookup_on_start=not args.minimized)
+        controller_kwargs: dict[str, Any] = {"show_lookup_on_start": not args.minimized}
+        if not is_commercial_edition() and is_devlab_allowed():
+            if devlab_flags["devlab"]:
+                os.environ["HEX_DEVLAB"] = "1"
+            if devlab_flags["devlab_roi_snapshots"]:
+                os.environ["HEX_DEVLAB_ROI"] = "1"
+            if devlab_flags["devlab_debug"]:
+                os.environ["HEX_DEVLAB_DEBUG"] = "1"
+            sig_params = inspect.signature(HexHelperController.__init__).parameters
+            if "devlab_enabled" in sig_params:
+                controller_kwargs["devlab_enabled"] = devlab_flags["devlab"]
+            if "devlab_roi_snapshots" in sig_params:
+                controller_kwargs["devlab_roi_snapshots"] = devlab_flags["devlab_roi_snapshots"]
+            if "devlab_debug_log" in sig_params:
+                controller_kwargs["devlab_debug_log"] = devlab_flags["devlab_debug"]
+        controller = HexHelperController(qt_app, **controller_kwargs)
         port_info = controller.bridge.bound_port if controller.bridge is not None else "cloud"
         logger.info("HexHelper started successfully (mode=%s)", port_info)
     except Exception as exc:

@@ -624,11 +624,34 @@ class CloudGatewayClient:
             raise CloudCoachError(code, resp.status_code, msg, wallet, extra)
         return _safe_json(resp)
 
-    def create_order(self, package_id: str, channel: str) -> dict[str, Any]:
+    def create_order(
+        self,
+        package_id: str,
+        channel: str,
+        *,
+        defer_notify: bool = True,
+    ) -> dict[str, Any]:
         resp, gen_before = self._request_with_auth(
             "POST",
             "/v1/orders/create",
-            json={"package_id": package_id, "channel": channel},
+            json={
+                "package_id": package_id,
+                "channel": channel,
+                "defer_notify": bool(defer_notify),
+            },
+        )
+        if resp.status_code != 200:
+            code, msg, wallet, extra = _parse_error_payload(resp)
+            if resp.status_code == 401:
+                self._clear_local_session(expected_gen=gen_before)
+                raise CloudCoachError("NOT_LOGGED_IN", 401, "登录状态已失效，请重新登录", wallet, extra)
+            raise CloudCoachError(code, resp.status_code, msg, wallet, extra)
+        return _safe_json(resp)
+
+    def notify_order_paid(self, order_no: str) -> dict[str, Any]:
+        resp, gen_before = self._request_with_auth(
+            "POST",
+            f"/v1/orders/{order_no}/notify-paid",
         )
         if resp.status_code != 200:
             code, msg, wallet, extra = _parse_error_payload(resp)

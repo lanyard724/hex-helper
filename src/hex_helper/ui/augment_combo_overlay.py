@@ -10,9 +10,9 @@ Strictly decoupled from the Bayesian win-rate AugmentBadgesOverlay:
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QPoint, QRect, Qt, QVariantAnimation
+from PySide6.QtCore import QEasingCurve, QPoint, QRect, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QMouseEvent, QScreen
 from PySide6.QtWidgets import (
     QFrame,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -79,6 +80,9 @@ def _clear_layout(layout) -> None:
 class AugmentComboOverlay(QWidget):
     """Independent left-edge Hextech dual-mode augment combo & anti-synergy floating HUD."""
 
+    geometry_changed = Signal(dict)
+    subcard_action = Signal(str, str, dict)
+
     COLLAPSED_W = 48
     COLLAPSED_MIN_H = 152
     EXPANDED_W = 316
@@ -96,6 +100,8 @@ class AugmentComboOverlay(QWidget):
         on_size_changed: Callable[[list[int] | None], None] | None = None,
         on_scale_changed: Callable[[float | None], None] | None = None,
         on_closed_by_user: Callable[[], None] | None = None,
+        on_geometry_changed: Callable[[dict[str, Any]], None] | None = None,
+        on_subcard_action: Callable[[str, str, dict[str, Any]], None] | None = None,
         initial_pos: list[int] | None = None,
         initial_size: list[int] | None = None,
         initial_scale: float | None = None,
@@ -106,6 +112,9 @@ class AugmentComboOverlay(QWidget):
         self._on_size_changed = on_size_changed
         self._on_scale_changed = on_scale_changed
         self._on_closed_by_user = on_closed_by_user
+        self._on_geometry_changed = on_geometry_changed
+        self._on_subcard_action = on_subcard_action
+        self._gesture_start_norm_rect: list[float] | None = None
         self._y_ratio = y_ratio
         self._target_screen: QScreen | None = None
         self._custom_pos: QPoint | None = (
@@ -129,7 +138,12 @@ class AugmentComboOverlay(QWidget):
         self._applied_ui_scale: float = 0.0
         self._last_rendered_w: int = self._custom_w or self.EXPANDED_W
         self._drag_offset: QPoint | None = None
+        self._drag_press_global: QPoint | None = None
+        self._did_drag: bool = False
         self._anchor_left: bool = self._infer_initial_anchor_left(self._custom_pos)
+        self._anchor_right: bool = (
+            False if self._anchor_left else self._infer_initial_anchor_right(self._custom_pos)
+        )
         self._expanded: bool = False
         self._pre_picker_expanded: bool | None = None
         self._mode: str = "plan"  # "plan" | "picker"
@@ -200,7 +214,7 @@ class AugmentComboOverlay(QWidget):
         self.pill_expand_btn = HextechActionButton("展", variant="cyan", height=24)
         self.pill_expand_btn.setFixedWidth(36)
         self.pill_expand_btn.setMinimumWidth(36)
-        self.pill_expand_btn.clicked.connect(lambda: self.set_expanded(True))
+        self.pill_expand_btn.clicked.connect(self._user_expand)
 
         pill_lay.addWidget(self.pill_close_btn, alignment=Qt.AlignmentFlag.AlignRight)
         pill_lay.addWidget(self.pill_crest_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -235,7 +249,7 @@ class AugmentComboOverlay(QWidget):
 
         self.collapse_btn = HextechActionButton("收起", variant="gold", height=22)
         self.collapse_btn.setMinimumWidth(38)
-        self.collapse_btn.clicked.connect(lambda: self.set_expanded(False))
+        self.collapse_btn.clicked.connect(self._user_collapse)
 
         self.close_btn = QPushButton("×")
         self.close_btn.setFixedSize(18, 18)
@@ -595,9 +609,23 @@ class AugmentComboOverlay(QWidget):
                 rb_h = self.reroll_banner.heightForWidth(inner_w)
                 row_sum += max(rb_h if rb_h > 0 else self.reroll_banner.sizeHint().height(), m.px(28)) + row_sp
             active_hint = max(active_hint, row_sum)
-        body_hint_h = active_hint if active_hint > 0 else self.panel_body.sizeHint().height()
+        else:
+            pl = self.plan_wrap.layout()
+            if pl is not None:
+                p_sp = max(0, pl.spacing())
+                plan_sum = 0
+                vis_cnt = 0
+                for i in range(pl.count()):
+                    cw = pl.itemAt(i).widget()
+                    if cw is not None and not cw.isHidden():
+                        hfw = cw.heightForWidth(inner_w)
+                        ch = max(hfw if hfw > 0 else 0, cw.sizeHint().height(), cw.minimumSizeHint().height())
+                        plan_sum += ch + (p_sp if vis_cnt > 0 else 0)
+                        vis_cnt += 1
+                active_hint = max(active_hint, plan_sum)
+        body_hint_h = max(active_hint, self.panel_body.sizeHint().height())
         chrome_h = m.px(66)
-        extra_pad = m.px(32) if self._mode == "picker" else m.px(20)
+        extra_pad = m.px(32) if self._mode == "picker" else m.px(24)
         return min(geo.height() - 48, max(self.EXPANDED_MIN_H, chrome_h + body_hint_h + extra_pad))
 
     def _invalidate_expanded_layouts(self) -> None:
@@ -629,18 +657,104 @@ class AugmentComboOverlay(QWidget):
         elif self._last_plan is not None:
             self._rebuild_plan_targets(self._last_plan)
 
+    def get_tracked_scrollbars(self) -> dict[str, QScrollBar]:
+        """Return key internal vertical scrollbars for optional DevLab overflow observation."""
+        return {"combo_overlay.panel": self.panel_scroll.verticalScrollBar()}
+
+    def _emit_subcard_action(
+        self,
+        card: str,
+        action: str,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        payload = dict(meta) if isinstance(meta, dict) else {}
+        self.subcard_action.emit(card, action, payload)
+        if self._on_subcard_action is not None:
+            self._on_subcard_action(card, action, payload)
+
+    def _user_expand(self) -> None:
+        self.set_expanded(True)
+        self._emit_subcard_action("combo_panel", "expand", {"expanded": True, "mode": self._mode})
+
+    def _user_collapse(self) -> None:
+        self.set_expanded(False)
+        self._emit_subcard_action("combo_panel", "collapse", {"expanded": False, "mode": self._mode})
+
+    def _user_toggle_expanded(self) -> None:
+        target = not self._expanded
+        self.set_expanded(target)
+        self._emit_subcard_action(
+            "combo_panel",
+            "expand" if target else "collapse",
+            {"expanded": target, "mode": self._mode},
+        )
+
+    def _capture_norm_rect(self) -> tuple[list[float], QRect, int, int, float]:
+        screens = list(QGuiApplication.screens())
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
+        if screen is not None:
+            geo = screen.geometry()
+            dpr = max(1.0, float(screen.devicePixelRatio() or 1.0))
+            try:
+                screen_idx = screens.index(screen)
+            except ValueError:
+                screen_idx = 0
+        else:
+            geo = QRect(0, 0, 1920, 1080)
+            dpr = 1.0
+            screen_idx = 0
+        sw = max(1, geo.width())
+        sh = max(1, geo.height())
+        norm = [
+            round((self.x() - geo.x()) / sw, 4),
+            round((self.y() - geo.y()) / sh, 4),
+            round(self.width() / sw, 4),
+            round(self.height() / sh, 4),
+        ]
+        return norm, geo, screen_idx, max(1, len(screens)), dpr
+
+    def _emit_geometry_changed(self, action: str) -> None:
+        norm, geo, screen_idx, screen_cnt, dpr = self._capture_norm_rect()
+        prev_norm = self._gesture_start_norm_rect
+        self._gesture_start_norm_rect = None
+        saved_size = [int(self._custom_w), int(self._custom_h or 0)] if self._custom_w is not None else None
+        saved_scale = round(float(self._ui_scale), 3) if self._custom_w is not None else None
+        saved_pos = [int(self._custom_pos.x()), int(self._custom_pos.y())] if self._custom_pos is not None else None
+        payload: dict[str, Any] = {
+            "overlay": "combo_overlay",
+            "action": action,
+            "x": int(self.x()),
+            "y": int(self.y()),
+            "width": int(self.width()),
+            "height": int(self.height()),
+            "pos": saved_pos,
+            "size": saved_size,
+            "scale": saved_scale,
+            "expanded": bool(self._expanded),
+            "snapped_edge": "left" if self._anchor_left else ("right" if self._anchor_right else "detached"),
+            "screen_rect": [int(geo.x()), int(geo.y()), int(geo.width()), int(geo.height())],
+            "screen_index": int(screen_idx),
+            "screen_count": int(screen_cnt),
+            "dpr": round(float(dpr), 3),
+            "norm_rect": norm,
+            "prev_norm_rect": prev_norm,
+        }
+        self.geometry_changed.emit(payload)
+        if self._on_geometry_changed is not None:
+            self._on_geometry_changed(payload)
+
     def _on_live_resize(self, target: QRect, edge: str) -> None:
+        if self._gesture_start_norm_rect is None:
+            self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
         has_v = ("t" in edge) or ("b" in edge)
-        h_for_scale = max(self.EXPANDED_MIN_H, target.height()) if (has_v or self._custom_h is not None) else None
+        is_corner = ("l" in edge or "r" in edge) and has_v
         self._custom_w = w
-        if has_v:
-            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
 
+        h_for_scale = max(self.EXPANDED_MIN_H, target.height()) if (has_v and not is_corner) else None
         new_scale = self._compute_scale_for_rect(w, h_for_scale)
         scale_changed = self._apply_ui_scale(new_scale, force=False)
         self._apply_header_density(w)
-        inner_w = max(180, w - self._px(22))
         self.panel.setFixedWidth(w)
         self.panel_body.setMinimumWidth(0)
         self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
@@ -650,14 +764,24 @@ class AugmentComboOverlay(QWidget):
             self._rebuild_dynamic_sections()
 
         self._invalidate_expanded_layouts()
+        screen = self._active_screen()
+        geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+        auto_h = self._compute_auto_expanded_height(w, geo)
+        max_allowed_h = max(self.EXPANDED_MIN_H, geo.height() - 32)
+        if is_corner:
+            # Corner resize scales width & typography without locking _custom_h below content
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height()) if target.height() > auto_h + 12 else None
+        elif has_v:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
         if self._custom_h is not None:
-            h = max(self.EXPANDED_MIN_H, self._custom_h)
-            y = target.y()
+            h = min(max_allowed_h, max(self.EXPANDED_MIN_H, self._custom_h, auto_h))
         else:
-            screen = self._active_screen()
-            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
-            h = self._compute_auto_expanded_height(w, geo)
-            y = max(geo.top() + 12, min(geo.bottom() - h - 12, target.y()))
+            h = auto_h
+        if "t" in edge:
+            raw_y = target.y() + target.height() - h
+        else:
+            raw_y = target.y()
+        y = max(geo.top() + 12, min(geo.bottom() - h - 12, raw_y))
 
         self.setFixedWidth(w)
         self.setFixedHeight(h)
@@ -668,14 +792,14 @@ class AugmentComboOverlay(QWidget):
     def _on_resize_finished(self, target: QRect, edge: str) -> None:
         w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
         has_v = ("t" in edge) or ("b" in edge)
+        is_corner = ("l" in edge or "r" in edge) and has_v
         self._custom_w = w
-        if has_v:
-            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
 
-        final_scale = self._compute_scale_for_rect(w, self._custom_h)
+        final_scale = self._compute_scale_for_rect(
+            w, max(self.EXPANDED_MIN_H, target.height()) if (has_v and not is_corner) else None
+        )
         need_rebuild = self._apply_ui_scale(final_scale, force=True) or (self._custom_w != self._last_rendered_w)
         self._apply_header_density(w)
-        inner_w = max(180, w - self._px(22))
         self.panel.setFixedWidth(w)
         self.panel_body.setMinimumWidth(0)
         self.panel_body.setMaximumWidth(self._QWIDGETSIZE_MAX)
@@ -684,22 +808,49 @@ class AugmentComboOverlay(QWidget):
             self._rebuild_dynamic_sections()
         self._invalidate_expanded_layouts()
 
-        if self._custom_h is None:
-            screen = self._active_screen()
-            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
-            h = self._compute_auto_expanded_height(w, geo)
-            y = max(geo.top() + 12, min(geo.bottom() - h - 12, self.y()))
-            self.setFixedHeight(h)
-            self.panel.setFixedHeight(h)
-            self.setGeometry(self.x(), y, w, h)
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
+        geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+        auto_h = self._compute_auto_expanded_height(w, geo)
+        max_allowed_h = max(self.EXPANDED_MIN_H, geo.height() - 32)
+        if is_corner:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height()) if target.height() > auto_h + 12 else None
+        elif has_v:
+            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+        if self._custom_h is not None:
+            h = min(max_allowed_h, max(self.EXPANDED_MIN_H, self._custom_h, auto_h))
+        else:
+            h = auto_h
+        if "t" in edge:
+            raw_y = target.y() + target.height() - h
+        else:
+            raw_y = self.y()
+        y = max(geo.top() + 12, min(geo.bottom() - h - 12, raw_y))
+        self.setFixedWidth(w)
+        self.setFixedHeight(h)
+        self.panel.setFixedHeight(h)
+        self.setGeometry(self.x(), y, w, h)
         self._layout_corner_grips()
 
-        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
         if screen is not None:
             self._target_screen = screen
-            geo = screen.geometry()
-            self._anchor_left = (self.x() - geo.left()) <= 28
-            self._custom_pos = QPoint(geo.left(), self.y()) if self._anchor_left else self.pos()
+            snap_tol = self._edge_snap_tolerance(geo)
+            dist_l = self.x() - geo.left()
+            dist_r = geo.right() - (self.x() + self.width())
+            if dist_l <= snap_tol and dist_l <= dist_r:
+                self._anchor_left = True
+                self._anchor_right = False
+                self.move(geo.left(), self.y())
+                self._custom_pos = QPoint(geo.left(), self.y())
+            elif dist_r <= snap_tol:
+                self._anchor_left = False
+                self._anchor_right = True
+                snapped_x = geo.right() - self.width() + 1
+                self.move(snapped_x, self.y())
+                self._custom_pos = QPoint(geo.right() - self.COLLAPSED_W + 1, self.y())
+            else:
+                self._anchor_left = False
+                self._anchor_right = False
+                self._custom_pos = self.pos()
         if self._on_size_changed:
             saved_h = self._custom_h if self._custom_h is not None else 0
             self._on_size_changed([self._custom_w, saved_h])
@@ -707,8 +858,10 @@ class AugmentComboOverlay(QWidget):
             self._on_scale_changed(round(self._ui_scale, 3))
         if self._on_pos_changed and self._custom_pos is not None:
             self._on_pos_changed([self._custom_pos.x(), self._custom_pos.y()])
+        self._emit_geometry_changed("resize")
 
     def reset_default_size(self) -> None:
+        self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         self._custom_w = None
         self._custom_h = None
         self._applied_ui_scale = 0.0
@@ -719,6 +872,7 @@ class AugmentComboOverlay(QWidget):
             self._on_size_changed(None)
         if self._on_scale_changed:
             self._on_scale_changed(None)
+        self._emit_geometry_changed("reset_size")
 
     @property
     def is_expanded(self) -> bool:
@@ -742,6 +896,10 @@ class AugmentComboOverlay(QWidget):
         parts.append("拖动调位")
         self.pill.setToolTip(" · ".join(parts))
 
+    @staticmethod
+    def _edge_snap_tolerance(geo: QRect) -> int:
+        return max(72, int(geo.width() * 0.05))
+
     @classmethod
     def _infer_initial_anchor_left(cls, pos: QPoint | None) -> bool:
         if pos is None:
@@ -750,7 +908,21 @@ class AugmentComboOverlay(QWidget):
         if screen is None:
             return False
         geo = screen.geometry()
-        return (pos.x() - geo.left()) <= 32
+        return (pos.x() - geo.left()) <= cls._edge_snap_tolerance(geo)
+
+    @classmethod
+    def _infer_initial_anchor_right(cls, pos: QPoint | None) -> bool:
+        if pos is None:
+            return False
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return False
+        geo = screen.geometry()
+        tol = cls._edge_snap_tolerance(geo)
+        ix = pos.x()
+        near_collapsed_right = (geo.right() - (ix + cls.COLLAPSED_W)) <= tol
+        near_expanded_right = abs(ix - (geo.right() - cls.EXPANDED_W + 1)) <= tol
+        return near_collapsed_right or near_expanded_right
 
     @classmethod
     def compute_expanded_width(
@@ -805,10 +977,12 @@ class AugmentComboOverlay(QWidget):
                 self._last_rendered_w = w
                 self._rebuild_dynamic_sections()
             self._invalidate_expanded_layouts()
+            auto_h = self._compute_auto_expanded_height(w, geo)
             if self._custom_h is not None and override_logical_width is None:
-                h = min(geo.height() - 32, max(self.EXPANDED_MIN_H, self._custom_h))
+                max_allowed_h = max(self.EXPANDED_MIN_H, geo.height() - 32)
+                h = min(max_allowed_h, max(self.EXPANDED_MIN_H, self._custom_h, auto_h))
             else:
-                h = self._compute_auto_expanded_height(w, geo)
+                h = auto_h
             if self.panel.height() != h or self.panel.minimumHeight() != h or self.panel.maximumHeight() != h:
                 self.panel.setFixedHeight(h)
         else:
@@ -827,16 +1001,27 @@ class AugmentComboOverlay(QWidget):
             if self.pill.height() != h or self.pill.minimumHeight() != h or self.pill.maximumHeight() != h:
                 self.pill.setFixedHeight(h)
 
-        if self._custom_pos is not None and not self._anchor_left:
-            x = max(geo.left(), min(geo.right() - w + 1, self._custom_pos.x()))
-            y = max(geo.top(), min(geo.bottom() - h + 1, self._custom_pos.y()))
-        else:
+        if self._anchor_left:
             y_base = (
                 self._custom_pos.y()
                 if self._custom_pos is not None
                 else int(geo.top() + geo.height() * self._y_ratio)
             )
             y = max(geo.top() + 16, min(geo.bottom() - h - 16, y_base))
+            x = geo.left()
+        elif self._anchor_right:
+            y_base = (
+                self._custom_pos.y()
+                if self._custom_pos is not None
+                else int(geo.top() + geo.height() * self._y_ratio)
+            )
+            y = max(geo.top() + 16, min(geo.bottom() - h - 16, y_base))
+            x = geo.right() - w + 1
+        elif self._custom_pos is not None:
+            x = max(geo.left(), min(geo.right() - w + 1, self._custom_pos.x()))
+            y = max(geo.top(), min(geo.bottom() - h + 1, self._custom_pos.y()))
+        else:
+            y = max(geo.top() + 16, min(geo.bottom() - h - 16, int(geo.top() + geo.height() * self._y_ratio)))
             x = geo.left()
         target_rect = QRect(x, y, w, h)
         if self.minimumWidth() != w or self.maximumWidth() != w:
@@ -849,16 +1034,19 @@ class AugmentComboOverlay(QWidget):
             self._layout_corner_grips()
 
     def _close_by_user(self) -> None:
-        self.hide()
         if self._on_closed_by_user:
             self._on_closed_by_user()
+        self.hide()
 
     def reset_to_left_edge(self) -> None:
+        self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         self._custom_pos = None
         self._anchor_left = True
+        self._anchor_right = False
         self._reposition()
         if self._on_pos_changed:
             self._on_pos_changed([self.x(), self.y()])
+        self._emit_geometry_changed("reset_edge")
 
     def _on_slide_width(self, val) -> None:
         w = max(self.COLLAPSED_W, int(val))
@@ -875,18 +1063,59 @@ class AugmentComboOverlay(QWidget):
             return min(self._custom_w, max(self.MIN_EXPANDED_W, geo.width() - 24))
         return self._custom_w or auto_w
 
+    def _apply_anti_strand_on_collapse(self, *, was_expanded: bool, prev_left: int, prev_right: int) -> None:
+        """Prevent 48px collapsed pill from stranding in mid-screen when collapsing while un-anchored."""
+        if not was_expanded or self._anchor_left or self._anchor_right:
+            return
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
+        if screen is None:
+            return
+        geo = screen.geometry()
+        sw = float(max(1, geo.width()))
+        right_ratio = (prev_right - geo.left()) / sw
+        left_ratio = (prev_left - geo.left()) / sw
+        if right_ratio >= 0.65:
+            self._anchor_right = True
+            self._anchor_left = False
+            self._custom_pos = QPoint(geo.right() - self.COLLAPSED_W + 1, self.y())
+        elif left_ratio <= 0.35:
+            self._anchor_left = True
+            self._anchor_right = False
+            self._custom_pos = QPoint(geo.left(), self.y())
+        else:
+            aligned_x = max(geo.left(), min(geo.right() - self.COLLAPSED_W + 1, prev_right - self.COLLAPSED_W))
+            self._custom_pos = QPoint(aligned_x, self.y())
+
     def set_expanded(self, expanded: bool) -> None:
         was_visible = self.isVisible()
+        was_expanded = self._expanded
+        prev_left = self.x()
+        prev_right = self.x() + self.width()
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
-        self._expanded = bool(expanded)
+        target_exp = bool(expanded)
+        self._expanded = target_exp
         if self._mode == "picker" and not self._expanded:
             # Respect manual collapse during picker so exit_picker_mode never ghost re-expands
             self._pre_picker_expanded = False
-        self.pill.setVisible(not self._expanded)
-        self.panel.setVisible(self._expanded)
-        # Single-frame snap avoids 60fps WS_EX_LAYERED resize DWM stalls
-        self._reposition()
+        if target_exp:
+            self.setUpdatesEnabled(False)
+            try:
+                self.pill.hide()
+                self._reposition()
+                self.panel.show()
+                self._reposition()
+            finally:
+                self.setUpdatesEnabled(True)
+        else:
+            self._apply_anti_strand_on_collapse(was_expanded=was_expanded, prev_left=prev_left, prev_right=prev_right)
+            self.setUpdatesEnabled(False)
+            try:
+                self.panel.hide()
+                self.pill.show()
+                self._reposition()
+            finally:
+                self.setUpdatesEnabled(True)
         if was_visible:
             show_no_activate(self, click_through=False)
 
@@ -927,13 +1156,17 @@ class AugmentComboOverlay(QWidget):
                 return
             header_drag_h = self._px(38, floor=34)
             if (not self._expanded) or event.position().y() <= header_drag_h:
-                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                self._gesture_start_norm_rect = self._capture_norm_rect()[0]
+                gpos = event.globalPosition().toPoint()
+                self._drag_press_global = gpos
+                self._drag_offset = gpos - self.frameGeometry().topLeft()
+                self._did_drag = False
                 event.accept()
                 return
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
             a_toggle = QAction("收起成小条" if self._expanded else "展开联动面板", menu)
-            a_toggle.triggered.connect(self.toggle_expanded)
+            a_toggle.triggered.connect(self._user_toggle_expanded)
             a_reset_size = QAction("恢复默认尺寸（适配屏幕）", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_reset = QAction("复位到屏幕左侧", menu)
@@ -953,15 +1186,24 @@ class AugmentComboOverlay(QWidget):
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and not self._expanded:
             self._drag_offset = None
-            self.set_expanded(True)
+            self._drag_press_global = None
+            self._did_drag = False
+            self._gesture_start_norm_rect = None
+            self._user_expand()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_offset is not None:
-            screen = QGuiApplication.screenAt(event.globalPosition().toPoint()) or self._active_screen()
-            pos = event.globalPosition().toPoint() - self._drag_offset
+            gpos = event.globalPosition().toPoint()
+            if not self._did_drag:
+                if self._drag_press_global is None or (gpos - self._drag_press_global).manhattanLength() < 4:
+                    event.accept()
+                    return
+                self._did_drag = True
+            screen = QGuiApplication.screenAt(gpos) or self._active_screen()
+            pos = gpos - self._drag_offset
             if screen is not None:
                 geo = screen.geometry()
                 pos.setX(max(geo.left(), min(geo.right() - self.width() + 1, pos.x())))
@@ -973,22 +1215,43 @@ class AugmentComboOverlay(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_offset is not None:
+            did_drag = self._did_drag
             self._drag_offset = None
+            self._drag_press_global = None
+            self._did_drag = False
+            if not did_drag:
+                self._gesture_start_norm_rect = None
+                event.accept()
+                return
             screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
             if screen is not None:
                 self._target_screen = screen
                 geo = screen.geometry()
-                self._anchor_left = (self.x() - geo.left()) <= 28
-                if self._anchor_left:
+                snap_tol = self._edge_snap_tolerance(geo)
+                dist_l = self.x() - geo.left()
+                dist_r = geo.right() - (self.x() + self.width())
+                if dist_l <= snap_tol and dist_l <= dist_r:
+                    self._anchor_left = True
+                    self._anchor_right = False
                     self.move(geo.left(), self.y())
                     self._custom_pos = QPoint(geo.left(), self.y())
+                elif dist_r <= snap_tol:
+                    self._anchor_left = False
+                    self._anchor_right = True
+                    snapped_x = geo.right() - self.width() + 1
+                    self.move(snapped_x, self.y())
+                    self._custom_pos = QPoint(geo.right() - self.COLLAPSED_W + 1, self.y())
                 else:
+                    self._anchor_left = False
+                    self._anchor_right = False
                     self._custom_pos = self.pos()
             else:
                 self._anchor_left = False
+                self._anchor_right = False
                 self._custom_pos = self.pos()
             if self._on_pos_changed:
                 self._on_pos_changed([self._custom_pos.x(), self._custom_pos.y()])
+            self._emit_geometry_changed("drag")
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1190,9 +1453,14 @@ class AugmentComboOverlay(QWidget):
             self.reroll_banner.hide()
 
         self._expanded = True
-        self.pill.hide()
-        self.panel.show()
-        self._reposition()
+        self.setUpdatesEnabled(False)
+        try:
+            self.pill.hide()
+            self._reposition()
+            self.panel.show()
+            self._reposition()
+        finally:
+            self.setUpdatesEnabled(True)
         if not self._full_locked and self.isVisible():
             show_no_activate(self, click_through=False)
 

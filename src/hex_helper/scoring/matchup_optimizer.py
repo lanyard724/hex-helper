@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Sequence
 
+from hex_helper.data.augment_combos import get_augment_combo_db
 from hex_helper.data.hero_signatures import get_hero_signature_db
 from hex_helper.data.provider import ItemRecStat, ItemStaticInfo
 from hex_helper.data.store import DataStore
@@ -58,12 +60,31 @@ SHIELD_ITEM_IDS = {
 S16_ITEM_IDS = frozenset(
     {"2517", "2510", "6697", "3430", "2512", "2523", "4011", "2526", "2524", "2525"}
 )
+ENCHANTER_SUPPORT_ITEM_IDS: frozenset[str] = frozenset(
+    {
+        "6617",  # 月石再生器
+        "2526",  # 耳语头环
+        "2530",  # 歌之权冠
+        "3504",  # 炽热香炉
+        "6616",  # 流水法杖
+        "3107",  # 救赎
+        "6621",  # 黎明核心
+        "3222",  # 米凯尔的祝福
+        "6620",  # 海力亚的回响
+        "2065",  # 舒瑞娅的战歌
+        "4011",  # 花晓之剑
+    }
+)
+_HYBRID_BRIDGE_AUGMENT_IDS: frozenset[str] = frozenset({"1054", "1029", "1129"})
+_MAYHEM_ITEM_PREFIXES: tuple[str, ...] = ("12", "22", "32", "44", "77", "99")
 
 # Curated situational counter items per damage profile (only added when threat triggers)
 PROFILE_COUNTER_ITEMS: dict[str, tuple[str, ...]] = {
     "AD": ("3033", "3036", "3153", "3156", "3091", "6695", "3139", "6333", "3026", "3123"),
     "AP": ("3165", "3135", "3137", "6653", "4645", "3157", "3102", "3916"),
     "TANK": ("3075", "2504", "4401", "3143", "3110", "3065", "3084", "2502"),
+    "SUPPORT": ("6617", "2526", "3107", "3222", "3504", "6616", "6621", "4011", "3165", "3916", "3190", "3157"),
+    "HYBRID": ("3153", "3115", "6653", "3165", "3033", "3157", "3091", "3156", "6333", "3102"),
 }
 
 ARMOR_PEN_ITEMS = {"3036", "3033", "3071", "6694", "3035"}
@@ -75,8 +96,8 @@ MR_DEFENSE_ITEMS = {"3156", "3091", "3102", "2504", "4401", "3065", "3139"}
 ARMOR_DEFENSE_ITEMS = {"3157", "6333", "3075", "3143", "3110", "3026", "2502"}
 QSS_CC_ITEMS = {"3139", "3140", "3102", "3814"}
 
-# Trinkets / free Poro-Snax never occupy any of the 6 main inventory slots
-TRINKET_AND_FREE_ITEM_IDS = {"2052", "2054", "3340", "3363", "3364", "3330", "3513"}
+# Trinkets / free Poro-Snax (including ARAM Mayhem 220013) never occupy any of the 6 main inventory slots
+TRINKET_AND_FREE_ITEM_IDS = {"2052", "2054", "220013", "3340", "3363", "3364", "3330", "3513"}
 # Completed Tier-2 / Tier-3 boots (occupy 1 of the 6 main inventory slots)
 TIER2_BOOT_IDS = {
     "3006", "3009", "3020", "3047", "3111", "3158", "3010", "3013",
@@ -87,6 +108,8 @@ _PROFILE_DEFAULT_ELIXIR: dict[str, tuple[str, str]] = {
     "AP": ("2139", "巫术合剂"),
     "TANK": ("2138", "钢铁合剂"),
     "AD": ("2140", "愤怒合剂"),
+    "SUPPORT": ("2139", "巫术合剂"),
+    "HYBRID": ("2139", "巫术合剂"),
 }
 
 
@@ -192,6 +215,7 @@ class DynamicItemRec:
     games: int
     reasons: tuple[str, ...]
     tags: tuple[str, ...]
+    score_breakdown: dict[str, float] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -219,14 +243,87 @@ _PROFILE_CN_LABELS: dict[str, str] = {
     "AD": "物理",
     "AP": "法强",
     "TANK": "坦克",
+    "SUPPORT": "软辅",
+    "HYBRID": "双修",
 }
 
 
+def _score_item_archetype(
+    info: ItemStaticInfo,
+    *,
+    is_owned_item: bool = False,
+) -> tuple[float, float, float, float]:
+    """Return (ad_pts, ap_pts, tank_pts, support_pts) for a single item."""
+    if not info.name or info.name.startswith("装备#") or info.category == "consumable":
+        return 0.0, 0.0, 0.0, 0.0
+    nid = normalize_item_id(info.item_id)
+    if not nid or nid in TRINKET_AND_FREE_ITEM_IDS or str(info.item_id) in TRINKET_AND_FREE_ITEM_IDS:
+        return 0.0, 0.0, 0.0, 0.0
+
+    tags = set(info.tags or ())
+    if info.category == "boots" or "Boots" in tags or nid in TIER2_BOOT_IDS or nid == "1001":
+        if nid == "3020":
+            return 0.0, 25.0, 0.0, 0.0
+        if nid == "3006":
+            return 25.0, 0.0, 0.0, 0.0
+        if nid in ("3047", "3111"):
+            return 0.0, 0.0, 15.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
+
+    st = info.stats or {}
+    ad_v = float(st.get("FlatPhysicalDamageMod", 0.0) or 0.0)
+    crit_v = float(st.get("FlatCritChanceMod", 0.0) or 0.0)
+    as_v = float(st.get("PercentAttackSpeedMod", 0.0) or 0.0)
+    ap_v = float(st.get("FlatMagicDamageMod", 0.0) or 0.0)
+    armor_v = float(st.get("FlatArmorMod", 0.0) or 0.0)
+    mr_v = float(st.get("FlatSpellBlockMod", 0.0) or 0.0)
+    hp_v = float(st.get("FlatHPPoolMod", 0.0) or 0.0)
+
+    is_complete = info.category == "complete_equipment" or info.gold >= 2200
+    scale = 1.0 if (not is_owned_item or is_complete) else 0.45
+
+    is_enchanter = (nid in ENCHANTER_SUPPORT_ITEM_IDS) or (
+        ("ManaRegen" in tags or "Heal" in tags) and ap_v <= 75.0 and ad_v <= 0.0
+    )
+    if is_enchanter:
+        return (
+            0.0,
+            ap_v * 0.35 * scale,
+            hp_v * 0.03 * scale,
+            85.0 * scale,
+        )
+
+    has_ad_identity = (
+        ad_v > 0.0
+        or ("Damage" in tags and ap_v <= 0.0)
+        or (crit_v > 0.0 and ap_v <= 0.0)
+        or (as_v > 0.0 and ap_v <= 0.0)
+    )
+    ad_pts = ad_v * 1.4
+    if ap_v <= 0.0:
+        ad_pts += crit_v * 120.0 + as_v * 65.0
+        if ad_v <= 0.0 and "Damage" in tags:
+            # Passive-AD bruiser items like Sterak's Gage (3053) omit FlatPhysicalDamageMod in DDragon
+            ad_pts += 55.0
+
+    ap_pts = ap_v * 1.05
+    if ap_v > 0.0 and crit_v > 0.0:
+        ap_pts += crit_v * 60.0
+
+    if ad_v <= 0.0 and ap_v <= 0.0 and not has_ad_identity:
+        tank_pts = armor_v * 1.3 + mr_v * 1.3 + hp_v * 0.13
+    else:
+        tank_pts = armor_v * 0.45 + mr_v * 0.45 + hp_v * 0.045
+
+    return ad_pts * scale, ap_pts * scale, tank_pts * scale, 0.0
+
+
 def _infer_static_default_profile(store: DataStore, hero_id: str) -> str:
-    """Infer champion's conventional damage/tank archetype from static core builds (ignoring augment overrides)."""
+    """Infer champion's conventional archetype from static core builds (ignoring augment overrides)."""
     ad_s = 0.0
     ap_s = 0.0
     tank_s = 0.0
+    sup_s = 0.0
 
     sample_ids: list[str] = []
     for cb in store.get_core_builds(hero_id)[:2]:
@@ -238,17 +335,15 @@ def _infer_static_default_profile(store: DataStore, hero_id: str) -> str:
             sample_ids = [r.item_id for r in top_recs]
 
     for iid in sample_ids:
-        info = store.get_item_info(iid)
-        ad_s += info.stats.get("FlatPhysicalDamageMod", 0.0) * 1.1
-        ad_s += info.stats.get("FlatCritChanceMod", 0.0) * 100.0
-        ap_s += info.stats.get("FlatMagicDamageMod", 0.0) * 0.85
-        tank_s += (
-            info.stats.get("FlatArmorMod", 0.0) * 1.1
-            + info.stats.get("FlatSpellBlockMod", 0.0) * 1.1
-            + info.stats.get("FlatHPPoolMod", 0.0) * 0.10
-        )
+        ad_p, ap_p, tk_p, sp_p = _score_item_archetype(store.get_item_info(iid))
+        ad_s += ad_p
+        ap_s += ap_p
+        tank_s += tk_p
+        sup_s += sp_p
 
-    if tank_s >= max(ad_s, ap_s) * 1.15 and tank_s > 60:
+    if sup_s >= max(ad_s, ap_s, tank_s) * 1.05 and sup_s > 45.0:
+        return "SUPPORT"
+    if tank_s >= max(ad_s, ap_s, sup_s) * 1.15 and tank_s > 60.0:
         return "TANK"
     if ap_s > ad_s * 1.15:
         return "AP"
@@ -313,50 +408,186 @@ def _matches_hero_set(p: PlayerLiveInfo, hero_set: set[str], store: DataStore) -
     return False
 
 
+def infer_unified_hero_profile(
+    hero_id: str | int | None,
+    store: DataStore | None,
+    *,
+    my_items: Sequence[str] = (),
+    selected_augments: Sequence[str] = (),
+    my_stats: dict[str, Any] | None = None,
+) -> str:
+    """Unified hero archetype inference shared by matchup_optimizer and augment_combo.
+
+    Supports ``AP``, ``AD``, ``TANK``, ``SUPPORT``, and ``HYBRID`` while decaying the
+    champion's static core-build prior as completed items are purchased
+    (``prior_weight = max(0.25, 1.0 - 0.25 * completed_count)``).
+    """
+    hid = str(hero_id).strip() if hero_id is not None else ""
+    owned_augs = [str(a).strip() for a in selected_augments if str(a).strip()]
+    owned_aug_set = set(owned_augs)
+
+    if owned_augs:
+        override = detect_profile_override(store, owned_augs)  # type: ignore[arg-type]
+        if override:
+            return override
+
+    ad_s = 0.0
+    ap_s = 0.0
+    tank_s = 0.0
+    sup_s = 0.0
+    completed_count = 0
+
+    # 1. Live owned inventory (highest authority as build matures)
+    if store is not None:
+        for raw_iid in my_items:
+            iid = str(raw_iid).strip()
+            if not iid:
+                continue
+            info = store.get_item_info(iid)
+            nid = normalize_item_id(iid)
+            is_boot = (
+                info.category == "boots"
+                or "Boots" in (info.tags or ())
+                or nid in TIER2_BOOT_IDS
+                or nid == "1001"
+            )
+            is_trinket = (
+                info.category == "consumable"
+                or nid in TRINKET_AND_FREE_ITEM_IDS
+                or iid in TRINKET_AND_FREE_ITEM_IDS
+            )
+            if not is_boot and not is_trinket and (info.category == "complete_equipment" or info.gold >= 2200):
+                completed_count += 1
+            ad_p, ap_p, tk_p, sp_p = _score_item_archetype(info, is_owned_item=True)
+            ad_s += ad_p
+            ap_s += ap_p
+            tank_s += tk_p
+            sup_s += sp_p
+
+        # 2. Static core-build prior with completed-item decay so real pivots break static TANK/AP/AD lock
+        sample_ids: list[str] = []
+        if hid:
+            for cb in store.get_core_builds(hid)[:2]:
+                sample_ids.extend(cb.items)
+            if not sample_ids:
+                recs = store.get_hero_item_recs(hid)
+                if recs:
+                    top_recs = sorted(recs.values(), key=lambda r: r.games, reverse=True)[:4]
+                    sample_ids = [r.item_id for r in top_recs]
+
+        if sample_ids:
+            prior_weight = max(0.25, 1.0 - 0.25 * completed_count)
+            p_ad = p_ap = p_tk = p_sp = 0.0
+            valid_n = 0
+            for iid in sample_ids:
+                ad_p, ap_p, tk_p, sp_p = _score_item_archetype(store.get_item_info(iid))
+                if ad_p > 0.0 or ap_p > 0.0 or tk_p > 0.0 or sp_p > 0.0:
+                    p_ad += ad_p
+                    p_ap += ap_p
+                    p_tk += tk_p
+                    p_sp += sp_p
+                    valid_n += 1
+            if valid_n > 0:
+                norm_scale = (2.0 / valid_n) * prior_weight
+                ad_s += p_ad * norm_scale
+                ap_s += p_ap * norm_scale
+                tank_s += p_tk * norm_scale
+                sup_s += p_sp * norm_scale
+
+    # 3. Non-override selected augment axis signals (HASTE_LOOP & utility axes stay strictly neutral!)
+    if owned_augs:
+        cdb = get_augment_combo_db()
+        for aid in owned_augs:
+            axes = cdb.get_axes(aid)
+            aug_ad = aug_ap = aug_tk = aug_sp = 0.0
+            for ax in axes:
+                if ax in ("AP_SPELL", "BURN_DOT"):
+                    aug_ap += 35.0
+                elif ax in ("AD_ATTACK", "AUTO_ONHIT", "CRIT_ATTACK"):
+                    aug_ad += 35.0
+                elif ax == "TANK_HP":
+                    aug_tk += 35.0
+                elif ax == "SHIELD_HEAL":
+                    aug_sp += 40.0
+            for rule in cdb.combos_for_augment(aid):
+                if aid in rule.core_augments:
+                    h_match = bool(hid and hid in rule.hero_bonus)
+                    cb_w = 55.0 if h_match else 30.0
+                    if rule.profile == "AP":
+                        aug_ap += cb_w
+                    elif rule.profile == "AD":
+                        aug_ad += cb_w
+                    elif rule.profile == "TANK":
+                        aug_tk += cb_w
+                    elif rule.profile == "SUPPORT":
+                        aug_sp += cb_w
+            ad_s += min(95.0, aug_ad)
+            ap_s += min(95.0, aug_ap)
+            tank_s += min(95.0, aug_tk)
+            sup_s += min(95.0, aug_sp)
+
+    # 4. Optional live champion stats reinforcement (camelCase LiveClient or snake_case)
+    if isinstance(my_stats, dict) and my_stats:
+        ap_live = float(my_stats.get("abilityPower") or my_stats.get("ability_power") or 0.0)
+        ad_live = float(my_stats.get("attackDamage") or my_stats.get("attack_damage") or 0.0)
+        hsp_raw = float(my_stats.get("healShieldPower") or my_stats.get("heal_shield_power") or 0.0)
+        hsp_pct = (hsp_raw * 100.0) if (0.0 < hsp_raw <= 2.5) else max(0.0, hsp_raw)
+        hp_live = float(my_stats.get("maxHealth") or my_stats.get("max_health") or 0.0)
+        arm_live = float(my_stats.get("armor") or 0.0)
+        mr_live = float(my_stats.get("magicResist") or my_stats.get("magic_resist") or 0.0)
+        if ap_live > 20.0:
+            ap_s += (ap_live - 20.0) * 0.22
+        if ad_live > 125.0:
+            ad_s += (ad_live - 125.0) * 0.35
+        if hsp_pct >= 8.0:
+            sup_s += hsp_pct * 2.2
+        if ap_live < 120.0 and ad_live < 200.0:
+            tank_s += (
+                max(0.0, hp_live - 2800.0) * 0.03
+                + max(0.0, arm_live - 115.0) * 0.35
+                + max(0.0, mr_live - 75.0) * 0.35
+            )
+
+    has_hybrid_bridge = bool(owned_aug_set & _HYBRID_BRIDGE_AUGMENT_IDS)
+    if (
+        has_hybrid_bridge
+        and ad_s >= 45.0
+        and ap_s >= 45.0
+        and max(ad_s, ap_s) >= max(tank_s, sup_s) * 0.85
+    ):
+        return "HYBRID"
+    if (
+        completed_count >= 2
+        and min(ad_s, ap_s) >= 75.0
+        and (min(ad_s, ap_s) / max(ad_s, ap_s)) >= 0.72
+        and max(ad_s, ap_s) >= max(tank_s, sup_s)
+    ):
+        return "HYBRID"
+
+    if sup_s >= max(ad_s, ap_s, tank_s) * 1.05 and sup_s > 45.0:
+        return "SUPPORT"
+    if tank_s >= max(ad_s, ap_s, sup_s) * 1.15 and tank_s > 60.0:
+        return "TANK"
+    if ap_s > ad_s * 1.15:
+        return "AP"
+    return "AD"
+
+
 def _infer_hero_profile(
     store: DataStore,
     hero_id: str,
     my_items: tuple[str, ...] | list[str],
     selected_augments: tuple[str, ...] | list[str],
 ) -> str:
-    override = detect_profile_override(store, selected_augments)
-    if override:
-        return override
+    return infer_unified_hero_profile(
+        hero_id,
+        store,
+        my_items=my_items,
+        selected_augments=selected_augments,
+    )
 
-    ad_s = 0.0
-    ap_s = 0.0
-    tank_s = 0.0
 
-    # Check currently owned items first
-    for iid in my_items:
-        info = store.get_item_info(iid)
-        ad_s += info.stats.get("FlatPhysicalDamageMod", 0.0) * 1.4
-        ad_s += info.stats.get("FlatCritChanceMod", 0.0) * 120.0
-        ap_s += info.stats.get("FlatMagicDamageMod", 0.0) * 1.0
-        tank_s += (
-            info.stats.get("FlatArmorMod", 0.0) * 1.3
-            + info.stats.get("FlatSpellBlockMod", 0.0) * 1.3
-            + info.stats.get("FlatHPPoolMod", 0.0) * 0.14
-        )
-
-    # Also check core builds for the champion
-    for cb in store.get_core_builds(hero_id)[:2]:
-        for iid in cb.items:
-            info = store.get_item_info(iid)
-            ad_s += info.stats.get("FlatPhysicalDamageMod", 0.0) * 1.1
-            ad_s += info.stats.get("FlatCritChanceMod", 0.0) * 100.0
-            ap_s += info.stats.get("FlatMagicDamageMod", 0.0) * 0.85
-            tank_s += (
-                info.stats.get("FlatArmorMod", 0.0) * 1.1
-                + info.stats.get("FlatSpellBlockMod", 0.0) * 1.1
-                + info.stats.get("FlatHPPoolMod", 0.0) * 0.10
-            )
-
-    if tank_s >= max(ad_s, ap_s) * 1.15 and tank_s > 60:
-        return "TANK"
-    if ap_s > ad_s * 1.15:
-        return "AP"
-    return "AD"
+infer_hero_profile = _infer_hero_profile
 
 
 def analyze_matchup_threats(
@@ -434,8 +665,13 @@ def analyze_matchup_threats(
                 prof = _infer_hero_profile(store, h.hero_id, (), ())
                 if prof == "AP":
                     p_ap = 70.0
+                elif prof == "SUPPORT":
+                    p_ap = 40.0
                 elif prof == "AD":
                     p_ad = 70.0
+                elif prof == "HYBRID":
+                    p_ap = 38.0
+                    p_ad = 38.0
                 else:
                     armor_score += 0.4 * w
                     hp_score += 0.5 * w
@@ -544,12 +780,20 @@ def canonicalize_item_id(item_id: str | int) -> str:
     return LEGACY_ITEM_ID_ALIASES.get(nid, nid)
 
 
+def _item_in_static_catalog(store: DataStore, nid: str) -> bool:
+    if not store.static.items:
+        return True
+    if nid in store.static.items:
+        return True
+    return len(nid) == 4 and nid.isdigit() and any(f"{pfx}{nid}" in store.static.items for pfx in _MAYHEM_ITEM_PREFIXES)
+
+
 def is_valid_plan_item(store: DataStore, item_id: str | int) -> bool:
     """Return True iff item_id resolves to a real purchasable complete equipment item in current DDragon."""
     nid = canonicalize_item_id(item_id)
     if not nid:
         return False
-    if store.static.items and nid not in store.static.items:
+    if not _item_in_static_catalog(store, nid):
         return False
     info = store.get_item_info(nid)
     if not info.name or info.name.startswith("装备#"):
@@ -601,6 +845,8 @@ def optimize_next_items(
     committed_plan: tuple[str, ...] | list[str] = (),
     locked_next_item: str = "",
     my_player: PlayerLiveInfo | None = None,
+    *,
+    collect_breakdown: bool = False,
 ) -> tuple[MatchupThreatProfile, list[DynamicItemRec]]:
     """Compute dynamically re-ranked next items with slot-ordered core progression & plan continuity."""
     hid = str(hero_id)
@@ -715,24 +961,31 @@ def optimize_next_items(
 
     def _is_off_profile_item(info: ItemStaticInfo) -> bool:
         norm_i = normalize_item_id(info.item_id)
-        # Strict damage-type gating: physical armor-pen/GW items NEVER belong on pure AP builds (even with Jeweled Gauntlet)
-        if profile == "AP" and not allows_ad_on_ap and norm_i in PHYSICAL_ONLY_ITEMS:
+        # Strict damage-type gating: physical armor-pen/GW items NEVER belong on pure AP/SUPPORT builds
+        if profile in ("AP", "SUPPORT") and not allows_ad_on_ap and norm_i in PHYSICAL_ONLY_ITEMS:
             return True
         if profile == "AD" and not allows_ap_on_ad and norm_i in MAGIC_ONLY_ITEMS:
             return True
         if norm_i in special_exempt or norm_i in core_item_ids:
             return False
         st = info.stats
+        tags = set(info.tags or ())
         ad_v = st.get("FlatPhysicalDamageMod", 0.0)
         ap_v = st.get("FlatMagicDamageMod", 0.0)
         crit_v = st.get("FlatCritChanceMod", 0.0)
         as_v = st.get("PercentAttackSpeedMod", 0.0)
-        armor_pen = "ArmorPenetration" in info.tags
+        armor_pen = "ArmorPenetration" in tags
+        is_support_item = (
+            norm_i in ENCHANTER_SUPPORT_ITEM_IDS
+            or norm_i in ("3190", "3050", "3109")
+            or ("ManaRegen" in tags or "Heal" in tags or "Aura" in tags)
+        )
         is_pure_tank = (
             ad_v <= 0
             and ap_v <= 0
             and crit_v <= 0
             and as_v <= 0
+            and not is_support_item
             and (
                 st.get("FlatArmorMod", 0.0) > 0
                 or st.get("FlatSpellBlockMod", 0.0) > 0
@@ -746,9 +999,17 @@ def optimize_next_items(
                     return True
             if is_pure_tank and not allows_tank_on_carry:
                 return True
-        elif profile == "AD":
-            if not allows_ap_on_ad and ap_v > 0 and ad_v <= 0 and "SpellBlock" not in info.tags:
+        elif profile == "SUPPORT":
+            if not allows_ad_on_ap and (ad_v > 0 or armor_pen) and ap_v <= 0 and not is_support_item:
                 return True
+            if is_pure_tank and not allows_tank_on_carry:
+                return True
+        elif profile == "AD":
+            if not allows_ap_on_ad and ap_v > 0 and ad_v <= 0 and "SpellBlock" not in tags:
+                return True
+            if is_pure_tank and not allows_tank_on_carry:
+                return True
+        elif profile == "HYBRID":
             if is_pure_tank and not allows_tank_on_carry:
                 return True
         return False
@@ -765,7 +1026,7 @@ def optimize_next_items(
             return
         if item_is_owned(norm, my_items):
             return
-        if store.static.items and norm not in store.static.items:
+        if not _item_in_static_catalog(store, norm):
             return
         info = store.get_item_info(norm)
         if not info.name or info.name.startswith("装备#"):
@@ -824,6 +1085,8 @@ def optimize_next_items(
         pick_share = (games / max_item_games) if max_item_games > 0 else 0.0
         bias = store.get_item_global_bias(iid)
         role_prior = store.get_role_item_prior(profile, iid) if games < 300 else None
+        if role_prior is None and games < 300 and profile in ("SUPPORT", "HYBRID"):
+            role_prior = store.get_role_item_prior("AP", iid)
         if rec_stat and rec_stat.games > 0:
             if games < 300 and role_prior is not None:
                 class_prior_wr = max(0.30, min(0.70, hero_wr + role_prior))
@@ -844,53 +1107,94 @@ def optimize_next_items(
         score = base_score
         reasons: list[str] = []
         tags: list[str] = []
+        if collect_breakdown:
+            adoption_delta = 0.0
+            plan_delta = 0.0
+            comp_delta = 0.0
+            core_delta = 0.0
+            sig_pos_delta = 0.0
+            destiny_delta = 0.0
+            aug_syn_pos_delta = 0.0
+            tank_shred_delta = 0.0
+            magic_pen_delta = 0.0
+            antiheal_pos_delta = 0.0
+            antiheal_pen_delta = 0.0
+            shield_cut_delta = 0.0
+            mr_def_delta = 0.0
+            armor_def_delta = 0.0
+            cc_def_delta = 0.0
+            penalty_delta = 0.0
 
         # Big-data mainstream adoption confidence bonus (rewards real high-sample core items over 0.3%-pick outliers)
         if pick_share >= 0.08:
-            score += min(2.4, math.log10(1.0 + pick_share * 20.0) * 1.8)
+            _adopt = min(2.4, math.log10(1.0 + pick_share * 20.0) * 1.8)
+            score += _adopt
+            if collect_breakdown:
+                adoption_delta = _adopt
 
         # Committed build-plan continuity & component-investment lock (prevents death-to-death flip-flopping!)
         invested_credit, _, _ = _owned_component_credit(store, iid, list(my_items))
         if locked_norm and iid == locked_norm:
-            if invested_credit == 0 and survival_emergency:
-                score += 1.6
-            else:
-                score += 5.2
+            _plan_add = 1.6 if (invested_credit == 0 and survival_emergency) else 5.2
+            score += _plan_add
+            if collect_breakdown:
+                plan_delta = _plan_add
             tags.append("锁定下件")
         elif iid in committed_norm:
             score += 2.2
+            if collect_breakdown:
+                plan_delta = 2.2
             tags.append("既定路线")
 
         if invested_credit >= 700:
-            score += min(4.8, 2.6 + invested_credit / 800.0)
+            _comp_add = min(4.8, 2.6 + invested_credit / 800.0)
+            score += _comp_add
+            if collect_breakdown:
+                comp_delta = _comp_add
             reasons.append(f"已购{invested_credit}G散件，顺势合成")
             tags.append("已有散件")
 
         # Slot-ordered big-data core progression (gives consensus 1st-slot core like Heartsteel / Blackfire strong anchor)
         if owned_complete_count == 0 and iid in consensus_starters:
-            score += 2.0 if (has_unowned_force_special and iid not in special_exempt) else 4.4
+            _core_add = 2.0 if (has_unowned_force_special and iid not in special_exempt) else 4.4
+            score += _core_add
+            if collect_breakdown:
+                core_delta = _core_add
             tags.append("大数据首选")
         elif iid in next_slot_core_ids:
             score += next_slot_core_bonus
+            if collect_breakdown:
+                core_delta = next_slot_core_bonus
             tags.append("当前顺位核心")
         elif iid in core_item_ids:
             score += 1.2
+            if collect_breakdown:
+                core_delta = 1.2
             tags.append("核心三件套")
 
         # Gentle low-weight hero signature tie-breaker (strictly subordinate to big data & special augments!)
         if not has_transformative_special:
             if owned_complete_count == 0 and iid in sig_starters:
                 score += 1.2
+                if collect_breakdown:
+                    sig_pos_delta = 1.2
                 tags.append("英雄招牌")
             elif iid in sig_items:
                 score += 0.8
+                if collect_breakdown:
+                    sig_pos_delta = 0.8
             elif iid in sig_avoid_passive and iid not in special_exempt:
                 score -= 1.6
+                if collect_breakdown:
+                    penalty_delta -= 1.6
 
         # Destiny's Weapon statistical bonus
         if iid in destiny_map:
             ddelta = destiny_map[iid]
-            score += 6.0 + ddelta * 60.0
+            _dest_add = 6.0 + ddelta * 60.0
+            score += _dest_add
+            if collect_breakdown:
+                destiny_delta = _dest_add
             reasons.append(f"命运之武器高胜率绑定 ({ddelta * 100:+.1f}%)")
             tags.append("命运绑定")
 
@@ -898,6 +1202,11 @@ def optimize_next_items(
         syn_bonus, syn_labels = evaluate_augment_synergies(store, selected_augments, info)
         if syn_bonus != 0:
             score += syn_bonus
+            if collect_breakdown:
+                if syn_bonus > 0:
+                    aug_syn_pos_delta = syn_bonus
+                else:
+                    penalty_delta += syn_bonus
             if syn_labels:
                 tags.extend(syn_labels)
                 reasons.append(syn_labels[0])
@@ -905,11 +1214,13 @@ def optimize_next_items(
         # --- Matchup situational adjustments ---
         # 1. Armor / HP shred (armor pen strictly gated to physical profiles)
         if has_high_armor_tank and (
-            (iid in ARMOR_PEN_ITEMS and (profile != "AP" or allows_ad_on_ap))
-            or (iid in HP_SHRED_ITEMS and (iid != "3153" or profile != "AP" or allows_ad_on_ap))
+            (iid in ARMOR_PEN_ITEMS and (profile not in ("AP", "SUPPORT") or allows_ad_on_ap))
+            or (iid in HP_SHRED_ITEMS and (iid != "3153" or profile not in ("AP", "SUPPORT") or allows_ad_on_ap))
         ):
             boost = 4.2 if iid in ARMOR_PEN_ITEMS else 3.8
             score += boost
+            if collect_breakdown:
+                tank_shred_delta = boost
             if threat.enemy_hp_score >= 3.2 and iid in HP_SHRED_ITEMS:
                 reasons.append("敌方堆血前排厚，百分比打坦")
             else:
@@ -918,7 +1229,10 @@ def optimize_next_items(
 
         # 2. Magic Pen vs MR stacking (strictly gated to magic profiles)
         if has_mr_stack and iid in MAGIC_PEN_ITEMS and (profile != "AD" or allows_ap_on_ad):
-            score += 4.5 if iid in ("3135", "3137") else 2.5
+            _mpen = 4.5 if iid in ("3135", "3137") else 2.5
+            score += _mpen
+            if collect_breakdown:
+                magic_pen_delta = _mpen
             reasons.append("敌方多人已出魔抗，法穿收益拉满")
             tags.append("法穿对策")
 
@@ -926,24 +1240,36 @@ def optimize_next_items(
         if threat.enemy_heal_score >= 1.8:
             if info.has_grievous:
                 if not threat.ally_has_grievous:
-                    score += 5.8 if iid not in ("3123", "3916") else (4.8 if my_gold < 2200 else 2.0)
+                    _gw_add = 5.8 if iid not in ("3123", "3916") else (4.8 if my_gold < 2200 else 2.0)
+                    score += _gw_add
+                    if collect_breakdown:
+                        antiheal_pos_delta = _gw_add
                     reasons.append("敌方高回复且我方尚无重伤")
                     tags.append("必出重伤")
                 else:
                     score -= 1.8
+                    if collect_breakdown:
+                        antiheal_pen_delta = -1.8
+                        penalty_delta -= 1.8
                     reasons.append("队友已有重伤，优先级下调")
             elif iid == "3036" and threat.ally_has_grievous and threat.enemy_armor_score >= 1.5:
                 score += 2.2
+                if collect_breakdown:
+                    antiheal_pos_delta = 2.2
                 reasons.append("队友已有重伤，直出大轻语拉满输出")
 
         # 4. Shield breaking
         if threat.enemy_shield_score >= 1.8 and not threat.ally_has_shield_break:
             if info.has_shield_break:
                 score += 4.8
+                if collect_breakdown:
+                    shield_cut_delta = 4.8
                 reasons.append("敌方多护盾阵容，破盾收益极高")
                 tags.append("破盾对策")
-            elif iid == "4645" and profile == "AP":
+            elif iid == "4645" and profile in ("AP", "HYBRID"):
                 score += 2.0
+                if collect_breakdown:
+                    shield_cut_delta = 2.0
                 reasons.append("敌方护盾多，影焰法穿增伤")
 
         # Defensive counter scaling: don't force passive defensive items at 0 items over scaling core starters (e.g. Heartsteel / Hubris)!
@@ -953,9 +1279,14 @@ def optimize_next_items(
         if (threat.enemy_ap_ratio >= 0.65 or (threat.top_threat_type == "AP" and threat.top_threat_name)) and (
             iid in MR_DEFENSE_ITEMS
         ):
-            score += (4.2 if threat.enemy_ap_ratio >= 0.65 else 2.4) * def_scale
+            _mr_base = (4.2 if threat.enemy_ap_ratio >= 0.65 else 2.4) * def_scale
+            score += _mr_base
+            _mr_emg = 0.0
             if survival_emergency:
-                score += 1.5 * def_scale
+                _mr_emg = 1.5 * def_scale
+                score += _mr_emg
+            if collect_breakdown:
+                mr_def_delta = _mr_base + _mr_emg
             if threat.top_threat_type == "AP" and threat.top_threat_name:
                 reasons.append(f"敌方重AP({int(threat.enemy_ap_ratio * 100)}%)且{threat.top_threat_name}肥，补魔抗防秒")
             else:
@@ -966,15 +1297,23 @@ def optimize_next_items(
         if (threat.enemy_ad_ratio >= 0.65 or (threat.top_threat_type == "AD" and threat.top_threat_name)) and (
             iid in ARMOR_DEFENSE_ITEMS
         ):
-            score += (4.0 if threat.enemy_ad_ratio >= 0.65 else 2.2) * def_scale
+            _ar_base = (4.0 if threat.enemy_ad_ratio >= 0.65 else 2.2) * def_scale
+            score += _ar_base
+            _ar_emg = 0.0
             if survival_emergency:
-                score += 1.5 * def_scale
+                _ar_emg = 1.5 * def_scale
+                score += _ar_emg
+            if collect_breakdown:
+                armor_def_delta = _ar_base + _ar_emg
             reasons.append(f"敌方实际AD出装占比{int(threat.enemy_ad_ratio * 100)}%，补护甲保命")
             tags.append("防AD")
 
         # 7. Hard CC -> QSS / Spellshield
         if threat.enemy_cc_score >= 2.2 and iid in QSS_CC_ITEMS:
-            score += 3.2 * def_scale
+            _cc_add = 3.2 * def_scale
+            score += _cc_add
+            if collect_breakdown:
+                cc_def_delta = _cc_add
             reasons.append("敌方硬控开团多，补解控/法术护盾")
             tags.append("解控保命")
 
@@ -987,21 +1326,70 @@ def optimize_next_items(
         price = info.gold
         affordable = bool(price > 0 and my_gold >= price)
         gold_needed = max(0, int(price - my_gold)) if price > 0 else 0
+        final_score = round(score, 2)
 
-        scored.append(
-            DynamicItemRec(
-                item_id=iid,
-                name=info.name,
-                price=price,
-                affordable=affordable,
-                gold_needed=gold_needed,
-                score=round(score, 2),
-                win_rate=raw_wr,
-                games=games,
-                reasons=tuple(reasons[:2]),
-                tags=tuple(dict.fromkeys(tags)),
+        if collect_breakdown:
+            breakdown = {
+                "base_winrate": round(base_score, 3),
+                "adoption_bonus": round(adoption_delta, 3),
+                "plan_continuity": round(plan_delta, 3),
+                "component_bonus": round(comp_delta, 3),
+                "core_progression": round(core_delta, 3),
+                "hero_signature": round(sig_pos_delta, 3),
+                "destiny_synergy": round(destiny_delta, 3),
+                "augment_synergy": round(aug_syn_pos_delta, 3),
+                "tank_shred": round(tank_shred_delta, 3),
+                "magic_pen": round(magic_pen_delta, 3),
+                "antiheal": round(antiheal_pos_delta, 3),
+                "shield_cut": round(shield_cut_delta, 3),
+                "mr_defense": round(mr_def_delta, 3),
+                "armor_defense": round(armor_def_delta, 3),
+                "cc_defense": round(cc_def_delta, 3),
+                "penalties": round(penalty_delta, 3),
+                "def_scale": round(def_scale, 3),
+                "matchup_counter": round(
+                    tank_shred_delta
+                    + magic_pen_delta
+                    + antiheal_pos_delta
+                    + antiheal_pen_delta
+                    + shield_cut_delta
+                    + mr_def_delta
+                    + armor_def_delta
+                    + cc_def_delta,
+                    3,
+                ),
+                "final_score": final_score,
+            }
+            scored.append(
+                DynamicItemRec(
+                    item_id=iid,
+                    name=info.name,
+                    price=price,
+                    affordable=affordable,
+                    gold_needed=gold_needed,
+                    score=final_score,
+                    win_rate=raw_wr,
+                    games=games,
+                    reasons=tuple(reasons[:2]),
+                    tags=tuple(dict.fromkeys(tags)),
+                    score_breakdown=breakdown,
+                )
             )
-        )
+        else:
+            scored.append(
+                DynamicItemRec(
+                    item_id=iid,
+                    name=info.name,
+                    price=price,
+                    affordable=affordable,
+                    gold_needed=gold_needed,
+                    score=final_score,
+                    win_rate=raw_wr,
+                    games=games,
+                    reasons=tuple(reasons[:2]),
+                    tags=tuple(dict.fromkeys(tags)),
+                )
+            )
 
     scored.sort(key=lambda r: (r.score, r.games), reverse=True)
     return threat, scored[:limit]
@@ -1156,10 +1544,18 @@ def recommend_counter_boots(
         return "3047", _boot_display_name(store, "3047"), reason
 
     # 3. Profile offensive / tempo boots
+    if profile == "SUPPORT":
+        return "3158", _boot_display_name(store, "3158"), "减CD高频盾奶"
+
     if profile == "AP":
         if mr_s >= 2.2:
             return "3158", _boot_display_name(store, "3158"), "敌高魔抗转CD"
         return "3020", _boot_display_name(store, "3020"), "法穿打脆皮"
+
+    if profile == "HYBRID":
+        if mr_s >= 2.2:
+            return "3158", _boot_display_name(store, "3158"), "敌高魔抗转CD"
+        return "3006", _boot_display_name(store, "3006"), "双修攻速输出"
 
     if profile == "AD":
         # Inspect hero's top core builds to distinguish AS/Crit carries vs Caster AD
@@ -1201,6 +1597,8 @@ def compute_aram_opening_buy_hint(
         "AP": ("守护者宝珠", "增幅典籍", 400),
         "AD": ("守护者战锤", "长剑", 350),
         "TANK": ("守护者号角", "红水晶", 400),
+        "SUPPORT": ("守护者宝珠", "仙女护符", 200),
+        "HYBRID": ("守护者宝珠", "增幅典籍", 400),
     }
     g_name, g_sub, g_sub_cost = guardian_map.get(profile, ("守护者宝珠", "草鞋", 300))
 
@@ -1392,6 +1790,8 @@ def reconcile_match_build_plan(
     locked_next_item: str,
     proposed_ids: list[str] | tuple[str, ...],
     allow_overhaul: bool = False,
+    *,
+    transformative_overhaul: bool = False,
 ) -> tuple[str, list[str]]:
     """Maintain a coherent full-match build plan with strict anti-flip-flop hysteresis.
 
@@ -1404,6 +1804,8 @@ def reconcile_match_build_plan(
        the old locked item), honor the player's actual shop choice immediately.
     4. Only allow full plan overhaul when `allow_overhaul=True` (initial plan lock or transformative
        augment like 迷人蝴蝶 / 装甲冲击 / 珠光护手 / 没法力) — never flip-flop between routine deaths!
+       When `cur_lock` already has >= 800G invested in components and `transformative_overhaul=False`,
+       preserve `cur_lock` in slot 1 and only reorder slots 2-5.
     """
     if analyze_inventory_slots(store, my_items).is_full_build:
         return "", []
@@ -1424,9 +1826,15 @@ def reconcile_match_build_plan(
     if cur_lock and (item_is_owned(cur_lock, my_items) or not is_valid_plan_item(store, cur_lock)):
         cur_lock = ""
 
+    lock_credit = _owned_component_credit(store, cur_lock, list(my_items))[0] if cur_lock else 0
+
     # Initial establishment or legitimate transformative-augment / augment-correction overhaul
     if allow_overhaul or not clean_committed:
-        merged = list(clean_proposed[:5])
+        if cur_lock and lock_credit >= 800 and not transformative_overhaul:
+            merged = [cur_lock] + [pid for pid in clean_proposed if pid != cur_lock]
+            merged = merged[:5]
+        else:
+            merged = list(clean_proposed[:5])
         if not allow_overhaul:
             for cid in clean_committed:
                 if cid not in merged and len(merged) < 5:
@@ -1435,8 +1843,7 @@ def reconcile_match_build_plan(
         return new_lock, merged
 
     # Check if player manually invested >= 800G in components of a different complete item in shop
-    lock_credit = _owned_component_credit(store, cur_lock, list(my_items))[0] if cur_lock else 0
-    if lock_credit < 400:
+    if cur_lock and lock_credit < 400:
         best_inv_id = ""
         best_inv_gold = 0
         for pid in clean_proposed:
@@ -1470,3 +1877,210 @@ def reconcile_match_build_plan(
             clean_committed.append(pid)
 
     return cur_lock, clean_committed[:5]
+
+
+def _owned_component_credit_with_matched(
+    store: DataStore,
+    item_id: str,
+    owned_pool: list[str],
+) -> tuple[int, list[int]]:
+    """Compute (credit_gold, matched_component_ids) for owned components contributing to item_id."""
+    if not item_id:
+        return 0, []
+    info = store.get_item_info(item_id)
+    if not info.components:
+        return 0, []
+    pool = [normalize_item_id(x) for x in owned_pool]
+    credit = 0
+    matched_ids: list[int] = []
+    for comp in info.components:
+        nc = normalize_item_id(comp)
+        if nc in pool:
+            pool.remove(nc)
+            credit += store.get_item_info(nc).gold
+            if nc.isdigit():
+                matched_ids.append(int(nc))
+        else:
+            sub_info = store.get_item_info(nc)
+            for sub in sub_info.components:
+                ns = normalize_item_id(sub)
+                if ns in pool:
+                    pool.remove(ns)
+                    credit += store.get_item_info(ns).gold
+                    if ns.isdigit():
+                        matched_ids.append(int(ns))
+    return credit, matched_ids
+
+
+def _format_route_str(lock: str, plan: list[str] | tuple[str, ...]) -> str:
+    ordered: list[str] = []
+    if lock:
+        ordered.append(lock)
+    for x in plan:
+        if x and x not in ordered:
+            ordered.append(x)
+    return "->".join(ordered)
+
+
+def _resolve_trace_profile(
+    store: DataStore,
+    hero_id: str | int,
+    my_items: tuple[str, ...] | list[str],
+    selected_augments: tuple[str, ...] | list[str],
+    fallback_items: list[str] | tuple[str, ...],
+) -> str:
+    hid = str(hero_id or "").strip()
+    if hid or selected_augments or my_items:
+        return _infer_hero_profile(store, hid, my_items, selected_augments)
+    if fallback_items:
+        return _infer_hero_profile(store, "", fallback_items, ())
+    return ""
+
+
+def reconcile_match_build_plan_with_trace(
+    store: DataStore,
+    my_items: tuple[str, ...] | list[str],
+    committed_plan: list[str] | tuple[str, ...],
+    locked_next_item: str,
+    proposed_ids: list[str] | tuple[str, ...],
+    allow_overhaul: bool = False,
+    *,
+    hero_id: str | int = "",
+    selected_augments: tuple[str, ...] | list[str] = (),
+    transformative_overhaul: bool = False,
+) -> tuple[str, list[str], dict[str, Any]]:
+    """Reconcile build plan identically to `reconcile_match_build_plan` and return a diagnostic trace dict."""
+    prev_lock = canonicalize_item_id(locked_next_item) if locked_next_item else ""
+    prev_plan: list[str] = []
+    for x in committed_plan:
+        nx = canonicalize_item_id(x)
+        if nx and nx not in prev_plan:
+            prev_plan.append(nx)
+    previous_route = _format_route_str(prev_lock, prev_plan)
+
+    if analyze_inventory_slots(store, my_items).is_full_build:
+        trace = {
+            "overridden": False,
+            "override_reason": "",
+            "committed_component_ids": [],
+            "committed_gold": 0,
+            "previous_route": previous_route,
+            "new_route": "",
+            "matchup_hero_profile": _resolve_trace_profile(
+                store, hero_id, my_items, selected_augments, prev_plan
+            ),
+        }
+        return "", [], trace
+
+    clean_committed: list[str] = []
+    for x in committed_plan:
+        nx = canonicalize_item_id(x)
+        if nx and nx not in clean_committed and not item_is_owned(nx, my_items) and is_valid_plan_item(store, nx):
+            clean_committed.append(nx)
+
+    clean_proposed: list[str] = []
+    for x in proposed_ids:
+        nx = canonicalize_item_id(x)
+        if nx and nx not in clean_proposed and not item_is_owned(nx, my_items) and is_valid_plan_item(store, nx):
+            clean_proposed.append(nx)
+
+    cur_lock = prev_lock
+    if cur_lock and (item_is_owned(cur_lock, my_items) or not is_valid_plan_item(store, cur_lock)):
+        cur_lock = ""
+
+    lock_credit, lock_comp_ids = (
+        _owned_component_credit_with_matched(store, cur_lock, list(my_items)) if cur_lock else (0, [])
+    )
+
+    # Initial establishment or legitimate transformative-augment / augment-correction overhaul
+    if allow_overhaul or not clean_committed:
+        if cur_lock and lock_credit >= 800 and not transformative_overhaul:
+            merged = [cur_lock] + [pid for pid in clean_proposed if pid != cur_lock]
+            merged = merged[:5]
+        else:
+            merged = list(clean_proposed[:5])
+        if not allow_overhaul:
+            for cid in clean_committed:
+                if cid not in merged and len(merged) < 5:
+                    merged.append(cid)
+        new_lock = merged[0] if merged else ""
+        overridden = bool(
+            allow_overhaul
+            and cur_lock
+            and new_lock != cur_lock
+        )
+        override_reason = "allow_overhaul" if overridden else ""
+        comp_gold, comp_ids = _owned_component_credit_with_matched(store, new_lock, list(my_items))
+        trace = {
+            "overridden": overridden,
+            "override_reason": override_reason,
+            "committed_component_ids": comp_ids,
+            "committed_gold": comp_gold,
+            "previous_route": previous_route,
+            "new_route": _format_route_str(new_lock, merged),
+            "matchup_hero_profile": _resolve_trace_profile(
+                store, hero_id, my_items, selected_augments, merged or clean_proposed
+            ),
+        }
+        return new_lock, merged, trace
+
+    # Check if player manually invested >= 800G in components of a different complete item in shop
+    overridden = False
+    override_reason = ""
+    chosen_gold = lock_credit
+    chosen_comp_ids = lock_comp_ids
+
+    if cur_lock and lock_credit < 400:
+        best_inv_id = ""
+        best_inv_gold = 0
+        best_inv_comp_ids: list[int] = []
+        for pid in clean_proposed:
+            if pid == cur_lock:
+                continue
+            cred, cids = _owned_component_credit_with_matched(store, pid, list(my_items))
+            if cred >= 800 and cred > best_inv_gold:
+                best_inv_gold = cred
+                best_inv_id = pid
+                best_inv_comp_ids = cids
+        if best_inv_id:
+            cur_lock = best_inv_id
+            if best_inv_id in clean_committed:
+                clean_committed.remove(best_inv_id)
+            clean_committed.insert(0, best_inv_id)
+            overridden = True
+            override_reason = "component_investment_gte_800g"
+            chosen_gold = best_inv_gold
+            chosen_comp_ids = best_inv_comp_ids
+
+    # Preserve locked_next_item and committed core slots; only pad open tail slots from proposed
+    if cur_lock:
+        if cur_lock in clean_committed:
+            clean_committed.remove(cur_lock)
+        clean_committed.insert(0, cur_lock)
+    elif clean_committed:
+        cur_lock = clean_committed[0]
+        chosen_gold, chosen_comp_ids = _owned_component_credit_with_matched(store, cur_lock, list(my_items))
+    elif clean_proposed:
+        cur_lock = clean_proposed[0]
+        clean_committed.append(cur_lock)
+        chosen_gold, chosen_comp_ids = _owned_component_credit_with_matched(store, cur_lock, list(my_items))
+
+    for pid in clean_proposed:
+        if len(clean_committed) >= 5:
+            break
+        if pid not in clean_committed:
+            clean_committed.append(pid)
+
+    new_plan = clean_committed[:5]
+    trace = {
+        "overridden": overridden,
+        "override_reason": override_reason,
+        "committed_component_ids": chosen_comp_ids,
+        "committed_gold": chosen_gold,
+        "previous_route": previous_route,
+        "new_route": _format_route_str(cur_lock, new_plan),
+        "matchup_hero_profile": _resolve_trace_profile(
+            store, hero_id, my_items, selected_augments, new_plan or clean_proposed
+        ),
+    }
+    return cur_lock, new_plan, trace

@@ -39,7 +39,111 @@ _COS_KEY_RE = re.compile(r"\bAKID[A-Za-z0-9]{16,}\b")
 _AUTH_KV_RE = re.compile(
     r"(?i)\b(password|passwd|refresh_token|access_token|secret_key|api_key)\s*([=:])\s*([^\s,;&\"'\}]{4,})"
 )
+_RIOT_KV_QUOTED_RE = re.compile(
+    r"(?i)([\"']?\b(?:puuid|summonerId|accountId|summonerName|riotId|riotIdGameName|riotIdTagline)\b[\"']?\s*[:=]\s*)([\"'])([^\"']+)\2"
+)
+_RIOT_KV_RE = re.compile(
+    r"(?i)\b(puuid|summonerId|accountId|summonerName|riotId|riotIdGameName|riotIdTagline)\s*([=:])\s*([^\s,;&\"'\}\]]{3,})"
+)
+_RIOT_PUUID_RE = re.compile(
+    r"(?:\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    r"|(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{76,82}(?![A-Za-z0-9_-]))"
+)
+_RIOT_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_/\\.#-])([A-Za-z0-9\u4e00-\u9fff\u3400-\u4dbf\uac00-\ud7af\u3040-\u30ff][A-Za-z0-9_.\-\u4e00-\u9fff\u3400-\u4dbf\uac00-\ud7af\u3040-\u30ff]{1,15})#([A-Za-z0-9]{2,5})(?![A-Za-z0-9_#])"
+)
+_RIOT_ID_NON_PLAYER_PREFIXES: frozenset[str] = frozenset(
+    {
+        "match",
+        "item",
+        "hero",
+        "champ",
+        "champion",
+        "aug",
+        "augment",
+        "slot",
+        "card",
+        "seq",
+        "ev",
+        "event",
+        "pid",
+        "id",
+        "req",
+        "request",
+        "order",
+        "ticket",
+        "err",
+        "error",
+        "line",
+        "frame",
+        "round",
+        "turn",
+        "team",
+        "pass",
+        "phase",
+        "tier",
+        "issue",
+        "pr",
+        "bug",
+        "step",
+        "stage",
+        "worker",
+        "thread",
+        "proc",
+        "port",
+        "code",
+        "http",
+        "https",
+        "color",
+        "rgb",
+        "rgba",
+        "hex",
+        "bg",
+        "fg",
+        "border",
+    }
+)
+_FILE_EXT_SUFFIXES = (
+    ".py",
+    ".md",
+    ".html",
+    ".htm",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".js",
+    ".ts",
+    ".css",
+    ".png",
+    ".jpg",
+    ".com",
+    ".cn",
+    ".net",
+    ".org",
+    ".io",
+    ".dev",
+    ".app",
+    ".gg",
+    ".test",
+)
+_LINE_ANCHOR_RE = re.compile(r"^L\d+$")
 _WIN_USER_PATH_RE = re.compile(r"(?i)([A-Z]:[/\\]Users[/\\])([^/\\\s\"'<>|]+)([/\\])")
+
+
+def _redact_riot_id_match(match: re.Match[str]) -> str:
+    name = match.group(1)
+    tag = match.group(2)
+    low_name = name.lower()
+    if low_name in _RIOT_ID_NON_PLAYER_PREFIXES:
+        return match.group(0)
+    if any(low_name.endswith(ext) for ext in _FILE_EXT_SUFFIXES):
+        return match.group(0)
+    if _LINE_ANCHOR_RE.match(tag):
+        return match.group(0)
+    # Latin-only Riot GameNames are at least 3 chars (2-char CJK names like 阿岚#CN1 are valid)
+    if name.isascii() and (len(name) < 3 or name.isdigit()):
+        return match.group(0)
+    return "<RIOT_ID_REDACTED>"
 
 
 def _utc_now_iso() -> str:
@@ -51,7 +155,7 @@ def _utc_file_stamp() -> str:
 
 
 def sanitize_log_text(text: str) -> str:
-    """Scrub tokens, API keys, LCU passwords, and Windows usernames from log text."""
+    """Scrub tokens, API keys, LCU passwords, Riot PUUID/IDs, and Windows usernames from log text."""
     if not text:
         return ""
     cleaned = _BEARER_RE.sub(r"\1<REDACTED>", text)
@@ -62,6 +166,10 @@ def sanitize_log_text(text: str) -> str:
     cleaned = _OPENAI_DS_KEY_RE.sub("<API_KEY_REDACTED>", cleaned)
     cleaned = _COS_KEY_RE.sub("<SECRET_ID_REDACTED>", cleaned)
     cleaned = _AUTH_KV_RE.sub(r"\1\2<REDACTED>", cleaned)
+    cleaned = _RIOT_KV_QUOTED_RE.sub(r"\1\2<REDACTED>\2", cleaned)
+    cleaned = _RIOT_KV_RE.sub(r"\1\2<REDACTED>", cleaned)
+    cleaned = _RIOT_PUUID_RE.sub("<PUUID_REDACTED>", cleaned)
+    cleaned = _RIOT_ID_RE.sub(_redact_riot_id_match, cleaned)
     cleaned = _WIN_USER_PATH_RE.sub(r"\1<USER>\3", cleaned)
     return cleaned
 

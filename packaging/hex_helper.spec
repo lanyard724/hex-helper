@@ -74,6 +74,13 @@ excludes = [
     "google.api_core",
     "google.protobuf",
     "googleapis_common_protos",
+    "hex_helper.devlab",
+    "hex_helper.devlab.recorder",
+    "hex_helper.devlab.analyzer",
+    "hex_helper.devlab.schema",
+    "hex_helper.devlab.ui_observer",
+    "hex_helper.devlab.__main__",
+    "hex_helper.bridge.agent_bridge",
     "pytest",
     "_pytest",
     "tkinter",
@@ -157,15 +164,67 @@ a = Analysis(
     optimize=0,
 )
 
-# Defensive commercial strip: ensure zero google.genai / google.* entries ever sneak into PYZ/datas
-_forbidden_prefixes = ("google.", "google/", "google\\", "genai")
+# Defensive commercial strip: ensure zero google.genai / google.* / hex_helper.devlab / agent_bridge entries sneak into PYZ/datas
+_forbidden_exact = {
+    "google",
+    "devlab",
+    "hex_helper.devlab",
+    "hex_helper.bridge.agent_bridge",
+}
+_forbidden_prefixes = (
+    "google.",
+    "google/",
+    "google\\",
+    "genai",
+    "hex_helper.devlab.",
+    "hex_helper/devlab",
+    "hex_helper\\devlab",
+    "devlab.",
+    "devlab/",
+    "devlab\\",
+    "hex_helper.bridge.agent_bridge.",
+)
+_forbidden_data_tokens = (
+    "google/genai",
+    "google_genai",
+    "google/auth",
+    "hex_helper/devlab",
+    "hex_helper.devlab",
+    "/devlab/",
+    "/devlab.",
+    "flight_recorder",
+    "hex_helper/bridge/agent_bridge",
+    "/agent_bridge.",
+    "/agent_bridge/",
+)
+
+
+def _is_forbidden_commercial_module(mod_name: str) -> bool:
+    low = str(mod_name).lower()
+    if low in _forbidden_exact or low.startswith(_forbidden_prefixes):
+        return True
+    if ".devlab." in low or low.endswith(".devlab") or "flight_recorder" in low:
+        return True
+    return False
+
+
+def _is_forbidden_commercial_data(data_name: str) -> bool:
+    norm = str(data_name).lower().replace("\\", "/")
+    if any(part in norm for part in _forbidden_data_tokens):
+        return True
+    return norm.startswith(("devlab/", "devlab.", "agent_bridge.", "agent_bridge/")) or norm in (
+        "devlab",
+        "agent_bridge",
+    )
+
+
 a.pure = [
     entry for entry in a.pure
-    if not (entry[0] == "google" or entry[0].startswith(_forbidden_prefixes))
+    if not _is_forbidden_commercial_module(entry[0])
 ]
 a.datas = [
     entry for entry in a.datas
-    if not any(part in entry[0].lower().replace("\\", "/") for part in ("google/genai", "google_genai", "google/auth"))
+    if not _is_forbidden_commercial_data(entry[0])
 ]
 
 pyz = PYZ(a.pure)

@@ -1,10 +1,11 @@
-"""Offline LOL V16.23 Hextech match recap card renderer & 1-click clipboard share dialog."""
+"""Offline LOL V16.23 Hextech match recap card v2 renderer & 1-click clipboard share dialog."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
+from typing import Callable
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
@@ -41,11 +42,11 @@ from hex_helper.ui.theme import (
     load_app_icon,
 )
 
-# Canonical logical design dimensions (16:9-ish shareable trophy card)
+# Canonical logical design dimensions (generous 760x480 layout: 100% zero item-name clipping)
 CARD_DEFAULT_WIDTH = 760
-CARD_DEFAULT_HEIGHT = 430
+CARD_DEFAULT_HEIGHT = 480
 
-# Authentic LOL V16.23 Hextech Palette (strictly desktop Hextech; zero Web orange)
+# Authentic LOL V16.23 Hextech Palette (strictly desktop Hextech; ZERO Web Tactile Orange)
 _BG_DARK_START = "#040E1A"
 _BG_DARK_MID = "#091428"
 _BG_DARK_END = "#030B16"
@@ -57,7 +58,12 @@ _GOLD_HAIRLINE = "#463714"
 _CYAN_BRIGHT = "#5EEAD4"
 _CYAN_PRIMARY = "#0AC8B9"
 _CYAN_MID = "#0397AB"
-_COACH_PANEL_BG = "#061A2A"
+_DEFEAT_CRIMSON = "#D96674"
+_DEFEAT_CRIMSON_SOFT = "#F5B8C0"
+_DEFEAT_BG_TOP = "#2B111A"
+_DEFEAT_BG_BOT = "#120A14"
+_PANEL_DARK_LEFT = "#061626"
+_PANEL_DARK_RIGHT = "#061A2A"
 _TEXT_MUTED = "#A09B8C"
 _TEXT_FAINT = "#6B6B68"
 
@@ -85,6 +91,46 @@ _RARITY_PALETTE: dict[str, dict[str, str]] = {
     },
 }
 
+_STAT_KEY_MAP: dict[str, str] = {
+    "ad": "ad",
+    "attackdamage": "ad",
+    "attack_damage": "ad",
+    "ap": "ap",
+    "abilitypower": "ap",
+    "ability_power": "ap",
+    "hp": "hp",
+    "maxhealth": "hp",
+    "max_health": "hp",
+    "health": "hp",
+    "armor": "armor",
+    "arm": "armor",
+    "mr": "mr",
+    "magicresist": "mr",
+    "magic_resist": "mr",
+    "spellblock": "mr",
+    "ah": "ah",
+    "abilityhaste": "ah",
+    "ability_haste": "ah",
+    "as": "as",
+    "attackspeed": "as",
+    "attack_speed": "as",
+    "ms": "ms",
+    "movespeed": "ms",
+    "move_speed": "ms",
+}
+
+# (canonical_key, zh_label, short_en, mayhem_gold_threshold)
+_STAT_DISPLAY_SPECS: tuple[tuple[str, str, str, float], ...] = (
+    ("ad", "攻击", "AD", 450.0),
+    ("ap", "法强", "AP", 750.0),
+    ("hp", "生命", "HP", 8000.0),
+    ("ah", "急速", "AH", 140.0),
+    ("armor", "护甲", "ARM", 300.0),
+    ("mr", "魔抗", "MR", 220.0),
+    ("as", "攻速", "AS", 2.5),
+    ("ms", "移速", "MS", 520.0),
+)
+
 _CARD_FONTS_READY = False
 _CINZEL_FAMILY = "Cinzel"
 _COPY_BTN_DEFAULT_TEXT = "📋 一键复制战报图"
@@ -93,17 +139,18 @@ _SAVE_BTN_DEFAULT_TEXT = "💾 保存图片"
 _SAVE_BTN_SAVED_TEXT = "✓ 已保存图片"
 
 _KDA_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*/\s*(\d+)\s*$")
+_TEAM_KILLS_RE = re.compile(r"^\s*(\d+)\s*[:\-/]\s*(\d+)\s*$")
 _INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 
 @dataclass(frozen=True)
 class MatchRecapData:
-    """Immutable snapshot of a completed ARAM Mayhem match for card rendering."""
+    """Immutable snapshot of a completed ARAM Mayhem match for v2 card rendering."""
 
     hero_id: str
     hero_name: str
     hero_icon_path: str = ""
-    won: int = -1  # 1 = 胜利, 0 = 败局/激战, -1 = 对局结束
+    won: int = -1  # 1 = 胜利, 0 = 惜败, -1 = 激战局
     kda: str = ""
     duration_s: int = 0
     team_kills: str = ""
@@ -112,8 +159,127 @@ class MatchRecapData:
     combo_title: str = ""
     combo_completed: bool = False
     item_entries: tuple[tuple[str, str], ...] = ()  # (item_name, icon_path) up to 6
-    ai_highlight: str = ""
+    item_ids: tuple[str, ...] = ()  # parallel raw item IDs for async icon hydration
+    ai_highlight: str = ""  # Retained for backward compatibility with legacy callers/tests
     dataset_patch: str = "26.23"
+    # v2 telemetry & visual fields
+    augment_icon_paths: tuple[str, ...] = ()  # parallel local PNG paths for the 4 augments
+    final_stats: dict[str, float] = field(default_factory=dict)
+    damage_dealt: int = 0
+    damage_share: float = 0.0
+    damage_taken: int = 0
+    heal_and_shield: int = 0
+    gold_earned: int = 0
+    kill_participation: float = 0.0
+    match_score: float = 0.0
+    rating_grade: str = ""
+    mvp_badge: str = ""  # "MVP" | "SVP" | ""
+
+
+def normalize_final_stats(raw_stats: dict[str, float] | None) -> dict[str, float]:
+    """Normalize LiveClient or canonical stat dictionaries into {ad, ap, hp, armor, mr, ah, as, ms}."""
+    if not isinstance(raw_stats, dict) or not raw_stats:
+        return {}
+    out: dict[str, float] = {}
+    for raw_k, raw_v in raw_stats.items():
+        norm_k = _STAT_KEY_MAP.get(str(raw_k or "").strip().lower())
+        if not norm_k:
+            continue
+        try:
+            val = float(raw_v)
+        except (TypeError, ValueError):
+            continue
+        if val != val or val < 0.0:  # guard NaN / negative
+            continue
+        out[norm_k] = val
+    return out
+
+
+def _grade_for_score(score: float) -> str:
+    if score >= 12.8:
+        return "S+"
+    if score >= 11.0:
+        return "S"
+    if score >= 9.5:
+        return "A+"
+    if score >= 8.0:
+        return "A"
+    return "B"
+
+
+def compute_match_rating(
+    kda: str | float = "",
+    won: int = -1,
+    damage_share: float = 0.0,
+    damage_taken_share: float = 0.0,
+    kp: float = 0.0,
+    gold_per_min: float = 0.0,
+) -> tuple[float, str, str]:
+    """Compute a transparent 0.0-16.0 ARAM Mayhem combat rating.
+
+    Returns ``(score, grade, badge)`` where ``grade`` is in ``{"S+", "S", "A+", "A", "B"}``
+    and ``badge`` is ``"MVP"``, ``"SVP"``, or ``""``.
+    """
+    has_kda = False
+    kda_ratio = 0.0
+    if isinstance(kda, (int, float)):
+        v = float(kda)
+        if v > 0.0:
+            kda_ratio = v
+            has_kda = True
+    elif isinstance(kda, str) and kda.strip():
+        m = _KDA_RE.match(kda)
+        if m:
+            k, d, a = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            has_kda = True
+            if d == 0:
+                kda_ratio = min(12.0, (k + a) * 0.85) if (k + a) > 0 else 0.0
+            else:
+                kda_ratio = (k + a) / float(d)
+
+    def _norm_share(val: float) -> float:
+        try:
+            f = float(val or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if f <= 0.0:
+            return 0.0
+        return min(1.0, f / 100.0 if f > 1.0 else f)
+
+    dmg_s = _norm_share(damage_share)
+    tank_s = _norm_share(damage_taken_share)
+    kp_s = _norm_share(kp)
+    try:
+        gpm = max(0.0, float(gold_per_min or 0.0))
+    except (TypeError, ValueError):
+        gpm = 0.0
+
+    has_combat = (dmg_s > 0.0) or (tank_s > 0.0) or (kp_s > 0.0) or (gpm > 0.0)
+    if not has_kda and not has_combat:
+        return 0.0, "", ""
+
+    win_bonus = 0.9 if won == 1 else (-0.2 if won == 0 else 0.0)
+    if has_combat:
+        kda_pts = min(4.2, kda_ratio * 0.82)
+        dmg_pts = min(3.4, max(0.0, dmg_s - 0.10) * 14.0)
+        tank_pts = min(2.4, max(0.0, tank_s - 0.15) * 11.0)
+        combat_pts = min(4.2, dmg_pts + tank_pts * 0.72)
+        kp_pts = min(1.8, max(0.0, kp_s - 0.35) * 4.0)
+        gpm_pts = min(1.0, max(0.0, (gpm - 750.0) / 550.0))
+        raw_score = 4.4 + kda_pts + combat_pts + kp_pts + gpm_pts + win_bonus
+    else:
+        # KDA-only fallback when EOG shares are unavailable
+        raw_score = 5.4 + min(5.6, kda_ratio * 1.05) + (1.2 if won == 1 else (-0.3 if won == 0 else 0.0))
+
+    score = round(max(1.0, min(16.0, raw_score)), 1)
+    grade = _grade_for_score(score)
+    if won == 1 and score >= 12.8:
+        badge = "MVP"
+    elif won == 0 and score >= 12.0:
+        badge = "SVP"
+    else:
+        badge = ""
+    return score, grade, badge
 
 
 def _ensure_card_fonts() -> None:
@@ -134,7 +300,6 @@ def _ensure_card_fonts() -> None:
             _CINZEL_FAMILY = fam
             break
 
-    # Under QT_QPA_PLATFORM=offscreen on Windows, system fonts are not auto-populated.
     need_cjk = not any(
         f in families for f in ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC")
     )
@@ -213,6 +378,33 @@ def _format_duration(duration_s: int) -> str:
     return f"{mins:02d}:{rem:02d}"
 
 
+def _format_cn_metric(value: int) -> str:
+    v = max(0, int(value or 0))
+    if v <= 0:
+        return "--"
+    if v >= 10_000:
+        return f"{v / 10_000.0:.1f}万"
+    return f"{v:,}"
+
+
+def _format_gold_k(value: int) -> str:
+    v = max(0, int(value or 0))
+    if v <= 0:
+        return "--"
+    if v >= 1000:
+        return f"{v / 1000.0:.1f}K"
+    return str(v)
+
+
+def _format_stat_value(key: str, val: float) -> str:
+    if key == "as":
+        return f"{val:.2f}"
+    iv = int(round(val))
+    if key == "hp" and iv >= 1000:
+        return f"{iv:,}"
+    return str(iv)
+
+
 def _parse_kda(kda: str) -> tuple[str, str, str, str] | None:
     m = _KDA_RE.match(kda or "")
     if not m:
@@ -224,6 +416,48 @@ def _parse_kda(kda: str) -> tuple[str, str, str, str] | None:
     else:
         ratio = f"{(k + a) / d:.1f} KDA"
     return k_str, d_str, a_str, ratio
+
+
+def _derive_kill_participation(data: MatchRecapData) -> float:
+    kp = float(data.kill_participation or 0.0)
+    if kp > 0.0:
+        return min(1.0, kp / 100.0 if kp > 1.0 else kp)
+    m_kda = _KDA_RE.match(data.kda or "")
+    m_tk = _TEAM_KILLS_RE.match(data.team_kills or "")
+    if m_kda and m_tk:
+        k, _d, a = int(m_kda.group(1)), int(m_kda.group(2)), int(m_kda.group(3))
+        my_team_k = int(m_tk.group(1))
+        if my_team_k > 0:
+            return min(1.0, (k + a) / float(my_team_k))
+    return 0.0
+
+
+def _resolve_rating(data: MatchRecapData) -> tuple[float, str, str]:
+    """Resolve explicit or auto-computed (score, grade, badge) for header rendering."""
+    if float(data.match_score or 0.0) > 0.0:
+        sc = round(max(0.1, min(16.0, float(data.match_score))), 1)
+        grade = (data.rating_grade or "").strip() or _grade_for_score(sc)
+        badge = (data.mvp_badge or "").strip().upper()
+        if badge not in ("MVP", "SVP"):
+            badge = ""
+        return sc, grade, badge
+
+    kp_eff = _derive_kill_participation(data)
+    gpm = (float(data.gold_earned) / (float(data.duration_s) / 60.0)) if (data.gold_earned > 0 and data.duration_s >= 60) else 0.0
+    sc, grade, badge = compute_match_rating(
+        kda=data.kda,
+        won=data.won,
+        damage_share=data.damage_share,
+        damage_taken_share=0.0,
+        kp=kp_eff,
+        gold_per_min=gpm,
+    )
+    if (data.rating_grade or "").strip():
+        grade = data.rating_grade.strip()
+    if (data.mvp_badge or "").strip():
+        b_raw = data.mvp_badge.strip().upper()
+        badge = b_raw if b_raw in ("MVP", "SVP") else ""
+    return sc, grade, badge
 
 
 def _safe_filename_part(name: str) -> str:
@@ -311,7 +545,6 @@ def _wrap_text_max_lines(
             lines.append(fm.elidedText(rem, Qt.TextElideMode.ElideRight, max_width))
             break
 
-        # Binary search largest fitting prefix
         lo, hi = 1, len(rem)
         best = 1
         while lo <= hi:
@@ -322,9 +555,14 @@ def _wrap_text_max_lines(
             else:
                 hi = mid - 1
 
-        # Prefer breaking at an ASCII space if near the end of an ASCII word
         split_at = best
-        if best < len(rem) and rem[best - 1].isascii() and rem[best - 1].isalnum() and rem[best].isascii() and rem[best].isalnum():
+        if (
+            best < len(rem)
+            and rem[best - 1].isascii()
+            and rem[best - 1].isalnum()
+            and rem[best].isascii()
+            and rem[best].isalnum()
+        ):
             last_sp = rem.rfind(" ", 0, best)
             if last_sp >= max(1, int(best * 0.55)):
                 split_at = last_sp
@@ -334,7 +572,6 @@ def _wrap_text_max_lines(
             chunk = rem[:best]
             split_at = best
         lines.append(chunk)
-        # Advance idx past consumed prefix inside original `clean`
         leading_trim = len(clean[idx:]) - len(rem)
         idx += leading_trim + split_at
 
@@ -345,96 +582,98 @@ def _draw_background_and_frame(p: QPainter, lw: float, lh: float, data: MatchRec
     """Layer 1 & 2: Deep navy-black Hextech gradient, glows, diagonal sheen, bevels, corner brackets."""
     full_rect = QRectF(0.0, 0.0, lw, lh)
 
-    # Base deep obsidian-navy gradient (#040E1A -> #091428 -> #030B16)
     bg = QLinearGradient(0.0, 0.0, lw, lh)
     bg.setColorAt(0.0, QColor(_BG_DARK_START))
     bg.setColorAt(0.52, QColor(_BG_DARK_MID))
     bg.setColorAt(1.0, QColor(_BG_DARK_END))
     p.fillRect(full_rect, QBrush(bg))
 
-    # Status-reactive radial atmosphere glows
+    # Status-reactive top-left atmospheric glow
     if data.won == 1:
-        top_glow = QRadialGradient(QPointF(140.0, 74.0), 290.0)
-        top_glow.setColorAt(0.0, QColor(200, 170, 110, 46))
-        top_glow.setColorAt(0.55, QColor(200, 155, 60, 16))
+        top_glow = QRadialGradient(QPointF(150.0, 74.0), 300.0)
+        top_glow.setColorAt(0.0, QColor(200, 170, 110, 48))
+        top_glow.setColorAt(0.50, QColor(10, 200, 185, 18))
         top_glow.setColorAt(1.0, QColor(0, 0, 0, 0))
     elif data.won == 0:
-        top_glow = QRadialGradient(QPointF(140.0, 74.0), 290.0)
-        top_glow.setColorAt(0.0, QColor(10, 200, 185, 44))
-        top_glow.setColorAt(0.55, QColor(3, 151, 171, 16))
+        top_glow = QRadialGradient(QPointF(150.0, 74.0), 290.0)
+        top_glow.setColorAt(0.0, QColor(190, 72, 92, 42))
+        top_glow.setColorAt(0.55, QColor(200, 155, 60, 14))
         top_glow.setColorAt(1.0, QColor(0, 0, 0, 0))
     else:
-        top_glow = QRadialGradient(QPointF(140.0, 74.0), 270.0)
-        top_glow.setColorAt(0.0, QColor(110, 180, 175, 34))
+        top_glow = QRadialGradient(QPointF(150.0, 74.0), 280.0)
+        top_glow.setColorAt(0.0, QColor(10, 200, 185, 42))
+        top_glow.setColorAt(0.55, QColor(200, 170, 110, 15))
         top_glow.setColorAt(1.0, QColor(0, 0, 0, 0))
     p.fillRect(full_rect, QBrush(top_glow))
 
-    # Lower-right subtle Hextech cyan bloom
-    br_glow = QRadialGradient(QPointF(lw - 105.0, lh - 68.0), 260.0)
-    br_glow.setColorAt(0.0, QColor(10, 200, 185, 30))
-    br_glow.setColorAt(0.6, QColor(3, 151, 171, 12))
+    # Lower-right Hextech cyan bloom behind combat telemetry dashboard
+    br_glow = QRadialGradient(QPointF(lw - 135.0, lh - 92.0), 290.0)
+    br_glow.setColorAt(0.0, QColor(10, 200, 185, 36))
+    br_glow.setColorAt(0.58, QColor(3, 151, 171, 14))
     br_glow.setColorAt(1.0, QColor(0, 0, 0, 0))
     p.fillRect(full_rect, QBrush(br_glow))
 
-    # Subtle prismatic shimmer behind center band when high-roll / first prismatic
+    # Subtle prismatic shimmer behind augments row when prismatic augment present
     has_prism = data.is_first_prismatic or data.combo_completed or any(
         _normalize_rarity(r) == "prismatic" for _, r in data.augments
     )
     if has_prism:
-        prism_glow = QRadialGradient(QPointF(lw * 0.5, 184.0), 280.0)
+        prism_glow = QRadialGradient(QPointF(lw * 0.5, 182.0), 290.0)
         prism_glow.setColorAt(0.0, QColor(217, 70, 239, 26))
         prism_glow.setColorAt(0.6, QColor(147, 51, 234, 9))
         prism_glow.setColorAt(1.0, QColor(0, 0, 0, 0))
         p.fillRect(full_rect, QBrush(prism_glow))
 
-    # Clipped interior diagonal sheen lines + faint geometric Hextech rune arc
     outer_rect = QRectF(5.0, 5.0, lw - 10.0, lh - 10.0)
     outer_path = _chamfer_path(outer_rect, 8.0)
     p.save()
     p.setClipPath(outer_path)
 
-    # Diagonal sheen ribbons (45-degree specular architectural streaks)
+    # Subtle diagonal architectural sheen bands
     sheen_specs = (
-        (lw * 0.14, 54.0, QColor(200, 170, 110, 13)),
-        (lw * 0.44, 34.0, QColor(10, 200, 185, 11)),
+        (lw * 0.14, 54.0, QColor(200, 170, 110, 12)),
+        (lw * 0.44, 34.0, QColor(10, 200, 185, 12)),
         (lw * 0.72, 68.0, QColor(200, 170, 110, 10)),
-        (lw * 0.90, 26.0, QColor(240, 230, 210, 8)),
+        (lw * 0.90, 28.0, QColor(240, 230, 210, 8)),
     )
     for x_start, band_w, col in sheen_specs:
         poly = QPolygonF(
             [
                 QPointF(x_start, 0.0),
                 QPointF(x_start + band_w, 0.0),
-                QPointF(x_start + band_w - lh * 0.52, lh),
-                QPointF(x_start - lh * 0.52, lh),
+                QPointF(x_start + band_w - lh * 0.50, lh),
+                QPointF(x_start - lh * 0.50, lh),
             ]
         )
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(col)
         p.drawPolygon(poly)
 
-    # Fine diagonal hairline strokes
     p.setPen(QPen(QColor(200, 170, 110, 22), 1.0))
-    p.drawLine(QPointF(lw * 0.62, 0.0), QPointF(lw * 0.62 - lh * 0.52, lh))
-    p.setPen(QPen(QColor(10, 200, 185, 20), 1.0))
-    p.drawLine(QPointF(lw * 0.88, 0.0), QPointF(lw * 0.88 - lh * 0.52, lh))
+    p.drawLine(QPointF(lw * 0.62, 0.0), QPointF(lw * 0.62 - lh * 0.50, lh))
+    p.setPen(QPen(QColor(10, 200, 185, 22), 1.0))
+    p.drawLine(QPointF(lw * 0.88, 0.0), QPointF(lw * 0.88 - lh * 0.50, lh))
 
-    # Faint Hextech geometric compass rings on upper-right background
-    rcx, rcy = lw - 76.0, 84.0
+    # Faint Hextech compass rings on upper-right background
+    rcx, rcy = lw - 76.0, 86.0
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.setPen(QPen(QColor(200, 170, 110, 20), 1.0))
-    p.drawEllipse(QPointF(rcx, rcy), 84.0, 84.0)
-    p.setPen(QPen(QColor(10, 200, 185, 18), 1.0, Qt.PenStyle.DashLine))
-    p.drawEllipse(QPointF(rcx, rcy), 112.0, 112.0)
+    p.drawEllipse(QPointF(rcx, rcy), 86.0, 86.0)
+    p.setPen(QPen(QColor(10, 200, 185, 20), 1.0, Qt.PenStyle.DashLine))
+    p.drawEllipse(QPointF(rcx, rcy), 116.0, 116.0)
     p.restore()
 
     # Outer soft ambient rim glow
-    rim_aura = QColor(200, 170, 110, 42) if data.won != 0 else QColor(10, 200, 185, 40)
+    rim_aura = (
+        QColor(200, 170, 110, 44)
+        if data.won == 1
+        else (QColor(217, 102, 116, 36) if data.won == 0 else QColor(10, 200, 185, 40))
+    )
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.setPen(QPen(rim_aura, 3.2))
     p.drawPath(outer_path)
 
-    # Outer metallic gold bevel (#F0E6D2 -> #C8AA6E -> #785A28 -> #C8AA6E)
+    # Outer metallic gold bevel
     gold_bevel = QLinearGradient(0.0, 0.0, lw, lh)
     gold_bevel.setColorAt(0.0, QColor(_GOLD_CREAM))
     gold_bevel.setColorAt(0.28, QColor(_GOLD_PRIMARY))
@@ -443,7 +682,7 @@ def _draw_background_and_frame(p: QPainter, lw: float, lh: float, data: MatchRec
     p.setPen(QPen(QBrush(gold_bevel), 1.6))
     p.drawPath(outer_path)
 
-    # Inner dark antique-gold hairline (#463714)
+    # Inner dark antique-gold hairline
     inner_rect = QRectF(10.0, 10.0, lw - 20.0, lh - 20.0)
     inner_path = _chamfer_path(inner_rect, 5.0)
     p.setPen(QPen(QColor(_GOLD_HAIRLINE), 1.0))
@@ -454,13 +693,15 @@ def _draw_background_and_frame(p: QPainter, lw: float, lh: float, data: MatchRec
     p.setPen(QPen(QColor(_GOLD_CREAM), 1.8))
     p.drawLine(QPointF(top_mid - 58.0, 5.0), QPointF(top_mid + 58.0, 5.0))
     _draw_diamond(p, top_mid, 5.0, 3.8, QColor(_GOLD_CREAM))
-    _draw_diamond(p, top_mid, 5.0, 1.8, QColor(_CYAN_PRIMARY if data.won == 0 else _GOLD_METAL))
+    _draw_diamond(p, top_mid, 5.0, 1.8, QColor(_CYAN_PRIMARY if data.won != 0 else _DEFEAT_CRIMSON))
 
-    # 4 Corner Hextech Brackets + tiny rivets
+    # 4 Corner Hextech Brackets + rivets
     arm = 18.0
     m = 3.5
-    rivet_col = QColor(_GOLD_PRIMARY if data.won != 0 else _CYAN_PRIMARY)
-    bracket_pen = QPen(QColor(_GOLD_CREAM), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap, Qt.PenJoinStyle.MiterJoin)
+    rivet_col = QColor(_GOLD_PRIMARY if data.won == 1 else (_DEFEAT_CRIMSON if data.won == 0 else _CYAN_PRIMARY))
+    bracket_pen = QPen(
+        QColor(_GOLD_CREAM), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap, Qt.PenJoinStyle.MiterJoin
+    )
     p.setPen(bracket_pen)
     corners = (
         (m, m, 1.0, 1.0),
@@ -483,30 +724,30 @@ def _draw_background_and_frame(p: QPainter, lw: float, lh: float, data: MatchRec
 
 
 def _draw_top_ribbon(p: QPainter, lw: float, data: MatchRecapData) -> None:
-    """Layer 3: Top-left Victory/Battle badge + optional 首棱彩局 tag + top-right Patch badge."""
-    y = 18.0
+    """Layer 3: Status badge (VICTORY / DEFEAT / ARAM) + 首棱彩局 + Duration + Team Kills + Patch."""
+    y = 17.0
     h = 26.0
     x = 24.0
 
-    # 1. Victory / Battle / Recap status badge
+    # 1. Victory / Defeat / ARAM status badge
     if data.won == 1:
         badge_text = "✦ 胜利 · VICTORY"
-        bg_top, bg_bot = QColor("#36260E"), QColor("#181108")
-        border_c1, border_c2 = QColor(_GOLD_CREAM), QColor(_GOLD_METAL)
-        glow_col = QColor(200, 170, 110, 72)
+        bg_top, bg_bot = QColor("#36260E"), QColor("#15110B")
+        border_c1, border_c2 = QColor(_GOLD_CREAM), QColor(_CYAN_PRIMARY)
+        glow_col = QColor(200, 170, 110, 74)
         text_col = QColor(_GOLD_CREAM)
     elif data.won == 0:
+        badge_text = "◆ 惜败 · DEFEAT"
+        bg_top, bg_bot = QColor(_DEFEAT_BG_TOP), QColor(_DEFEAT_BG_BOT)
+        border_c1, border_c2 = QColor(_DEFEAT_CRIMSON_SOFT), QColor(_GOLD_PRIMARY)
+        glow_col = QColor(217, 102, 116, 66)
+        text_col = QColor(_DEFEAT_CRIMSON_SOFT)
+    else:
         badge_text = "◈ 激战局 · ARAM"
         bg_top, bg_bot = QColor("#0A3240"), QColor("#051721")
-        border_c1, border_c2 = QColor(_CYAN_BRIGHT), QColor(_CYAN_PRIMARY)
-        glow_col = QColor(10, 200, 185, 70)
+        border_c1, border_c2 = QColor(_CYAN_BRIGHT), QColor(_GOLD_PRIMARY)
+        glow_col = QColor(10, 200, 185, 68)
         text_col = QColor(_CYAN_BRIGHT)
-    else:
-        badge_text = "◆ 对局结束 · RECAP"
-        bg_top, bg_bot = QColor("#122338"), QColor("#081322")
-        border_c1, border_c2 = QColor(_GOLD_PRIMARY), QColor(_CYAN_MID)
-        glow_col = QColor(200, 170, 110, 44)
-        text_col = QColor(_GOLD_CREAM)
 
     badge_font = _sans_font(12, bold=True, letter_spacing=0.9)
     fm = QFontMetricsF(badge_font)
@@ -535,18 +776,18 @@ def _draw_top_ribbon(p: QPainter, lw: float, data: MatchRecapData) -> None:
     p.setPen(text_col)
     p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
 
-    x += badge_w + 9.0
+    x += badge_w + 8.0
 
     # 2. Optional 首棱彩局 prismatic tag
     if data.is_first_prismatic:
         prism_text = "✦ 首棱彩局"
-        p_font = _sans_font(12, bold=True, letter_spacing=0.6)
+        p_font = _sans_font(11, bold=True, letter_spacing=0.6)
         pfm = QFontMetricsF(p_font)
-        pw = pfm.horizontalAdvance(prism_text) + 20.0
-        p_rect = QRectF(x, y, pw, h)
-        p_path = _chamfer_path(p_rect, 5.0)
+        pw = pfm.horizontalAdvance(prism_text) + 18.0
+        p_rect = QRectF(x, y + 1.0, pw, h - 2.0)
+        p_path = _chamfer_path(p_rect, 4.5)
 
-        p.setPen(QPen(QColor(217, 70, 239, 68), 3.2))
+        p.setPen(QPen(QColor(217, 70, 239, 64), 3.0))
         p.drawPath(p_path)
 
         p_fill = QLinearGradient(p_rect.left(), p_rect.top(), p_rect.right(), p_rect.bottom())
@@ -558,36 +799,75 @@ def _draw_top_ribbon(p: QPainter, lw: float, data: MatchRecapData) -> None:
         p_rim.setColorAt(0.0, QColor("#F5D0FE"))
         p_rim.setColorAt(0.5, QColor("#D946EF"))
         p_rim.setColorAt(1.0, QColor("#9333EA"))
-        p.setPen(QPen(QBrush(p_rim), 1.4))
+        p.setPen(QPen(QBrush(p_rim), 1.3))
         p.drawPath(p_path)
 
         p.setFont(p_font)
         p.setPen(QColor("#FAE8FF"))
         p.drawText(p_rect, Qt.AlignmentFlag.AlignCenter, prism_text)
 
-    # 3. Top-right Patch badge
+    # 3. Right-side compact chips: [Team Kills] [Duration] [PATCH]
+    right_cursor = lw - 24.0
+    chip_h = h - 2.0
+    chip_y = y + 1.0
+
+    def _draw_right_chip(
+        label: str,
+        value: str,
+        *,
+        val_color: QColor,
+        border_color: QColor,
+        latin_val: bool = False,
+    ) -> None:
+        nonlocal right_cursor
+        lbl_f = _sans_font(10, bold=False)
+        val_f = _latin_font(11, bold=True, letter_spacing=1.0) if latin_val else _sans_font(11, bold=True, letter_spacing=0.4)
+        lfm = QFontMetricsF(lbl_f)
+        vfm = QFontMetricsF(val_f)
+        lw_p = lfm.horizontalAdvance(label) if label else 0.0
+        vw_p = vfm.horizontalAdvance(value)
+        inner_gap = 5.0 if label else 0.0
+        cw = lw_p + inner_gap + vw_p + 18.0
+        c_rect = QRectF(right_cursor - cw, chip_y, cw, chip_h)
+        c_path = _chamfer_path(c_rect, 4.0)
+        p.fillPath(c_path, QColor(9, 22, 38, 222))
+        p.setPen(QPen(border_color, 1.05))
+        p.drawPath(c_path)
+
+        tx = c_rect.left() + 9.0
+        if label:
+            p.setFont(lbl_f)
+            p.setPen(QColor(_TEXT_MUTED))
+            p.drawText(QRectF(tx, chip_y, lw_p + 2.0, chip_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+            tx += lw_p + inner_gap
+        p.setFont(val_f)
+        p.setPen(val_color)
+        p.drawText(QRectF(tx, chip_y, vw_p + 4.0, chip_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, value)
+        right_cursor -= cw + 7.0
+
     patch_str = f"PATCH {(data.dataset_patch or '26.23').strip()}"
-    patch_font = _latin_font(11, bold=True, letter_spacing=1.2)
-    pt_fm = QFontMetricsF(patch_font)
-    pt_w = pt_fm.horizontalAdvance(patch_str) + 22.0
-    pt_rect = QRectF(lw - 24.0 - pt_w, y + 1.0, pt_w, h - 2.0)
-    pt_path = _chamfer_path(pt_rect, 4.0)
-    p.fillPath(pt_path, QColor(9, 22, 38, 220))
-    p.setPen(QPen(QColor(_GOLD_BRONZE), 1.1))
-    p.drawPath(pt_path)
-    p.setFont(patch_font)
-    p.setPen(QColor(_GOLD_PRIMARY))
-    p.drawText(pt_rect, Qt.AlignmentFlag.AlignCenter, patch_str)
+    _draw_right_chip("", patch_str, val_color=QColor(_GOLD_PRIMARY), border_color=QColor(_GOLD_BRONZE), latin_val=True)
+
+    dur_str = _format_duration(data.duration_s)
+    if dur_str:
+        _draw_right_chip("时长", dur_str, val_color=QColor(_GOLD_CREAM), border_color=QColor(_GOLD_HAIRLINE))
+
+    tk_str = (data.team_kills or "").strip()
+    if tk_str:
+        _draw_right_chip("人头", tk_str, val_color=QColor(_CYAN_BRIGHT), border_color=QColor(3, 151, 171, 165))
 
 
 def _draw_hero_portrait(p: QPainter, x: float, y: float, size: float, data: MatchRecapData) -> None:
-    """64x64 circular/beveled hero portrait with metallic gold frame and monogram fallback."""
+    """62x62 circular hero portrait with metallic gold frame and monogram fallback."""
     cx = x + size * 0.5
     cy = y + size * 0.5
     r = size * 0.5
 
-    # Soft outer halo
-    halo_col = QColor(200, 170, 110, 62) if data.won != 0 else QColor(10, 200, 185, 62)
+    halo_col = (
+        QColor(200, 170, 110, 62)
+        if data.won == 1
+        else (QColor(217, 102, 116, 52) if data.won == 0 else QColor(10, 200, 185, 62))
+    )
     halo = QRadialGradient(QPointF(cx, cy), r + 7.0)
     halo.setColorAt(0.7, halo_col)
     halo.setColorAt(1.0, QColor(0, 0, 0, 0))
@@ -603,28 +883,24 @@ def _draw_hero_portrait(p: QPainter, x: float, y: float, size: float, data: Matc
     p.save()
     p.setClipPath(clip)
     if img is not None:
-        # Center-crop square and smooth-scale
         side = min(img.width(), img.height())
         sx = (img.width() - side) // 2
         sy = (img.height() - side) // 2
-        cropped = img.copy(sx, sy, side, side)
-        p.drawImage(inner_rect, cropped)
+        p.drawImage(inner_rect, img.copy(sx, sy, side, side))
     else:
-        # Graceful Hextech gold monogram fallback
         med = QRadialGradient(QPointF(cx, cy), r)
         med.setColorAt(0.0, QColor("#103A4F"))
         med.setColorAt(0.6, QColor("#091428"))
         med.setColorAt(1.0, QColor("#030A14"))
         p.fillRect(inner_rect, QBrush(med))
 
-        # Inner subtle cyan rune circle
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(10, 200, 185, 110), 1.0))
+        p.setPen(QPen(QColor(10, 200, 185, 115), 1.0))
         p.drawEllipse(inner_rect.adjusted(4.0, 4.0, -4.0, -4.0))
 
         hero_txt = (data.hero_name or "").strip()
         monogram = hero_txt[0] if hero_txt else ((data.hero_id or "H").strip()[:2].upper() or "H")
-        m_font = _sans_font(26 if len(monogram) == 1 else 18, bold=True)
+        m_font = _sans_font(25 if len(monogram) == 1 else 18, bold=True)
         p.setFont(m_font)
         p.setPen(QColor(0, 0, 0, 190))
         p.drawText(inner_rect.translated(0.0, 1.5), Qt.AlignmentFlag.AlignCenter, monogram)
@@ -632,34 +908,126 @@ def _draw_hero_portrait(p: QPainter, x: float, y: float, size: float, data: Matc
         p.drawText(inner_rect, Qt.AlignmentFlag.AlignCenter, monogram)
     p.restore()
 
-    # Metallic antique-gold circular ring
     ring_grad = QLinearGradient(x, y, x + size, y + size)
     ring_grad.setColorAt(0.0, QColor(_GOLD_CREAM))
     ring_grad.setColorAt(0.35, QColor(_GOLD_METAL))
     ring_grad.setColorAt(0.75, QColor(_GOLD_BRONZE))
     ring_grad.setColorAt(1.0, QColor(_GOLD_PRIMARY))
     p.setBrush(Qt.BrushStyle.NoBrush)
-    p.setPen(QPen(QBrush(ring_grad), 2.6))
-    p.drawEllipse(QRectF(x + 1.3, y + 1.3, size - 2.6, size - 2.6))
+    p.setPen(QPen(QBrush(ring_grad), 2.5))
+    p.drawEllipse(QRectF(x + 1.25, y + 1.25, size - 2.5, size - 2.5))
 
-    # Subtle 4 cardinal gold micro-diamonds on portrait bezel
     for dx, dy in ((0.0, -r), (r, 0.0), (0.0, r), (-r, 0.0)):
-        _draw_diamond(p, cx + dx, cy + dy, 2.3, QColor(_GOLD_CREAM))
+        _draw_diamond(p, cx + dx, cy + dy, 2.2, QColor(_GOLD_CREAM))
 
 
 def _draw_header(p: QPainter, lw: float, data: MatchRecapData) -> None:
-    """Layer 4: Hero portrait, hero name, KDA block, duration (MM:SS), and team kills."""
-    portrait_x = 26.0
-    portrait_y = 56.0
-    portrait_sz = 64.0
+    """Layer 4: Hero portrait + Hero name + Build Synergy Tag on left; KDA + Hardcore Rating Badge on right."""
+    portrait_x = 24.0
+    portrait_y = 55.0
+    portrait_sz = 62.0
     _draw_hero_portrait(p, portrait_x, portrait_y, portrait_sz, data)
 
-    # Right-side KDA metric panel (measure first so hero name never collides)
+    # Right-side: [KDA Panel] + [Hardcore Rating Badge]
+    score, grade, mvp_badge = _resolve_rating(data)
+    right_x = lw - 24.0
+    right_used_w = 0.0
+
+    if score > 0.0 and grade:
+        is_s_plus = grade == "S+"
+        is_s = grade in ("S+", "S")
+        rating_w = 136.0 if mvp_badge else 120.0
+        r_rect = QRectF(right_x - rating_w, 54.0, rating_w, 64.0)
+        r_path = _chamfer_path(r_rect, 7.0)
+
+        # Metallic rating fill
+        r_bg = QLinearGradient(r_rect.left(), r_rect.top(), r_rect.right(), r_rect.bottom())
+        if is_s_plus:
+            r_bg.setColorAt(0.0, QColor("#30220C"))
+            r_bg.setColorAt(0.55, QColor("#122334"))
+            r_bg.setColorAt(1.0, QColor("#071522"))
+            rim_c1, rim_c2 = QColor(_GOLD_CREAM), QColor(_CYAN_PRIMARY)
+            grade_col = QColor(_GOLD_CREAM)
+            aura_col = QColor(200, 170, 110, 62)
+        elif is_s:
+            r_bg.setColorAt(0.0, QColor("#0A2C3B"))
+            r_bg.setColorAt(1.0, QColor("#061424"))
+            rim_c1, rim_c2 = QColor(_CYAN_BRIGHT), QColor(_GOLD_PRIMARY)
+            grade_col = QColor(_CYAN_BRIGHT)
+            aura_col = QColor(10, 200, 185, 52)
+        else:
+            r_bg.setColorAt(0.0, QColor("#112136"))
+            r_bg.setColorAt(1.0, QColor("#071220"))
+            rim_c1, rim_c2 = QColor(_GOLD_PRIMARY), QColor(_GOLD_BRONZE)
+            grade_col = QColor(_GOLD_PRIMARY)
+            aura_col = QColor(200, 170, 110, 30)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(aura_col, 3.0))
+        p.drawPath(r_path)
+        p.fillPath(r_path, QBrush(r_bg))
+
+        rim_g = QLinearGradient(r_rect.left(), r_rect.top(), r_rect.right(), r_rect.bottom())
+        rim_g.setColorAt(0.0, rim_c1)
+        rim_g.setColorAt(1.0, rim_c2)
+        p.setPen(QPen(QBrush(rim_g), 1.45))
+        p.drawPath(r_path)
+
+        # Top metallic highlight bar
+        p.setPen(QPen(rim_c1, 1.8))
+        p.drawLine(QPointF(r_rect.left() + 10.0, r_rect.top() + 0.6), QPointF(r_rect.right() - 10.0, r_rect.top() + 0.6))
+
+        # Left column inside badge: Grade ("S+", "S", "A+", ...)
+        g_font = _latin_font(25 if len(grade) <= 2 else 21, bold=True, letter_spacing=0.6)
+        g_rect = QRectF(r_rect.left() + 8.0, r_rect.top() + 8.0, 50.0, 48.0)
+        p.setFont(g_font)
+        p.setPen(QColor(0, 0, 0, 205))
+        p.drawText(g_rect.translated(0.0, 1.5), Qt.AlignmentFlag.AlignCenter, grade)
+        p.setPen(grade_col)
+        p.drawText(g_rect, Qt.AlignmentFlag.AlignCenter, grade)
+
+        # Right column inside badge: Score + MVP/SVP crest (or RATING tag)
+        sc_x = r_rect.left() + 58.0
+        sc_w = r_rect.right() - sc_x - 8.0
+        sc_font = _sans_font(16, bold=True, letter_spacing=0.3)
+        p.setFont(sc_font)
+        p.setPen(QColor(_GOLD_CREAM))
+        p.drawText(QRectF(sc_x, r_rect.top() + 10.0, sc_w, 22.0), Qt.AlignmentFlag.AlignCenter, f"{score:.1f}")
+
+        if mvp_badge:
+            pill_r = QRectF(sc_x + 4.0, r_rect.top() + 36.0, sc_w - 8.0, 18.0)
+            pill_p = _chamfer_path(pill_r, 3.0)
+            is_mvp = mvp_badge == "MVP"
+            p_bg = QLinearGradient(pill_r.left(), pill_r.top(), pill_r.right(), pill_r.bottom())
+            if is_mvp:
+                p_bg.setColorAt(0.0, QColor("#C89B3C"))
+                p_bg.setColorAt(1.0, QColor("#785A28"))
+                p_fg = QColor("#040E1A")
+                p_bd = QColor(_GOLD_CREAM)
+            else:
+                p_bg.setColorAt(0.0, QColor("#0E4A5C"))
+                p_bg.setColorAt(1.0, QColor("#072634"))
+                p_fg = QColor(_CYAN_BRIGHT)
+                p_bd = QColor(_CYAN_PRIMARY)
+            p.fillPath(pill_p, QBrush(p_bg))
+            p.setPen(QPen(p_bd, 1.0))
+            p.drawPath(pill_p)
+            p.setFont(_latin_font(9, bold=True, letter_spacing=1.0))
+            p.setPen(p_fg)
+            p.drawText(pill_r, Qt.AlignmentFlag.AlignCenter, mvp_badge)
+        else:
+            p.setFont(_latin_font(8, bold=True, letter_spacing=1.0))
+            p.setPen(QColor(_TEXT_MUTED))
+            p.drawText(QRectF(sc_x, r_rect.top() + 36.0, sc_w, 18.0), Qt.AlignmentFlag.AlignCenter, "RATING")
+
+        right_x = r_rect.left() - 9.0
+        right_used_w += rating_w + 9.0
+
+    # KDA metric panel to the left of Rating Badge
     kda_raw = (data.kda or "").strip()
-    kda_panel_w = 0.0
     if kda_raw:
         parsed = _parse_kda(kda_raw)
-        num_font = _sans_font(24, bold=True, letter_spacing=0.6)
+        num_font = _sans_font(22, bold=True, letter_spacing=0.5)
         nfm = QFontMetricsF(num_font)
         if parsed is not None:
             k_s, d_s, a_s, ratio_s = parsed
@@ -674,23 +1042,24 @@ def _draw_header(p: QPainter, lw: float, data: MatchRecapData) -> None:
             text_w = nfm.horizontalAdvance(kda_raw)
             ratio_s = "KDA"
 
-        kda_panel_w = max(168.0, min(260.0, text_w + 36.0))
-        kda_rect = QRectF(lw - 24.0 - kda_panel_w, 57.0, kda_panel_w, 62.0)
+        kda_panel_w = max(148.0, min(206.0, text_w + 28.0))
+        kda_rect = QRectF(right_x - kda_panel_w, 54.0, kda_panel_w, 64.0)
         kda_path = _chamfer_path(kda_rect, 6.0)
 
         k_bg = QLinearGradient(kda_rect.left(), kda_rect.top(), kda_rect.right(), kda_rect.bottom())
-        k_bg.setColorAt(0.0, QColor(11, 26, 46, 220))
-        k_bg.setColorAt(1.0, QColor(5, 14, 26, 232))
+        k_bg.setColorAt(0.0, QColor(11, 26, 46, 224))
+        k_bg.setColorAt(1.0, QColor(5, 14, 26, 234))
         p.fillPath(kda_path, QBrush(k_bg))
         p.setPen(QPen(QColor(_GOLD_BRONZE), 1.1))
         p.drawPath(kda_path)
 
-        # Top micro gold bar on KDA panel
-        p.setPen(QPen(QColor(_GOLD_PRIMARY), 1.8))
-        p.drawLine(QPointF(kda_rect.left() + 12.0, kda_rect.top() + 0.5), QPointF(kda_rect.right() - 12.0, kda_rect.top() + 0.5))
+        p.setPen(QPen(QColor(_GOLD_PRIMARY), 1.6))
+        p.drawLine(
+            QPointF(kda_rect.left() + 10.0, kda_rect.top() + 0.5),
+            QPointF(kda_rect.right() - 10.0, kda_rect.top() + 0.5),
+        )
 
-        # Draw K / D / A centered in upper half
-        num_y = kda_rect.top() + 6.0
+        num_y = kda_rect.top() + 7.0
         num_h = 31.0
         p.setFont(num_font)
         if parsed is not None:
@@ -712,25 +1081,29 @@ def _draw_header(p: QPainter, lw: float, data: MatchRecapData) -> None:
                 p.drawText(seg_r, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, seg)
                 cur_x += seg_w
         else:
-            elided_kda = nfm.elidedText(kda_raw, Qt.TextElideMode.ElideRight, kda_panel_w - 20.0)
+            elided_kda = nfm.elidedText(kda_raw, Qt.TextElideMode.ElideRight, kda_panel_w - 18.0)
             p.setPen(QColor(_GOLD_CREAM))
             p.drawText(QRectF(kda_rect.left() + 8.0, num_y, kda_panel_w - 16.0, num_h), Qt.AlignmentFlag.AlignCenter, elided_kda)
 
-        # Lower ratio sub-label
-        ratio_font = _latin_font(10, bold=True, letter_spacing=1.4)
+        ratio_font = _latin_font(10, bold=True, letter_spacing=1.3)
         p.setFont(ratio_font)
         p.setPen(QColor(_GOLD_PRIMARY))
-        p.drawText(QRectF(kda_rect.left() + 6.0, kda_rect.top() + 39.0, kda_panel_w - 12.0, 18.0), Qt.AlignmentFlag.AlignCenter, ratio_s)
+        p.drawText(
+            QRectF(kda_rect.left() + 6.0, kda_rect.top() + 40.0, kda_panel_w - 12.0, 18.0),
+            Qt.AlignmentFlag.AlignCenter,
+            ratio_s,
+        )
+        right_used_w += kda_panel_w + 12.0
 
-    # Left hero identity + metadata column
-    info_x = portrait_x + portrait_sz + 16.0
-    info_max_w = (lw - 24.0 - kda_panel_w - (14.0 if kda_panel_w > 0 else 0.0)) - info_x
+    # Left column: Hero Name + Build Synergy Tag
+    info_x = portrait_x + portrait_sz + 14.0
+    info_max_w = max(120.0, (lw - 24.0 - right_used_w) - info_x)
 
     hero_display = (data.hero_name or data.hero_id or "未知英雄").strip()
-    name_font = _sans_font(24, bold=True, letter_spacing=0.6)
+    name_font = _sans_font(24, bold=True, letter_spacing=0.5)
     name_fm = QFontMetricsF(name_font)
-    elided_hero = name_fm.elidedText(hero_display, Qt.TextElideMode.ElideRight, max(80.0, info_max_w))
-    name_rect = QRectF(info_x, 56.0, info_max_w, 33.0)
+    elided_hero = name_fm.elidedText(hero_display, Qt.TextElideMode.ElideRight, info_max_w)
+    name_rect = QRectF(info_x, 54.0, info_max_w, 33.0)
 
     p.setFont(name_font)
     p.setPen(QColor(0, 0, 0, 210))
@@ -738,50 +1111,68 @@ def _draw_header(p: QPainter, lw: float, data: MatchRecapData) -> None:
     p.setPen(QColor(_GOLD_CREAM))
     p.drawText(name_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_hero)
 
-    # Metadata row: Duration + Team Kills + Mode tag
-    meta_y = 94.0
-    meta_h = 24.0
-    meta_x = info_x
-    meta_chips: list[tuple[str, str, QColor]] = []
+    # Build Synergy Tag Pill directly under Hero Name
+    syn_y = 92.0
+    syn_h = 24.0
+    combo_txt = (data.combo_title or "").strip()
+    if combo_txt:
+        tag_prefix = "★ 成型" if data.combo_completed else "◆ 体系"
+        syn_font = _sans_font(11, bold=True, letter_spacing=0.3)
+        sfm = QFontMetricsF(syn_font)
+        prefix_w = sfm.horizontalAdvance(tag_prefix) + 12.0
+        max_body_w = max(40.0, info_max_w - prefix_w - 18.0)
+        elided_combo = sfm.elidedText(combo_txt, Qt.TextElideMode.ElideRight, max_body_w)
+        body_w = sfm.horizontalAdvance(elided_combo)
+        pill_w = min(info_max_w, prefix_w + body_w + 18.0)
+        syn_rect = QRectF(info_x, syn_y, pill_w, syn_h)
+        syn_path = _chamfer_path(syn_rect, 4.5)
 
-    dur_str = _format_duration(data.duration_s)
-    if dur_str:
-        meta_chips.append(("时长", dur_str, QColor(_GOLD_CREAM)))
-    if (data.team_kills or "").strip():
-        meta_chips.append(("人头比", data.team_kills.strip(), QColor(_CYAN_BRIGHT)))
-    if not meta_chips:
-        meta_chips.append(("模式", "海克斯大乱斗", QColor(_GOLD_PRIMARY)))
+        if data.combo_completed:
+            bg_g = QLinearGradient(syn_rect.left(), syn_rect.top(), syn_rect.right(), syn_rect.bottom())
+            bg_g.setColorAt(0.0, QColor("#2B153D"))
+            bg_g.setColorAt(0.55, QColor("#2A1E0D"))
+            bg_g.setColorAt(1.0, QColor("#092434"))
+            p.fillPath(syn_path, QBrush(bg_g))
+            rim_g = QLinearGradient(syn_rect.left(), syn_rect.top(), syn_rect.right(), syn_rect.top())
+            rim_g.setColorAt(0.0, QColor("#E879F9"))
+            rim_g.setColorAt(0.5, QColor(_GOLD_CREAM))
+            rim_g.setColorAt(1.0, QColor(_CYAN_PRIMARY))
+            p.setPen(QPen(QBrush(rim_g), 1.3))
+            p.drawPath(syn_path)
+            pref_col = QColor("#F5D0FE")
+            body_col = QColor("#FFF4D4")
+        else:
+            p.fillPath(syn_path, QColor(12, 26, 44, 220))
+            p.setPen(QPen(QColor(_GOLD_PRIMARY), 1.1))
+            p.drawPath(syn_path)
+            pref_col = QColor(_CYAN_BRIGHT)
+            body_col = QColor(_GOLD_CREAM)
 
-    lbl_font = _sans_font(11, bold=False)
-    val_font = _sans_font(12, bold=True, letter_spacing=0.4)
-    lfm = QFontMetricsF(lbl_font)
-    vfm = QFontMetricsF(val_font)
-
-    for idx, (lbl, val, val_col) in enumerate(meta_chips):
-        chip_w = lfm.horizontalAdvance(lbl) + vfm.horizontalAdvance(val) + 24.0
-        if meta_x + chip_w > info_x + info_max_w and idx > 0:
-            break
-        c_rect = QRectF(meta_x, meta_y, min(chip_w, info_x + info_max_w - meta_x), meta_h)
+        p.setFont(syn_font)
+        p.setPen(pref_col)
+        p.drawText(QRectF(syn_rect.left() + 8.0, syn_y, prefix_w, syn_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, tag_prefix)
+        p.setPen(body_col)
+        p.drawText(
+            QRectF(syn_rect.left() + 6.0 + prefix_w, syn_y, max(24.0, syn_rect.width() - prefix_w - 12.0), syn_h),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            elided_combo,
+        )
+    else:
+        sub_txt = "◈ 海克斯大乱斗 · ARAM MAYHEM"
+        sf = _sans_font(11, bold=False, letter_spacing=0.3)
+        sfm = QFontMetricsF(sf)
+        cw = min(info_max_w, sfm.horizontalAdvance(sub_txt) + 18.0)
+        c_rect = QRectF(info_x, syn_y, cw, syn_h)
         c_path = _chamfer_path(c_rect, 4.0)
         p.fillPath(c_path, QColor(9, 22, 38, 210))
         p.setPen(QPen(QColor(_GOLD_HAIRLINE), 1.0))
         p.drawPath(c_path)
-
-        p.setFont(lbl_font)
-        p.setPen(QColor(_TEXT_MUTED))
-        lw_px = lfm.horizontalAdvance(lbl)
-        p.drawText(QRectF(c_rect.left() + 8.0, meta_y, lw_px + 2.0, meta_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, lbl)
-
-        p.setFont(val_font)
-        p.setPen(val_col)
-        val_x = c_rect.left() + 14.0 + lw_px
-        val_elided = vfm.elidedText(val, Qt.TextElideMode.ElideRight, max(20.0, c_rect.right() - val_x - 6.0))
-        p.drawText(QRectF(val_x, meta_y, max(20.0, c_rect.right() - val_x - 6.0), meta_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, val_elided)
-
-        meta_x += c_rect.width() + 8.0
+        p.setFont(sf)
+        p.setPen(QColor(_GOLD_PRIMARY))
+        p.drawText(c_rect.adjusted(8.0, 0.0, -6.0, 0.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, sub_txt)
 
     # Gold-fade horizontal divider below header
-    div_y = 130.0
+    div_y = 128.0
     div_grad = QLinearGradient(24.0, div_y, lw - 24.0, div_y)
     div_grad.setColorAt(0.0, QColor(120, 90, 40, 0))
     div_grad.setColorAt(0.18, QColor(120, 90, 40, 150))
@@ -790,101 +1181,50 @@ def _draw_header(p: QPainter, lw: float, data: MatchRecapData) -> None:
     div_grad.setColorAt(1.0, QColor(120, 90, 40, 0))
     p.setPen(QPen(QBrush(div_grad), 1.0))
     p.drawLine(QPointF(24.0, div_y), QPointF(lw - 24.0, div_y))
-    _draw_diamond(p, lw * 0.5, div_y, 3.2, QColor(_GOLD_PRIMARY))
+    _draw_diamond(p, lw * 0.5, div_y, 3.0, QColor(_GOLD_PRIMARY))
 
 
-def _draw_combo_and_augments(p: QPainter, lw: float, data: MatchRecapData) -> None:
-    """Layer 5: Combo Highlight Banner + up to 4 rarity-coded Augment pills (zero overlap)."""
+def _draw_section_header(
+    p: QPainter,
+    left: float,
+    right: float,
+    y: float,
+    zh_title: str,
+    en_title: str,
+    right_tag: str = "",
+) -> None:
+    zh_f = _sans_font(11, bold=True, letter_spacing=0.6)
+    en_f = _latin_font(9, bold=True, letter_spacing=1.2)
+    zfm = QFontMetricsF(zh_f)
+    zh_w = zfm.horizontalAdvance(zh_title)
+    p.setFont(zh_f)
+    p.setPen(QColor(_GOLD_PRIMARY))
+    p.drawText(QRectF(left, y, zh_w + 6.0, 15.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, zh_title)
+
+    p.setFont(en_f)
+    p.setPen(QColor(_TEXT_FAINT))
+    p.drawText(QRectF(left + zh_w + 8.0, y + 0.5, 180.0, 14.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, en_title)
+
+    if right_tag:
+        p.setFont(en_f)
+        p.setPen(QColor(_CYAN_PRIMARY))
+        p.drawText(QRectF(right - 160.0, y + 0.5, 160.0, 14.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, right_tag)
+
+
+def _draw_augments_row(p: QPainter, lw: float, data: MatchRecapData) -> None:
+    """Layer 5: 4 rarity-coded Augment cards with real local 28x28 augment icons + rarity labels + names."""
     left = 24.0
-    avail_w = lw - 48.0
-    combo_txt = (data.combo_title or "").strip()
-
-    if combo_txt:
-        banner_rect = QRectF(left, 138.0, avail_w, 34.0)
-        banner_path = _chamfer_path(banner_rect, 6.0)
-
-        if data.combo_completed:
-            fill_g = QLinearGradient(banner_rect.left(), banner_rect.top(), banner_rect.right(), banner_rect.bottom())
-            fill_g.setColorAt(0.0, QColor("#2A143A"))
-            fill_g.setColorAt(0.48, QColor("#2D210E"))
-            fill_g.setColorAt(1.0, QColor("#0A2535"))
-            p.fillPath(banner_path, QBrush(fill_g))
-
-            rim_g = QLinearGradient(banner_rect.left(), banner_rect.top(), banner_rect.right(), banner_rect.top())
-            rim_g.setColorAt(0.0, QColor("#E879F9"))
-            rim_g.setColorAt(0.45, QColor(_GOLD_CREAM))
-            rim_g.setColorAt(0.75, QColor(_GOLD_PRIMARY))
-            rim_g.setColorAt(1.0, QColor(_CYAN_PRIMARY))
-            p.setPen(QPen(QBrush(rim_g), 1.5))
-            p.drawPath(banner_path)
-            tag_text = "★ 体系成型"
-            tag_bg = QColor(200, 155, 60, 68)
-            tag_border = QColor(_GOLD_CREAM)
-            tag_fg = QColor("#FFF4D4")
-            title_fg = QColor("#FFF4D4")
-        else:
-            fill_g = QLinearGradient(banner_rect.left(), banner_rect.top(), banner_rect.right(), banner_rect.bottom())
-            fill_g.setColorAt(0.0, QColor("#142236"))
-            fill_g.setColorAt(1.0, QColor("#0A1525"))
-            p.fillPath(banner_path, QBrush(fill_g))
-            p.setPen(QPen(QColor(_GOLD_PRIMARY), 1.2))
-            p.drawPath(banner_path)
-            tag_text = "◆ 核心连招"
-            tag_bg = QColor(200, 170, 110, 38)
-            tag_border = QColor(_GOLD_PRIMARY)
-            tag_fg = QColor(_GOLD_CREAM)
-            title_fg = QColor(_GOLD_CREAM)
-
-        # Left tag badge inside combo banner
-        tag_font = _sans_font(11, bold=True, letter_spacing=0.6)
-        tfm = QFontMetricsF(tag_font)
-        tag_w = tfm.horizontalAdvance(tag_text) + 16.0
-        tag_rect = QRectF(banner_rect.left() + 8.0, banner_rect.top() + 6.0, tag_w, 22.0)
-        tag_path = _chamfer_path(tag_rect, 3.5)
-        p.fillPath(tag_path, tag_bg)
-        p.setPen(QPen(tag_border, 1.0))
-        p.drawPath(tag_path)
-        p.setFont(tag_font)
-        p.setPen(tag_fg)
-        p.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, tag_text)
-
-        # Main combo title text + subtle right status mark
-        right_mark = "COMBO ONLINE" if data.combo_completed else "SYNERGY PLAN"
-        rm_font = _latin_font(9, bold=True, letter_spacing=1.3)
-        rm_fm = QFontMetricsF(rm_font)
-        rm_w = rm_fm.horizontalAdvance(right_mark) + 12.0
-        p.setFont(rm_font)
-        p.setPen(QColor(94, 234, 212, 185) if data.combo_completed else QColor(200, 170, 110, 150))
-        p.drawText(
-            QRectF(banner_rect.right() - rm_w - 8.0, banner_rect.top(), rm_w, banner_rect.height()),
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-            right_mark,
-        )
-
-        c_font = _sans_font(15, bold=True, letter_spacing=0.5)
-        cfm = QFontMetricsF(c_font)
-        tx = tag_rect.right() + 12.0
-        tw = max(40.0, banner_rect.right() - tx - rm_w - 18.0)
-        elided_combo = cfm.elidedText(combo_txt, Qt.TextElideMode.ElideRight, tw)
-        t_rect = QRectF(tx, banner_rect.top(), tw, banner_rect.height())
-        p.setFont(c_font)
-        p.setPen(QColor(0, 0, 0, 200))
-        p.drawText(t_rect.translated(0.0, 1.2), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_combo)
-        p.setPen(title_fg)
-        p.drawText(t_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_combo)
-
-        aug_y = 180.0
-        aug_h = 56.0
-    else:
-        # Subtle section header when no combo title is provided
-        sec_font = _sans_font(11, bold=True, letter_spacing=0.8)
-        p.setFont(sec_font)
-        p.setPen(QColor(_GOLD_PRIMARY))
-        p.drawText(QRectF(left, 139.0, 220.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "◆ 本局海克斯强化")
-        aug_y = 162.0
-        aug_h = 68.0
+    right = lw - 24.0
+    avail_w = right - left
 
     augments = list(data.augments[:4])
+    icon_paths = tuple(data.augment_icon_paths or ())
+    count_tag = f"{len(augments)} / 4 AUGMENTS" if augments else ""
+    _draw_section_header(p, left, right, 134.0, "◆ 海克斯强化", "HEXTECH AUGMENTS", count_tag)
+
+    aug_y = 152.0
+    aug_h = 54.0
+
     if not augments:
         empty_rect = QRectF(left, aug_y, avail_w, aug_h)
         empty_path = _chamfer_path(empty_rect, 5.0)
@@ -899,6 +1239,7 @@ def _draw_combo_and_augments(p: QPainter, lw: float, data: MatchRecapData) -> No
     n = len(augments)
     gap = 10.0
     pill_w = (avail_w - gap * (n - 1)) / n if n > 1 else min(340.0, avail_w)
+    icon_sz = 30.0
 
     for idx, (aug_name, rarity_raw) in enumerate(augments):
         rk = _normalize_rarity(rarity_raw)
@@ -910,58 +1251,77 @@ def _draw_combo_and_augments(p: QPainter, lw: float, data: MatchRecapData) -> No
         rect = QRectF(px, aug_y, pill_w, aug_h)
         path = _chamfer_path(rect, 5.0)
 
-        # Pill fill gradient
         pg = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.bottom())
         pg.setColorAt(0.0, QColor(pal["bg_top"]))
         pg.setColorAt(1.0, QColor(pal["bg_bot"]))
         p.fillPath(path, QBrush(pg))
 
-        # Subtle inner left rarity wash
         p.save()
         p.setClipPath(path)
-        wash = QLinearGradient(rect.left(), rect.top(), rect.left() + 56.0, rect.top())
-        wash.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 46))
+        wash = QLinearGradient(rect.left(), rect.top(), rect.left() + 64.0, rect.top())
+        wash.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 50))
         wash.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 0))
         p.fillRect(rect, QBrush(wash))
-
-        # Left 3.5px vertical rarity bar
-        p.fillRect(QRectF(rect.left(), rect.top(), 3.5, rect.height()), accent)
-
-        # Subtle top specular edge
+        p.fillRect(QRectF(rect.left(), rect.top(), 3.0, rect.height()), accent)
         p.setPen(QPen(QColor(bright.red(), bright.green(), bright.blue(), 65), 1.0))
         p.drawLine(QPointF(rect.left() + 4.0, rect.top() + 1.0), QPointF(rect.right() - 4.0, rect.top() + 1.0))
         p.restore()
 
-        # Crisp chamfered rarity border
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 195), 1.25))
         p.drawPath(path)
 
-        # Top row: diamond + rarity label + slot index
+        # Framed 30x30 local augment icon slot (28x28 artwork inside 1px rarity border)
+        ico_x = rect.left() + 9.0
+        ico_y = rect.top() + (aug_h - icon_sz) * 0.5
+        ico_rect = QRectF(ico_x, ico_y, icon_sz, icon_sz)
+        ico_path = _chamfer_path(ico_rect, 4.0)
+        aug_ico_str = icon_paths[idx] if idx < len(icon_paths) else ""
+        aug_img = _load_local_image(aug_ico_str)
+
+        p.save()
+        p.setClipPath(ico_path)
+        p.fillRect(ico_rect, QColor("#050F1C"))
+        if aug_img is not None:
+            side = min(aug_img.width(), aug_img.height())
+            sx0 = (aug_img.width() - side) // 2
+            sy0 = (aug_img.height() - side) // 2
+            p.drawImage(ico_rect.adjusted(1.0, 1.0, -1.0, -1.0), aug_img.copy(sx0, sy0, side, side))
+        else:
+            # Crisp geometric Hextech rarity emblem fallback
+            em_g = QRadialGradient(ico_rect.center(), icon_sz * 0.55)
+            em_g.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 85))
+            em_g.setColorAt(1.0, QColor(6, 16, 28, 220))
+            p.fillRect(ico_rect, QBrush(em_g))
+            _draw_diamond(p, ico_rect.center().x(), ico_rect.center().y(), 7.5, accent)
+            _draw_diamond(p, ico_rect.center().x(), ico_rect.center().y(), 3.6, bright)
+        p.restore()
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(accent, 1.25))
+        p.drawPath(ico_path)
+
+        # Right side of card: rarity label + slot index on top, augment name below
+        tx = ico_rect.right() + 8.0
+        text_avail = max(36.0, rect.right() - tx - 7.0)
+
         top_row_y = rect.top() + 7.0
-        _draw_diamond(p, rect.left() + 14.0, top_row_y + 7.0, 3.3, accent)
-
-        r_font = _sans_font(10, bold=True, letter_spacing=0.6)
-        p.setFont(r_font)
+        p.setFont(_sans_font(10, bold=True, letter_spacing=0.5))
         p.setPen(bright)
-        p.drawText(QRectF(rect.left() + 22.0, top_row_y, pill_w - 50.0, 15.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, pal["label"])
+        p.drawText(QRectF(tx, top_row_y, text_avail - 20.0, 14.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, pal["label"])
 
-        idx_font = _latin_font(9, bold=True, letter_spacing=1.0)
-        p.setFont(idx_font)
-        p.setPen(QColor(bright.red(), bright.green(), bright.blue(), 120))
-        p.drawText(QRectF(rect.right() - 32.0, top_row_y, 24.0, 15.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, f"0{idx + 1}")
+        p.setFont(_latin_font(9, bold=True, letter_spacing=0.9))
+        p.setPen(QColor(bright.red(), bright.green(), bright.blue(), 125))
+        p.drawText(QRectF(rect.right() - 26.0, top_row_y, 20.0, 14.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, f"0{idx + 1}")
 
-        # Main augment title (auto-shrinks slightly for long names, elides as safety net)
         clean_name = (aug_name or "未知强化").strip()
-        text_avail = pill_w - 20.0
-        a_font = _sans_font(14, bold=True)
+        a_font = _sans_font(13, bold=True)
         afm = QFontMetricsF(a_font)
         if afm.horizontalAdvance(clean_name) > text_avail:
-            a_font = _sans_font(12, bold=True)
+            a_font = _sans_font(11, bold=True)
             afm = QFontMetricsF(a_font)
         elided_name = afm.elidedText(clean_name, Qt.TextElideMode.ElideRight, text_avail)
-
-        name_rect = QRectF(rect.left() + 11.0, rect.top() + 25.0, text_avail, rect.height() - 29.0)
+        name_rect = QRectF(tx, rect.top() + 24.0, text_avail, 22.0)
         p.setFont(a_font)
         p.setPen(QColor(0, 0, 0, 190))
         p.drawText(name_rect.translated(0.0, 1.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_name)
@@ -970,196 +1330,394 @@ def _draw_combo_and_augments(p: QPainter, lw: float, data: MatchRecapData) -> No
 
 
 def _draw_items_row(p: QPainter, lw: float, data: MatchRecapData) -> None:
-    """Layer 6: Up to 6 beveled 42x42 item icons (or gold-bordered text chips when PNG missing)."""
+    """Layer 6: 6 spacious 48x48 beveled item icons + full unobstructed Chinese names underneath (ZERO clipping!)."""
     left = 24.0
-    y_top = 246.0
-    row_h = 58.0
+    right = lw - 24.0
+    avail_w = right - left
 
-    # Left section label + crisp vertical gold hairline separator
-    lbl_rect = QRectF(left, y_top + 6.0, 86.0, 22.0)
-    p.setFont(_sans_font(12, bold=True, letter_spacing=0.6))
-    p.setPen(QColor(_GOLD_PRIMARY))
-    p.drawText(lbl_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "◆ 终局出装")
-
-    p.setFont(_latin_font(9, bold=True, letter_spacing=1.2))
-    p.setPen(QColor(_TEXT_FAINT))
-    p.drawText(QRectF(left + 11.0, y_top + 28.0, 82.0, 16.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "FINAL BUILD")
-
-    vdiv_x = left + 92.0
-    vdiv_g = QLinearGradient(vdiv_x, y_top + 2.0, vdiv_x, y_top + 52.0)
-    vdiv_g.setColorAt(0.0, QColor(120, 90, 40, 0))
-    vdiv_g.setColorAt(0.5, QColor(200, 170, 110, 145))
-    vdiv_g.setColorAt(1.0, QColor(120, 90, 40, 0))
-    p.setPen(QPen(QBrush(vdiv_g), 1.0))
-    p.drawLine(QPointF(vdiv_x, y_top + 2.0), QPointF(vdiv_x, y_top + 52.0))
-
-    track_x = left + 104.0
-    track_w = (lw - 24.0) - track_x
     items = list(data.item_entries[:6])
+    right_tag = "6 / 6 FULL BUILD" if len(items) >= 6 else (f"{len(items)} / 6 ITEMS" if items else "")
+    _draw_section_header(p, left, right, 214.0, "◆ 终局出装", "FINAL BUILD", right_tag)
+
+    icon_y = 232.0
+    icon_sz = 48.0
+    cap_y = icon_y + icon_sz + 4.0  # 284.0
+    cap_h = 22.0  # 284..306 -> 11px clear gap before bottom dashboard at y=317!
 
     if not items:
-        empty_r = QRectF(track_x, y_top + 6.0, track_w, 42.0)
-        empty_p = _chamfer_path(empty_r, 4.0)
+        empty_r = QRectF(left, icon_y, avail_w, 64.0)
+        empty_p = _chamfer_path(empty_r, 5.0)
         p.fillPath(empty_p, QColor(8, 18, 32, 185))
         p.setPen(QPen(QColor(_GOLD_HAIRLINE), 1.0, Qt.PenStyle.DashLine))
         p.drawPath(empty_p)
-        p.setFont(_sans_font(11, bold=False))
+        p.setFont(_sans_font(12, bold=False))
         p.setPen(QColor(_TEXT_FAINT))
         p.drawText(empty_r, Qt.AlignmentFlag.AlignCenter, "暂未采集到终局装备数据")
         return
 
     max_slots = 6
-    gap = 8.0
-    slot_w = (track_w - gap * (max_slots - 1)) / max_slots
-    icon_sz = 42.0
+    gap = 10.0
+    slot_w = (avail_w - gap * (max_slots - 1)) / max_slots  # ~110.3px per slot!
 
-    for idx, (item_name, icon_path) in enumerate(items):
-        sx = track_x + idx * (slot_w + gap)
+    for idx in range(max_slots):
+        sx = left + idx * (slot_w + gap)
+        ix = sx + (slot_w - icon_sz) * 0.5
+        icon_rect = QRectF(ix, icon_y, icon_sz, icon_sz)
+        icon_path_shape = _chamfer_path(icon_rect, 4.0)
+
+        if idx >= len(items):
+            # Subtle empty Hextech inventory socket
+            p.fillPath(icon_path_shape, QColor(6, 16, 28, 130))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(70, 55, 20, 135), 1.0, Qt.PenStyle.DashLine))
+            p.drawPath(icon_path_shape)
+            continue
+
+        item_name, icon_path = items[idx]
         clean_name = (item_name or f"装备{idx + 1}").strip()
         img = _load_local_image(icon_path)
 
+        # Cast depth shadow
+        p.save()
+        p.translate(1.5, 2.2)
+        p.fillPath(icon_path_shape, QColor(0, 0, 0, 155))
+        p.restore()
+
+        p.save()
+        p.setClipPath(icon_path_shape)
         if img is not None:
-            ix = sx + (slot_w - icon_sz) * 0.5
-            iy = y_top + 1.0
-            icon_rect = QRectF(ix, iy, icon_sz, icon_sz)
-            icon_path_shape = _chamfer_path(icon_rect, 3.5)
-
-            # Cast depth shadow
-            p.save()
-            p.translate(1.5, 2.0)
-            p.fillPath(icon_path_shape, QColor(0, 0, 0, 145))
-            p.restore()
-
-            p.save()
-            p.setClipPath(icon_path_shape)
             p.fillRect(icon_rect, QColor("#040E1A"))
             side = min(img.width(), img.height())
             cx0 = (img.width() - side) // 2
             cy0 = (img.height() - side) // 2
             p.drawImage(icon_rect, img.copy(cx0, cy0, side, side))
-            p.restore()
+        else:
+            tile_g = QLinearGradient(icon_rect.left(), icon_rect.top(), icon_rect.left(), icon_rect.bottom())
+            tile_g.setColorAt(0.0, QColor("#152438"))
+            tile_g.setColorAt(1.0, QColor("#091322"))
+            p.fillRect(icon_rect, QBrush(tile_g))
+            p.setPen(QPen(QColor(200, 170, 110, 65), 1.0))
+            p.drawLine(QPointF(icon_rect.left() + 4.0, icon_rect.top() + 2.0), QPointF(icon_rect.right() - 4.0, icon_rect.top() + 2.0))
+            mono = clean_name[:2]
+            p.setFont(_sans_font(13, bold=True))
+            p.setPen(QColor(_GOLD_CREAM))
+            p.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, mono)
+        p.restore()
 
-            # Metallic gold beveled border
-            g_rim = QLinearGradient(icon_rect.left(), icon_rect.top(), icon_rect.right(), icon_rect.bottom())
-            g_rim.setColorAt(0.0, QColor(_GOLD_CREAM))
-            g_rim.setColorAt(0.45, QColor(_GOLD_PRIMARY))
-            g_rim.setColorAt(1.0, QColor(_GOLD_BRONZE))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QBrush(g_rim), 1.5))
-            p.drawPath(icon_path_shape)
+        # Metallic gold beveled border
+        g_rim = QLinearGradient(icon_rect.left(), icon_rect.top(), icon_rect.right(), icon_rect.bottom())
+        g_rim.setColorAt(0.0, QColor(_GOLD_CREAM))
+        g_rim.setColorAt(0.45, QColor(_GOLD_PRIMARY))
+        g_rim.setColorAt(1.0, QColor(_GOLD_BRONZE))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QBrush(g_rim), 1.55))
+        p.drawPath(icon_path_shape)
 
-            # Subtle item name caption below icon
+        # Full unobstructed Chinese item name directly below icon (zero overlap!)
+        cap_font = _sans_font(11, bold=False)
+        cfm = QFontMetricsF(cap_font)
+        if cfm.horizontalAdvance(clean_name) > slot_w - 2.0:
             cap_font = _sans_font(10, bold=False)
             cfm = QFontMetricsF(cap_font)
-            elided_cap = cfm.elidedText(clean_name, Qt.TextElideMode.ElideRight, slot_w - 2.0)
-            p.setFont(cap_font)
-            p.setPen(QColor(_TEXT_MUTED))
-            p.drawText(QRectF(sx, iy + icon_sz + 2.0, slot_w, row_h - icon_sz - 3.0), Qt.AlignmentFlag.AlignCenter, elided_cap)
-        else:
-            # Gold-bordered text chip fallback (height=42 to align harmoniously with icons)
-            chip_rect = QRectF(sx + 1.0, y_top + 6.0, slot_w - 2.0, icon_sz)
-            chip_path = _chamfer_path(chip_rect, 4.0)
-
-            c_bg = QLinearGradient(chip_rect.left(), chip_rect.top(), chip_rect.left(), chip_rect.bottom())
-            c_bg.setColorAt(0.0, QColor("#152336"))
-            c_bg.setColorAt(1.0, QColor("#0A1422"))
-            p.fillPath(chip_path, QBrush(c_bg))
-
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor(_GOLD_PRIMARY), 1.3))
-            p.drawPath(chip_path)
-
-            # Tiny top specular line
-            p.setPen(QPen(QColor(240, 230, 210, 50), 1.0))
-            p.drawLine(QPointF(chip_rect.left() + 4.0, chip_rect.top() + 1.2), QPointF(chip_rect.right() - 4.0, chip_rect.top() + 1.2))
-
-            chip_font = _sans_font(10, bold=True)
-            tfm = QFontMetricsF(chip_font)
-            wrapped = _wrap_text_max_lines(clean_name, tfm, chip_rect.width() - 10.0, max_lines=2)
-            p.setFont(chip_font)
-            p.setPen(QColor(_GOLD_CREAM))
-            if len(wrapped) <= 1:
-                p.drawText(chip_rect.adjusted(4.0, 0.0, -4.0, 0.0), Qt.AlignmentFlag.AlignCenter, wrapped[0] if wrapped else clean_name)
-            else:
-                line_h = 14.0
-                start_y = chip_rect.center().y() - line_h
-                for li, line in enumerate(wrapped[:2]):
-                    p.drawText(
-                        QRectF(chip_rect.left() + 4.0, start_y + li * line_h, chip_rect.width() - 8.0, line_h),
-                        Qt.AlignmentFlag.AlignCenter,
-                        line,
-                    )
+        elided_cap = cfm.elidedText(clean_name, Qt.TextElideMode.ElideRight, slot_w - 2.0)
+        cap_rect = QRectF(sx, cap_y, slot_w, cap_h)
+        p.setFont(cap_font)
+        p.setPen(QColor(0, 0, 0, 175))
+        p.drawText(cap_rect.translated(0.0, 1.0), Qt.AlignmentFlag.AlignCenter, elided_cap)
+        p.setPen(QColor("#E2D9C5"))
+        p.drawText(cap_rect, Qt.AlignmentFlag.AlignCenter, elided_cap)
 
 
-def _draw_ai_highlight_box(p: QPainter, lw: float, data: MatchRecapData) -> None:
-    """Layer 7: Cyan-left-accented dark panel (#061A2A) displaying ◈ AI 副驾高光 + 2-line wrapped text."""
-    box = QRectF(24.0, 314.0, lw - 48.0, 70.0)
-    path = _chamfer_path(box, 5.0)
+def _draw_telemetry_dashboard(p: QPainter, lw: float, data: MatchRecapData) -> None:
+    """Layer 7: 2-column Hextech Final Telemetry Dashboard (replaces legacy AI Highlight box!).
 
-    bg = QLinearGradient(box.left(), box.top(), box.right(), box.bottom())
-    bg.setColorAt(0.0, QColor(_COACH_PANEL_BG))
-    bg.setColorAt(1.0, QColor("#04121E"))
-    p.fillPath(path, QBrush(bg))
+    - Left panel 「终局面板 · FINAL STATS」: 2-row metallic stat chips with Mayhem gold highlight.
+    - Right panel 「硬核战绩 · COMBAT DATA」: Champion damage + share bar + tank/heal/KP/gold cells.
+    """
+    top_y = 317.0
+    panel_h = 118.0
+    left_x = 24.0
+    gap = 12.0
+    col_w = (lw - 48.0 - gap) * 0.5  # 350.0px each
+
+    left_box = QRectF(left_x, top_y, col_w, panel_h)
+    right_box = QRectF(left_x + col_w + gap, top_y, col_w, panel_h)
+
+    # --- LEFT PANEL: 终局面板 · FINAL STATS ---
+    l_path = _chamfer_path(left_box, 5.5)
+    l_bg = QLinearGradient(left_box.left(), left_box.top(), left_box.right(), left_box.bottom())
+    l_bg.setColorAt(0.0, QColor(_PANEL_DARK_LEFT))
+    l_bg.setColorAt(1.0, QColor("#040E1A"))
+    p.fillPath(l_path, QBrush(l_bg))
 
     p.save()
-    p.setClipPath(path)
-    # Soft cyan wash fading rightward from left accent bar
-    wash = QLinearGradient(box.left(), box.top(), box.left() + 165.0, box.top())
-    wash.setColorAt(0.0, QColor(10, 200, 185, 38))
-    wash.setColorAt(1.0, QColor(10, 200, 185, 0))
-    p.fillRect(box, QBrush(wash))
-
-    # Crisp 3.5px Hextech cyan left accent bar
-    p.fillRect(QRectF(box.left(), box.top(), 3.5, box.height()), QColor(_CYAN_PRIMARY))
+    p.setClipPath(l_path)
+    l_wash = QLinearGradient(left_box.left(), left_box.top(), left_box.left() + 120.0, left_box.top())
+    l_wash.setColorAt(0.0, QColor(200, 170, 110, 32))
+    l_wash.setColorAt(1.0, QColor(200, 170, 110, 0))
+    p.fillRect(left_box, QBrush(l_wash))
+    p.fillRect(QRectF(left_box.left(), left_box.top(), 3.0, left_box.height()), QColor(_GOLD_PRIMARY))
     p.restore()
 
     p.setBrush(Qt.BrushStyle.NoBrush)
-    p.setPen(QPen(QColor(3, 151, 171, 165), 1.1))
-    p.drawPath(path)
+    p.setPen(QPen(QColor(120, 90, 40, 175), 1.1))
+    p.drawPath(l_path)
 
-    # Header line inside AI panel
-    hdr_font = _sans_font(12, bold=True, letter_spacing=0.6)
-    p.setFont(hdr_font)
+    p.setFont(_sans_font(11, bold=True, letter_spacing=0.6))
+    p.setPen(QColor(_GOLD_PRIMARY))
+    p.drawText(QRectF(left_box.left() + 12.0, left_box.top() + 6.0, 140.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "◆ 终局面板")
+    p.setFont(_latin_font(9, bold=True, letter_spacing=1.2))
+    p.setPen(QColor(_GOLD_BRONZE))
+    p.drawText(QRectF(left_box.right() - 130.0, left_box.top() + 7.0, 118.0, 16.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, "FINAL STATS")
+
+    norm_stats = normalize_final_stats(data.final_stats)
+    # Build visible chips from available stats (show up to 8 in 2x4 grid)
+    stat_chips: list[tuple[str, str, bool]] = []
+    for key, zh_lbl, en_lbl, mayhem_th in _STAT_DISPLAY_SPECS:
+        if key in norm_stats and norm_stats[key] > 0.0:
+            val = norm_stats[key]
+            stat_chips.append((f"{zh_lbl} {en_lbl}", _format_stat_value(key, val), val >= mayhem_th))
+
+    grid_x = left_box.left() + 11.0
+    grid_y = left_box.top() + 28.0
+    grid_w = left_box.width() - 20.0
+    grid_h = left_box.height() - 36.0
+
+    if stat_chips:
+        # 2 rows x 4 columns (or 2x3 if <= 6 stats)
+        cols = 4 if len(stat_chips) > 6 else max(2, min(4, (len(stat_chips) + 1) // 2))
+        rows = 2 if len(stat_chips) > cols else 1
+        cg, rg = 6.0, 6.0
+        cw = (grid_w - cg * (cols - 1)) / cols
+        ch = (grid_h - rg * (rows - 1)) / rows
+        for i, (lbl_txt, val_txt, is_mayhem) in enumerate(stat_chips[: cols * rows]):
+            r_i, c_i = divmod(i, cols)
+            cr = QRectF(grid_x + c_i * (cw + cg), grid_y + r_i * (ch + rg), cw, ch)
+            cp = _chamfer_path(cr, 3.5)
+            if is_mayhem:
+                cg_fill = QLinearGradient(cr.left(), cr.top(), cr.right(), cr.bottom())
+                cg_fill.setColorAt(0.0, QColor(72, 52, 18, 225))
+                cg_fill.setColorAt(1.0, QColor(30, 22, 9, 230))
+                p.fillPath(cp, QBrush(cg_fill))
+                p.setPen(QPen(QColor(_GOLD_PRIMARY), 1.2))
+                p.drawPath(cp)
+                lbl_c = QColor(_GOLD_PRIMARY)
+                val_c = QColor(_GOLD_CREAM)
+                disp_lbl = f"✦{lbl_txt}"
+            else:
+                p.fillPath(cp, QColor(9, 22, 38, 215))
+                p.setPen(QPen(QColor(70, 55, 20, 165), 0.95))
+                p.drawPath(cp)
+                lbl_c = QColor(_TEXT_MUTED)
+                val_c = QColor("#E2E8F0")
+                disp_lbl = lbl_txt
+
+            p.setFont(_sans_font(9, bold=is_mayhem))
+            p.setPen(lbl_c)
+            p.drawText(QRectF(cr.left() + 3.0, cr.top() + 3.0, cr.width() - 6.0, 13.0), Qt.AlignmentFlag.AlignCenter, disp_lbl)
+
+            v_font = _sans_font(14 if rows == 2 else 16, bold=True)
+            p.setFont(v_font)
+            p.setPen(val_c)
+            p.drawText(QRectF(cr.left() + 3.0, cr.top() + 16.0, cr.width() - 6.0, cr.height() - 18.0), Qt.AlignmentFlag.AlignCenter, val_txt)
+    else:
+        # Graceful fallback summary chips when LiveClient final_stats is unavailable
+        prism_c = sum(1 for _, r in data.augments[:4] if _normalize_rarity(r) == "prismatic")
+        gold_c = sum(1 for _, r in data.augments[:4] if _normalize_rarity(r) == "gold")
+        silv_c = sum(1 for _, r in data.augments[:4] if _normalize_rarity(r) == "silver")
+        aug_desc = " · ".join(
+            part
+            for part in (
+                f"{prism_c}棱彩" if prism_c else "",
+                f"{gold_c}黄金" if gold_c else "",
+                f"{silv_c}白银" if silv_c else "",
+            )
+            if part
+        ) or "暂无强化"
+        parsed_kda = _parse_kda(data.kda)
+        kda_ratio_s = parsed_kda[3] if parsed_kda else (data.kda or "--")
+        item_cnt = len(data.item_entries[:6])
+        build_desc = f"{item_cnt}/6 满神装" if item_cnt >= 6 else (f"{item_cnt} 件出装" if item_cnt else "待采集")
+        mode_desc = "首棱彩局" if data.is_first_prismatic else ("体系已成型" if data.combo_completed else "海克斯大乱斗")
+        fallback_chips = [
+            ("KDA 效率", kda_ratio_s, bool(parsed_kda and (parsed_kda[3] == "PERFECT" or float(parsed_kda[3].split()[0]) >= 5.0))),
+            ("海克斯品质", aug_desc, prism_c >= 2),
+            ("终局出装", build_desc, item_cnt >= 6),
+            ("对局特征", mode_desc, data.combo_completed or data.is_first_prismatic),
+        ]
+        cg, rg = 7.0, 6.0
+        cw = (grid_w - cg) * 0.5
+        ch = (grid_h - rg) * 0.5
+        for i, (lbl_txt, val_txt, hi) in enumerate(fallback_chips):
+            r_i, c_i = divmod(i, 2)
+            cr = QRectF(grid_x + c_i * (cw + cg), grid_y + r_i * (ch + rg), cw, ch)
+            cp = _chamfer_path(cr, 3.5)
+            p.fillPath(cp, QColor(42, 32, 14, 190) if hi else QColor(9, 22, 38, 215))
+            p.setPen(QPen(QColor(_GOLD_PRIMARY if hi else _GOLD_HAIRLINE), 1.0))
+            p.drawPath(cp)
+            p.setFont(_sans_font(9, bold=False))
+            p.setPen(QColor(_GOLD_PRIMARY if hi else _TEXT_MUTED))
+            p.drawText(QRectF(cr.left() + 8.0, cr.top() + 3.0, cr.width() - 16.0, 13.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, lbl_txt)
+            vf = _sans_font(12, bold=True)
+            vfm = QFontMetricsF(vf)
+            elided_v = vfm.elidedText(val_txt, Qt.TextElideMode.ElideRight, cr.width() - 16.0)
+            p.setFont(vf)
+            p.setPen(QColor(_GOLD_CREAM if hi else "#E2E8F0"))
+            p.drawText(QRectF(cr.left() + 8.0, cr.top() + 17.0, cr.width() - 16.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_v)
+
+    # --- RIGHT PANEL: 硬核战绩 · COMBAT DATA ---
+    r_path = _chamfer_path(right_box, 5.5)
+    r_bg = QLinearGradient(right_box.left(), right_box.top(), right_box.right(), right_box.bottom())
+    r_bg.setColorAt(0.0, QColor(_PANEL_DARK_RIGHT))
+    r_bg.setColorAt(1.0, QColor("#04101C"))
+    p.fillPath(r_path, QBrush(r_bg))
+
+    p.save()
+    p.setClipPath(r_path)
+    r_wash = QLinearGradient(right_box.left(), right_box.top(), right_box.left() + 145.0, right_box.top())
+    r_wash.setColorAt(0.0, QColor(10, 200, 185, 42))
+    r_wash.setColorAt(1.0, QColor(10, 200, 185, 0))
+    p.fillRect(right_box, QBrush(r_wash))
+    p.fillRect(QRectF(right_box.left(), right_box.top(), 3.0, right_box.height()), QColor(_CYAN_PRIMARY))
+    p.restore()
+
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(QPen(QColor(3, 151, 171, 175), 1.1))
+    p.drawPath(r_path)
+
+    p.setFont(_sans_font(11, bold=True, letter_spacing=0.6))
     p.setPen(QColor(_CYAN_PRIMARY))
-    p.drawText(QRectF(box.left() + 14.0, box.top() + 7.0, 200.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "◈ AI 副驾高光")
+    p.drawText(QRectF(right_box.left() + 12.0, right_box.top() + 6.0, 140.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "◈ 硬核战绩")
+    p.setFont(_latin_font(9, bold=True, letter_spacing=1.2))
+    p.setPen(QColor(3, 151, 171, 200))
+    p.drawText(QRectF(right_box.right() - 130.0, right_box.top() + 7.0, 118.0, 16.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, "COMBAT DATA")
 
-    tag_font = _latin_font(9, bold=True, letter_spacing=1.3)
-    p.setFont(tag_font)
-    p.setPen(QColor(3, 151, 171, 190))
-    p.drawText(QRectF(box.right() - 180.0, box.top() + 8.0, 168.0, 16.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, "TACTICAL INSIGHT")
+    # Compute normalized combat metrics
+    raw_share = float(data.damage_share or 0.0)
+    dmg_share = min(1.0, raw_share / 100.0 if raw_share > 1.0 else max(0.0, raw_share))
+    kp_val = _derive_kill_participation(data)
+    has_dmg = int(data.damage_dealt or 0) > 0 or dmg_share > 0.0
 
-    # Body text (max 2 cleanly wrapped lines)
-    raw_hi = (data.ai_highlight or "").strip()
-    is_default = not raw_hi
-    body_text = raw_hi or "本局由 HexHelper 全程零注入监测大数据胜率出装与海克斯选牌。"
+    bar_x = right_box.left() + 12.0
+    bar_w = right_box.width() - 22.0
+    row1_y = right_box.top() + 28.0
 
-    body_font_px = _sans_font(13, bold=False)
-    bfm = QFontMetricsF(body_font_px)
-    text_x = box.left() + 14.0
-    text_w = box.width() - 26.0
-    lines = _wrap_text_max_lines(body_text, bfm, text_w, max_lines=2)
+    if has_dmg:
+        dmg_txt = _format_cn_metric(data.damage_dealt)
+        share_pct = int(round(dmg_share * 100.0))
+        is_carry_dmg = share_pct >= 30
+        p.setFont(_sans_font(10, bold=False))
+        p.setPen(QColor(_TEXT_MUTED))
+        p.drawText(QRectF(bar_x, row1_y, 70.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "对英雄输出")
 
-    p.setFont(body_font_px)
-    p.setPen(QColor(_TEXT_MUTED if is_default else _GOLD_CREAM))
-    line_h = 19.0
-    start_y = box.top() + (36.0 if len(lines) == 1 else 28.0)
-    for idx, line in enumerate(lines[:2]):
+        p.setFont(_sans_font(15, bold=True))
+        p.setPen(QColor(_GOLD_CREAM if is_carry_dmg else _CYAN_BRIGHT))
+        p.drawText(QRectF(bar_x + 68.0, row1_y - 1.0, 100.0, 20.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, dmg_txt)
+
+        if share_pct > 0:
+            p.setFont(_sans_font(11, bold=True))
+            p.setPen(QColor(_GOLD_PRIMARY if is_carry_dmg else _CYAN_BRIGHT))
+            p.drawText(
+                QRectF(bar_x + bar_w - 110.0, row1_y, 110.0, 18.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                f"全队占比 {share_pct}%",
+            )
+        fill_ratio = max(0.08, min(1.0, dmg_share * 2.2)) if dmg_share > 0.0 else 0.55
+        bar_c1 = QColor(_GOLD_METAL if is_carry_dmg else _CYAN_MID)
+        bar_c2 = QColor(_GOLD_CREAM if is_carry_dmg else _CYAN_BRIGHT)
+    else:
+        # Fallback hero bar when EOG damage telemetry is not provided: show KP% or KDA participation bar
+        kp_pct = int(round(kp_val * 100.0))
+        p.setFont(_sans_font(10, bold=False))
+        p.setPen(QColor(_TEXT_MUTED))
+        p.drawText(QRectF(bar_x, row1_y, 82.0, 18.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "团战参与率")
+
+        p.setFont(_sans_font(15, bold=True))
+        p.setPen(QColor(_CYAN_BRIGHT))
         p.drawText(
-            QRectF(text_x, start_y + idx * line_h, text_w, line_h),
+            QRectF(bar_x + 74.0, row1_y - 1.0, 110.0, 20.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            line,
+            f"{kp_pct}%" if kp_pct > 0 else "同步完成",
         )
+        score_v, grade_v, _ = _resolve_rating(data)
+        if score_v > 0.0:
+            p.setFont(_sans_font(10, bold=True))
+            p.setPen(QColor(_GOLD_PRIMARY))
+            p.drawText(
+                QRectF(bar_x + bar_w - 110.0, row1_y, 110.0, 18.0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                f"综合战力 {grade_v} · {score_v:.1f}",
+            )
+        fill_ratio = max(0.18, min(1.0, kp_val if kp_val > 0.0 else (score_v / 16.0 if score_v > 0.0 else 0.45)))
+        bar_c1, bar_c2 = QColor(_CYAN_MID), QColor(_CYAN_BRIGHT)
+
+    # Progress bar track
+    track_r = QRectF(bar_x, row1_y + 22.0, bar_w, 7.0)
+    track_p = _chamfer_path(track_r, 2.5)
+    p.fillPath(track_p, QColor(4, 14, 24, 235))
+    p.setPen(QPen(QColor(3, 151, 171, 115), 0.8))
+    p.drawPath(track_p)
+
+    fill_w = max(8.0, bar_w * fill_ratio)
+    fill_r = QRectF(bar_x + 1.0, row1_y + 23.0, fill_w - 2.0, 5.0)
+    fill_g = QLinearGradient(fill_r.left(), fill_r.top(), fill_r.right(), fill_r.top())
+    fill_g.setColorAt(0.0, bar_c1)
+    fill_g.setColorAt(1.0, bar_c2)
+    p.fillPath(_chamfer_path(fill_r, 2.0), QBrush(fill_g))
+
+    # Row 2: 4 compact telemetry cells
+    cell_y = row1_y + 37.0
+    cell_h = right_box.bottom() - cell_y - 9.0
+    cell_gap = 6.0
+    cell_w = (bar_w - cell_gap * 3.0) / 4.0
+
+    kp_disp = f"{int(round(kp_val * 100.0))}%" if kp_val > 0.0 else "--"
+    has_any_eog = any(
+        int(v or 0) > 0 for v in (data.damage_taken, data.heal_and_shield, data.gold_earned, data.damage_dealt)
+    )
+    if has_any_eog:
+        cells = (
+            ("承受伤害", _format_cn_metric(data.damage_taken), QColor("#E2E8F0")),
+            ("治疗护盾", _format_cn_metric(data.heal_and_shield), QColor(_CYAN_BRIGHT)),
+            ("参团率 KP", kp_disp, QColor(_GOLD_CREAM if kp_val >= 0.70 else "#E2E8F0")),
+            ("全场经济", _format_gold_k(data.gold_earned), QColor(_GOLD_PRIMARY)),
+        )
+    else:
+        parsed_k = _parse_kda(data.kda)
+        dur_s = _format_duration(data.duration_s) or "--"
+        cells = (
+            ("击杀", parsed_k[0] if parsed_k else "--", QColor(_GOLD_CREAM)),
+            ("助攻", parsed_k[2] if parsed_k else "--", QColor(_CYAN_BRIGHT)),
+            ("参团率 KP", kp_disp, QColor(_GOLD_PRIMARY)),
+            ("对局时长", dur_s, QColor("#E2E8F0")),
+        )
+
+    for idx, (c_lbl, c_val, c_col) in enumerate(cells):
+        cx = bar_x + idx * (cell_w + cell_gap)
+        cr = QRectF(cx, cell_y, cell_w, cell_h)
+        cp = _chamfer_path(cr, 3.5)
+        p.fillPath(cp, QColor(7, 22, 36, 215))
+        p.setPen(QPen(QColor(3, 151, 171, 110), 0.95))
+        p.drawPath(cp)
+
+        p.setFont(_sans_font(9, bold=False))
+        p.setPen(QColor(_TEXT_MUTED))
+        p.drawText(QRectF(cr.left() + 2.0, cr.top() + 4.0, cr.width() - 4.0, 14.0), Qt.AlignmentFlag.AlignCenter, c_lbl)
+
+        p.setFont(_sans_font(13, bold=True))
+        p.setPen(c_col)
+        p.drawText(QRectF(cr.left() + 2.0, cr.top() + 19.0, cr.width() - 4.0, cr.height() - 21.0), Qt.AlignmentFlag.AlignCenter, c_val)
 
 
 def _draw_footer_watermark(p: QPainter, lw: float, lh: float, data: MatchRecapData) -> None:
-    """Layer 8: Subtle footer hairline + HexHelper emblem + watermark line."""
-    sep_y = lh - 39.0
-    p.setPen(QPen(QColor(120, 90, 40, 88), 1.0))
+    """Layer 8: Clean single-line HexHelper emblem + patch watermark."""
+    sep_y = lh - 35.0
+    p.setPen(QPen(QColor(120, 90, 40, 92), 1.0))
     p.drawLine(QPointF(26.0, sep_y), QPointF(lw - 26.0, sep_y))
 
     patch = (data.dataset_patch or "26.23").strip()
     prefix = "HEXHELPER"
-    suffix = f" · 海克斯大乱斗 AI 副驾 · 零注入纯只读 · {patch} 大数据"
+    suffix = f" · 海克斯大乱斗 · {patch} 数据引擎"
 
     pre_font = _latin_font(10, bold=True, letter_spacing=1.5)
     suf_font = _sans_font(10, bold=False, letter_spacing=0.4)
@@ -1172,8 +1730,8 @@ def _draw_footer_watermark(p: QPainter, lw: float, lh: float, data: MatchRecapDa
     suf_w = sfm.horizontalAdvance(suffix)
     total_w = icon_sz + icon_gap + pre_w + suf_w
 
-    fy = sep_y + 4.0
-    fh = 22.0
+    fy = sep_y + 3.0
+    fh = 21.0
     start_x = (lw - total_w) * 0.5
 
     emblem = _load_emblem_image()
@@ -1205,7 +1763,7 @@ def render_match_recap_image(
     width: int = CARD_DEFAULT_WIDTH,
     height: int = CARD_DEFAULT_HEIGHT,
 ) -> QImage:
-    """Render an offline LOL V16.23 Hextech match recap card purely with Qt QPainter."""
+    """Render an offline LOL V16.23 Hextech v2 match recap card purely with Qt QPainter."""
     _ensure_card_fonts()
     w = max(320, int(width))
     h = max(220, int(height))
@@ -1227,9 +1785,9 @@ def render_match_recap_image(
     _draw_background_and_frame(p, lw, lh, data)
     _draw_top_ribbon(p, lw, data)
     _draw_header(p, lw, data)
-    _draw_combo_and_augments(p, lw, data)
+    _draw_augments_row(p, lw, data)
     _draw_items_row(p, lw, data)
-    _draw_ai_highlight_box(p, lw, data)
+    _draw_telemetry_dashboard(p, lw, data)
     _draw_footer_watermark(p, lw, lh, data)
     p.end()
     return img
@@ -1261,11 +1819,16 @@ class MatchRecapDialog(QDialog):
         lifecycle_state=None,
         snoozed: bool = False,
         on_core_action=None,
+        on_recap_action: Callable[[str, bool], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.data = data
+        self._card_width = card_width
+        self._card_height = card_height
         self._card_image: QImage = render_match_recap_image(data, width=card_width, height=card_height)
         self._on_core_action = on_core_action
+        self._on_recap_action = on_recap_action
+        self._close_action_emitted: bool = False
         self._recap_cta_action = ""
 
         hero_label = (data.hero_name or data.hero_id or "对局").strip()
@@ -1379,7 +1942,9 @@ class MatchRecapDialog(QDialog):
                 nl = QLabel(nudge_txt)
                 nl.setWordWrap(True)
                 nl.setStyleSheet("border: none; background: transparent; color: #E2D9C5; font-size: 11px; font-weight: bold;")
-                nb = HextechActionButton(nudge_btn_txt, variant="cyan" if nudge_action == "register" else "gold", height=26, parent=bar)
+                nb = HextechActionButton(
+                    nudge_btn_txt, variant="cyan" if nudge_action == "register" else "gold", height=26, parent=bar
+                )
                 nb.clicked.connect(self._trigger_core_nudge)
                 bl.addWidget(nl, 1)
                 bl.addWidget(nb)
@@ -1414,6 +1979,25 @@ class MatchRecapDialog(QDialog):
     def card_image(self) -> QImage:
         return self._card_image
 
+    def update_data(self, data: MatchRecapData) -> None:
+        """Re-render the recap card in-place (e.g. once missing item/hero/augment icons finish downloading)."""
+        self.data = data
+        self._card_image = render_match_recap_image(
+            data,
+            width=self._card_width,
+            height=self._card_height,
+        )
+        pm = QPixmap.fromImage(self._card_image)
+        max_preview_w = 760
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail_w = screen.availableGeometry().width()
+            if avail_w > 0:
+                max_preview_w = min(max_preview_w, max(480, avail_w - 120))
+        if pm.width() > max_preview_w:
+            pm = pm.scaledToWidth(max_preview_w, Qt.TransformationMode.SmoothTransformation)
+        self.preview_label.setPixmap(pm)
+
     def default_save_filename(self) -> str:
         hero_part = _safe_filename_part(self.data.hero_name or self.data.hero_id or "match")
         return f"HexHelper_{hero_part}_战报.png"
@@ -1428,12 +2012,25 @@ class MatchRecapDialog(QDialog):
     def _reset_save_btn_text(self) -> None:
         self.save_btn.setText(_SAVE_BTN_DEFAULT_TEXT)
 
+    def _emit_recap_action(self, action: str, ok: bool) -> None:
+        if self._on_recap_action is not None:
+            self._on_recap_action(str(action), bool(ok))
+
+    def _emit_close_once(self) -> None:
+        if self._close_action_emitted:
+            return
+        self._close_action_emitted = True
+        self._emit_recap_action("close", True)
+
     def copy_to_clipboard(self) -> QImage:
         cb = QGuiApplication.clipboard()
-        if cb is not None:
+        ok = False
+        if cb is not None and not self._card_image.isNull():
             cb.setImage(self._card_image)
+            ok = True
         self.copy_btn.setText(_COPY_BTN_COPIED_TEXT)
         self._copy_reset_timer.start(2600)
+        self._emit_recap_action("copy", ok)
         return self._card_image
 
     def save_to_path(self, path: str | Path) -> bool:
@@ -1449,9 +2046,24 @@ class MatchRecapDialog(QDialog):
             "PNG 图片 (*.png)",
         )
         if not chosen:
+            self._emit_recap_action("save", False)
             return ""
         if self.save_to_path(chosen):
             self.save_btn.setText(_SAVE_BTN_SAVED_TEXT)
             self._save_reset_timer.start(2200)
+            self._emit_recap_action("save", True)
             return chosen
+        self._emit_recap_action("save", False)
         return ""
+
+    def accept(self) -> None:
+        self._emit_close_once()
+        super().accept()
+
+    def reject(self) -> None:
+        self._emit_close_once()
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._emit_close_once()
+        super().closeEvent(event)

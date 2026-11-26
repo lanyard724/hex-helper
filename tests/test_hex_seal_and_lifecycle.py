@@ -184,6 +184,7 @@ def test_live_peephole_hint_priority() -> None:
 
 def test_seal_overlay_zero_focus_idle_timer_and_shatter_frames(qapp: QApplication) -> None:
     host = QWidget()
+    host.move(4000, 4000)
     host.resize(300, 110)
     seal = HextechSealOverlay(host, seal_id="test_unit", title="测试封印", compact=True, allow_idle_ambient=False)
     try:
@@ -229,7 +230,7 @@ def test_preview_dialog_snooze_and_dual_track_recharge_ceremony(qapp: QApplicati
     finally:
         dlg.close()
 
-    cloud = CloudGatewayClient("https://api.hexhelper.example.com")
+    cloud = CloudGatewayClient("https://api.priswebtool.site")
     rdlg = RechargeDialog(cloud, auto_load=False, tier="auto", in_game=False, is_first_recharge=True)
     try:
         rdlg.show_created_order(

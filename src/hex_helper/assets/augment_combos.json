@@ -1170,7 +1170,6 @@
       "HASTE_LOOP"
     ],
     "1004": [
-      "AP_SPELL",
       "HASTE_LOOP"
     ],
     "1005": [
@@ -1750,8 +1749,7 @@
       "TANK_HP"
     ],
     "2077": [
-      "TANK_HP",
-      "AP_SPELL"
+      "TANK_HP"
     ],
     "2078": [
       "AP_SPELL",
@@ -1978,15 +1976,14 @@
       "AUTO_ONHIT"
     ],
     "3116": [
-      "MOBILITY_DASH",
-      "AD_ATTACK"
+      "MOBILITY_DASH"
     ],
     "3118": [
       "ULT_CYCLE",
       "AP_SPELL"
     ],
     "3121": [
-      "SHIELD_HEAL"
+      "UTILITY_SUSTAIN"
     ],
     "3123": [
       "CRIT_SPELL",

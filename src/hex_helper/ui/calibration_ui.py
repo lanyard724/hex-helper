@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QMouseEvent, QPainter, QPen
@@ -18,12 +18,15 @@ class CalibrationOverlay(QWidget):
         self,
         initial_title_roi: NormalizedRect,
         on_calibrated: Callable[[NormalizedRect, NormalizedRect], None],
+        on_calibration_finished: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__()
         self._initial = initial_title_roi
         self._on_calibrated = on_calibrated
+        self._on_calibration_finished = on_calibration_finished
         self._origin: QPoint | None = None
         self._current_rect: QRect | None = None
+        self._session_finished: bool = False
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -33,7 +36,43 @@ class CalibrationOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
+    def _emit_finished(self, outcome: str, title_roi: NormalizedRect | None = None) -> None:
+        if self._session_finished:
+            return
+        self._session_finished = True
+        if self._on_calibration_finished is None:
+            return
+        screens = list(QGuiApplication.screens())
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            dpr = round(max(1.0, float(screen.devicePixelRatio() or 1.0)), 3)
+            try:
+                screen_idx = screens.index(screen)
+            except ValueError:
+                screen_idx = 0
+            res = [int(geo.width()), int(geo.height())]
+        else:
+            dpr = 1.0
+            screen_idx = 0
+            res = [int(max(1, self.width())), int(max(1, self.height()))]
+        custom_rect_norm = (
+            [round(title_roi.x, 4), round(title_roi.y, 4), round(title_roi.w, 4), round(title_roi.h, 4)]
+            if title_roi is not None
+            else None
+        )
+        self._on_calibration_finished(
+            {
+                "outcome": outcome,
+                "screen_index": int(screen_idx),
+                "resolution": res,
+                "dpr": dpr,
+                "custom_rect_norm": custom_rect_norm,
+            }
+        )
+
     def open_calibrator(self) -> None:
+        self._session_finished = False
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             geo = screen.geometry()
@@ -92,8 +131,12 @@ class CalibrationOverlay(QWidget):
                     h=min(0.90, title_roi.h + 0.22),
                 ).clamp()
                 self._on_calibrated(card_roi, title_roi)
+                self._emit_finished("saved", title_roi)
+            else:
+                self._emit_finished("cancelled", None)
             self.hide()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
+            self._emit_finished("cancelled", None)
             self.hide()

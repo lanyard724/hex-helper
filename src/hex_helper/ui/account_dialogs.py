@@ -595,6 +595,12 @@ class RechargeDialog(QDialog):
         self._poll_timer.setInterval(3000)
         self._poll_timer.timeout.connect(self._poll_tick)
 
+        self._notify_cooldown_left: int = 0
+        self._notify_in_flight: bool = False
+        self._notify_cooldown_timer = QTimer(self)
+        self._notify_cooldown_timer.setInterval(1000)
+        self._notify_cooldown_timer.timeout.connect(self._on_notify_cooldown_tick)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
         root.setSpacing(8)
@@ -699,10 +705,15 @@ class RechargeDialog(QDialog):
 
         order_btn_row = QHBoxLayout()
         order_btn_row.setSpacing(6)
-        self.copy_memo_btn = HextechActionButton("复制核对码", variant="gold", height=28)
+        self.copy_memo_btn = HextechActionButton("复制核对码", variant="gold", height=30)
         self.copy_memo_btn.clicked.connect(self._copy_memo)
-        self.refresh_order_btn = HextechActionButton("我已支付，立即查单", variant="cyan", height=28)
-        self.refresh_order_btn.clicked.connect(self._poll_tick)
+        self.refresh_order_btn = HextechActionButton(
+            "我已扫码支付 · 通知确认",
+            variant="cyan",
+            pointed_right=True,
+            height=30,
+        )
+        self.refresh_order_btn.clicked.connect(self._notify_paid_clicked)
         order_btn_row.addStretch(1)
         order_btn_row.addWidget(self.copy_memo_btn)
         order_btn_row.addWidget(self.refresh_order_btn)
@@ -914,8 +925,16 @@ class RechargeDialog(QDialog):
             self._pkg_group.addButton(rb)
             self.pkg_lay.addWidget(card)
 
+        service_hours = data.get("service_hours")
         if not enabled_chs:
-            self._set_status("✕ 暂未开启任何在线收款渠道，请联系管理员后再试", "#F87171")
+            if isinstance(service_hours, dict) and not service_hours.get("is_open", True):
+                closed_msg = str(service_hours.get("message") or "").strip()
+                self._set_status(
+                    f"☾ {closed_msg or '当前为夜间休眠时段，暂不支持补能'}",
+                    "#FDE68A",
+                )
+            else:
+                self._set_status("✕ 暂未开启任何在线收款渠道，请联系管理员后再试", "#F87171")
         elif not self._packages:
             self._set_status("✕ 暂无可选算力包", "#F87171")
         else:
@@ -1033,10 +1052,83 @@ class RechargeDialog(QDialog):
         self.qr_image_lbl.show()
         self.order_info_lbl.show()
         self.copy_memo_btn.show()
+        self._notify_cooldown_timer.stop()
+        self._notify_cooldown_left = 0
+        self._notify_in_flight = False
+        self.refresh_order_btn.setText("我已扫码支付 · 通知确认")
+        self.refresh_order_btn.setEnabled(True)
         self.refresh_order_btn.show()
         self.order_card.show()
         self._sync_dialog_geometry()
-        self._set_status("⏳ 等待扫码支付确认中（每 3 秒自动刷新订单状态）...", "#0AC8B9")
+        self._set_status("⏳ 扫码付款完成后，请点击「我已扫码支付 · 通知确认」发起到账核验", "#0AC8B9")
+
+    def _on_notify_cooldown_tick(self) -> None:
+        if self._closed:
+            self._notify_cooldown_timer.stop()
+            return
+        self._notify_cooldown_left = max(0, self._notify_cooldown_left - 1)
+        if self._notify_cooldown_left > 0:
+            self.refresh_order_btn.setText(f"已通知确认 ({self._notify_cooldown_left}s)")
+            self.refresh_order_btn.setEnabled(False)
+        else:
+            self._notify_cooldown_timer.stop()
+            self.refresh_order_btn.setText("再次通知确认")
+            self.refresh_order_btn.setEnabled(True)
+
+    def _notify_paid_clicked(self) -> None:
+        if self._closed or not self._current_order_no:
+            return
+        if self._notify_in_flight or self._notify_cooldown_left > 0:
+            self._poll_tick()
+            return
+        notify_fn = getattr(self._client, "notify_order_paid", None)
+        if not callable(notify_fn):
+            self._poll_tick()
+            return
+
+        order_no = self._current_order_no
+        self._notify_in_flight = True
+        self.refresh_order_btn.setEnabled(False)
+        self.refresh_order_btn.setText("⏳ 正在通知核验...")
+        self._set_status("⏳ 正在向管理员发送付款核验通知...", "#FBBF24")
+
+        def worker() -> None:
+            try:
+                res = notify_fn(order_no)
+                self._invoker.invoke.emit(lambda r=res, o=order_no: self._on_notify_paid_done(o, r))
+            except CloudCoachError as exc:
+                self._invoker.invoke.emit(lambda m=exc.message, o=order_no: self._on_notify_paid_error(o, m))
+            except Exception as exc:
+                self._invoker.invoke.emit(lambda m=str(exc), o=order_no: self._on_notify_paid_error(o, m))
+
+        threading.Thread(target=worker, name="HexNotifyPaid", daemon=True).start()
+
+    def _on_notify_paid_done(self, order_no: str, res: dict[str, Any]) -> None:
+        self._notify_in_flight = False
+        if self._closed or order_no != self._current_order_no:
+            return
+        if res.get("already_paid"):
+            self.refresh_order_btn.setText("我已扫码支付 · 通知确认")
+            self.refresh_order_btn.setEnabled(True)
+            self._poll_tick()
+            return
+        cd = max(1, int(res.get("cooldown_seconds") or 60))
+        self._notify_cooldown_left = cd
+        self.refresh_order_btn.setText(f"已通知确认 ({cd}s)")
+        self.refresh_order_btn.setEnabled(False)
+        self._notify_cooldown_timer.start()
+        msg = str(res.get("message") or "已通知管理员核验，通常 1-3 分钟内自动到账")
+        self._set_status(f"✓ {msg}（每 3 秒自动刷新状态）", "#0AC8B9")
+        self._poll_tick()
+
+    def _on_notify_paid_error(self, order_no: str, msg: str) -> None:
+        self._notify_in_flight = False
+        if self._closed or order_no != self._current_order_no:
+            return
+        self.refresh_order_btn.setText("我已扫码支付 · 通知确认")
+        self.refresh_order_btn.setEnabled(True)
+        self._set_status(f"⚠ {msg}", "#FDE68A")
+        self._poll_tick()
 
     def _on_paid_ceremony_clicked(self) -> None:
         self._auto_close_timer.stop()
@@ -1060,6 +1152,7 @@ class RechargeDialog(QDialog):
         st = str(order_data.get("status") or "")
         if st == "paid":
             self._poll_timer.stop()
+            self._notify_cooldown_timer.stop()
             wallet = order_data.get("wallet") if isinstance(order_data.get("wallet"), dict) else {}
             bal = float(wallet.get("balance_credits") or 0.0)
             added = int(order_data.get("credits_amount") or 0)
@@ -1131,18 +1224,21 @@ class RechargeDialog(QDialog):
     def closeEvent(self, event) -> None:  # noqa: N802
         self._closed = True
         self._poll_timer.stop()
+        self._notify_cooldown_timer.stop()
         self._auto_close_timer.stop()
         super().closeEvent(event)
 
     def reject(self) -> None:
         self._closed = True
         self._poll_timer.stop()
+        self._notify_cooldown_timer.stop()
         self._auto_close_timer.stop()
         super().reject()
 
     def accept(self) -> None:
         self._closed = True
         self._poll_timer.stop()
+        self._notify_cooldown_timer.stop()
         self._auto_close_timer.stop()
         super().accept()
 

@@ -195,7 +195,7 @@ def test_augment_overlay_tight_bbox_dedup_and_zero_idle_paints() -> None:
 def test_edge_drawer_instant_expand_and_zero_idle_ring_paints() -> None:
     app = _qt_app()
     with tempfile.TemporaryDirectory() as td:
-        static = StaticAssetsManager(Path(td))
+        static = StaticAssetsManager(Path(td), fetcher=lambda _url: b"")
         static.items["3089"] = ItemStaticInfo(item_id="3089", name="灭世者的死亡之帽", gold=3500, category="complete_equipment")
         store = DataStore(static)
         store._heroes["63"] = HeroStat("63", "布兰德", "Brand", 10000, 5200, 0.52, 0.05, 10)

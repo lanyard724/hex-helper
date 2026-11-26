@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QPoint, QRect, Qt, QTimer, QVariantAnimation
+from PySide6.QtCore import QEasingCurve, QPoint, QRect, Qt, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QMouseEvent, QPixmap, QScreen
 from PySide6.QtWidgets import (
     QComboBox,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -121,6 +122,9 @@ def _clip_text(text: str, max_len: int) -> str:
 class EdgeBuildDrawer(QWidget):
     """Collapsible right-edge LoL Hextech Visual Decision HUD (48px pill <-> 368px visual HUD)."""
 
+    geometry_changed = Signal(dict)
+    subcard_action = Signal(str, str, dict)
+
     COLLAPSED_W = 48
     COLLAPSED_MIN_H = 184
     EXPANDED_W = 368
@@ -130,6 +134,10 @@ class EdgeBuildDrawer(QWidget):
     MAX_EXPANDED_H = 1850
     _MIN_COMFORT_H = 300
     _QWIDGETSIZE_MAX = 16777215
+    BRIEF_AUTO_COLLAPSE_MS = 20_000
+    QUICK_CONFIRM_HIGH_CONF_MS = 15_000
+    QUICK_CONFIRM_LOW_CONF_MS = 35_000
+    PLAN_B_RESCAN_COOLDOWN_MS = 1_500
 
     def __init__(
         self,
@@ -151,6 +159,11 @@ class EdgeBuildDrawer(QWidget):
         on_check_update: Callable[[], None] | None = None,
         on_core_action: Callable[[str], None] | None = None,
         on_opening_brief_seal_dismissed: Callable[[], None] | None = None,
+        on_geometry_changed: Callable[[dict[str, Any]], None] | None = None,
+        on_subcard_action: Callable[[str, str, dict[str, Any]], None] | None = None,
+        on_manual_add_item: Callable[[str], None] | None = None,
+        on_manual_remove_item: Callable[[str], None] | None = None,
+        on_plan_b_rescan: Callable[[], None] | None = None,
         initial_tier: str = "a",
         initial_pos: list[int] | None = None,
         initial_size: list[int] | None = None,
@@ -177,6 +190,14 @@ class EdgeBuildDrawer(QWidget):
         self._on_check_update = on_check_update
         self._on_core_action = on_core_action
         self._on_opening_brief_seal_dismissed = on_opening_brief_seal_dismissed
+        self._on_geometry_changed = on_geometry_changed
+        self._on_subcard_action = on_subcard_action
+        self._on_manual_add_item = on_manual_add_item
+        self._on_manual_remove_item = on_manual_remove_item
+        self._on_plan_b_rescan = on_plan_b_rescan
+        self._degraded_2999_active: bool = False
+        self._degraded_synced_items: list[tuple[str, str]] = []
+        self._gesture_start_norm_rect: list[float] | None = None
         self._lifecycle: CoreLifecycleSnapshot | None = None
         self._peephole_hint: str = ""
         self._is_player_dead: bool = False
@@ -230,6 +251,8 @@ class EdgeBuildDrawer(QWidget):
         self._last_layout_bucket: int = self._width_bucket(self._expanded_w)
         self._last_rendered_w: int = self._expanded_w
         self._drag_offset: QPoint | None = None
+        self._drag_press_global: QPoint | None = None
+        self._did_drag: bool = False
         self._anchor_right: bool = self._infer_initial_anchor_right(self._custom_pos)
         self._expanded = False
         self._coach_online = False
@@ -240,6 +263,19 @@ class EdgeBuildDrawer(QWidget):
         self._coach_advice: CoachAdvicePayload | None = None
         self._opening_brief_data: dict[str, str] = {}
         self._opening_brief_dismissed: bool = False
+        self._opening_brief_compacted: bool = False
+        self._brief_auto_collapse_timer = QTimer(self)
+        self._brief_auto_collapse_timer.setSingleShot(True)
+        self._brief_auto_collapse_timer.setInterval(self.BRIEF_AUTO_COLLAPSE_MS)
+        self._brief_auto_collapse_timer.timeout.connect(self._on_brief_auto_collapse_timeout)
+        self._quick_confirm_confidence: float = 1.0
+        self._quick_confirm_case_a_active: bool = False
+        self._quick_confirm_timer = QTimer(self)
+        self._quick_confirm_timer.setSingleShot(True)
+        self._quick_confirm_timer.timeout.connect(self._on_quick_confirm_auto_dismiss)
+        self._rescan_cooldown_timer = QTimer(self)
+        self._rescan_cooldown_timer.setSingleShot(True)
+        self._rescan_cooldown_timer.timeout.connect(self._reset_plan_b_rescan_btn)
         self._advice_gold_snapshot: float | None = None
         self._advice_items_snapshot: tuple[str, ...] = ()
         self._advice_received_mono: float = 0.0
@@ -344,7 +380,7 @@ class EdgeBuildDrawer(QWidget):
         self.pill_expand_btn = HextechActionButton("展", variant="cyan", height=24)
         self.pill_expand_btn.setFixedWidth(36)
         self.pill_expand_btn.setMinimumWidth(36)
-        self.pill_expand_btn.clicked.connect(lambda: self.set_expanded(True))
+        self.pill_expand_btn.clicked.connect(self._user_expand)
 
         pill_lay.addWidget(self.pill_close_btn, alignment=Qt.AlignmentFlag.AlignRight)
         pill_lay.addWidget(self.pill_item_ring, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -391,7 +427,7 @@ class EdgeBuildDrawer(QWidget):
         self.coach_btn.clicked.connect(self._handle_call_coach)
         self.collapse_btn = HextechActionButton("收起", variant="gold", height=24)
         self.collapse_btn.setMinimumWidth(40)
-        self.collapse_btn.clicked.connect(lambda: self.set_expanded(False))
+        self.collapse_btn.clicked.connect(self._user_collapse)
         self.settings_menu_btn = QPushButton("⚙")
         self.settings_menu_btn.setFixedSize(20, 20)
         self.settings_menu_btn.setToolTip("展开/收起数据集与手动切英雄栏")
@@ -969,7 +1005,7 @@ class EdgeBuildDrawer(QWidget):
             "font-size: 10px; padding: 0px 8px; border-radius: 2px; }"
             "QPushButton:hover { color: #F0E6D2; border-color: #C8AA6E; }"
         )
-        ip_close_btn.clicked.connect(self.inline_preview_box.hide)
+        ip_close_btn.clicked.connect(self._close_inline_preview)
         self._ip_close_btn = ip_close_btn
         ip_btns.addWidget(self.inline_preview_cta_btn)
         ip_btns.addStretch(1)
@@ -1094,6 +1130,88 @@ class EdgeBuildDrawer(QWidget):
         self.aug_manual_row.hide()
         aug_lay.addWidget(self.aug_manual_row)
         body_lay.addWidget(self.aug_frame)
+
+        # 6B. PLAN B DEGRADED SYNC BAR (Strictly hidden when 2999 is live; LOL V16.23 Hextech palette)
+        self.degraded_sync_frame = QFrame()
+        self.degraded_sync_frame.setObjectName("SubCard")
+        self.degraded_sync_frame.setStyleSheet(
+            "QFrame#SubCard { background-color: rgba(4, 14, 26, 232); "
+            "border: 1px solid #0AC8B9; border-radius: 3px; }"
+        )
+        ds_lay = QVBoxLayout(self.degraded_sync_frame)
+        ds_lay.setContentsMargins(8, 5, 8, 5)
+        ds_lay.setSpacing(4)
+
+        ds_top = QHBoxLayout()
+        ds_top.setSpacing(4)
+        self.degraded_sync_hdr_lbl = QLabel("◈ 2999降级 · Plan B同步")
+        self.degraded_sync_hdr_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #0AC8B9; font-weight: bold; font-size: 10px;"
+        )
+        self.degraded_rescan_btn = QPushButton("扫画面")
+        self.degraded_rescan_btn.setFixedHeight(18)
+        self.degraded_rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.degraded_rescan_btn.setToolTip("立即视觉扫描底部 6 格装备与 4 格海克斯图标")
+        self.degraded_rescan_btn.setStyleSheet(
+            "QPushButton { padding: 0px 6px; font-size: 10px; border: 1px solid #0AC8B9; "
+            "background-color: rgba(10, 200, 185, 30); color: #F0E6D2; border-radius: 2px; }"
+            "QPushButton:hover { background-color: rgba(10, 200, 185, 70); }"
+        )
+        self.degraded_rescan_btn.clicked.connect(self._handle_plan_b_rescan)
+        self.item_toggle_add_btn = QPushButton("+装备")
+        self.item_toggle_add_btn.setFixedHeight(18)
+        self.item_toggle_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.item_toggle_add_btn.setToolTip("手动补录已购装备")
+        self.item_toggle_add_btn.setStyleSheet(
+            "QPushButton { padding: 0px 6px; font-size: 10px; border: 1px solid #C8AA6E; "
+            "background: transparent; color: #C8AA6E; border-radius: 2px; }"
+            "QPushButton:hover { border-color: #F0E6D2; color: #F0E6D2; }"
+        )
+        self.item_toggle_add_btn.clicked.connect(self._toggle_manual_item_picker)
+        ds_top.addWidget(self.degraded_sync_hdr_lbl)
+        ds_top.addStretch(1)
+        ds_top.addWidget(self.degraded_rescan_btn)
+        ds_top.addWidget(self.item_toggle_add_btn)
+        ds_lay.addLayout(ds_top)
+
+        default_degraded_hint = "游戏未开启2999接口 · 自动视觉识别+手动补录已购装备"
+        self.degraded_sync_hdr_lbl.setToolTip(default_degraded_hint)
+        self.degraded_sync_frame.setToolTip(default_degraded_hint)
+        self.degraded_hint_lbl = QLabel(default_degraded_hint)
+        self.degraded_hint_lbl.setWordWrap(True)
+        self.degraded_hint_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #A09B8C; font-size: 9px;"
+        )
+        # Keep gray hint tucked in tooltip to save vertical height; label stays hidden for back-compat readers
+        self.degraded_hint_lbl.hide()
+
+        self.degraded_items_wrap = QWidget()
+        self.degraded_items_wrap.setStyleSheet("background: transparent; border: none;")
+        self.degraded_items_lay = QGridLayout(self.degraded_items_wrap)
+        self.degraded_items_lay.setContentsMargins(0, 0, 0, 0)
+        self.degraded_items_lay.setHorizontalSpacing(4)
+        self.degraded_items_lay.setVerticalSpacing(3)
+        ds_lay.addWidget(self.degraded_items_wrap)
+
+        self.item_manual_row = QWidget()
+        imr = QHBoxLayout(self.item_manual_row)
+        imr.setContentsMargins(0, 0, 0, 0)
+        imr.setSpacing(4)
+        self.item_add_combo = QComboBox()
+        self.item_add_combo.setEditable(True)
+        self.item_add_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if self.item_add_combo.lineEdit():
+            self.item_add_combo.lineEdit().setPlaceholderText("搜装备中文名补录...")
+        item_confirm_btn = QPushButton("添加")
+        item_confirm_btn.setFixedHeight(22)
+        item_confirm_btn.clicked.connect(self._handle_manual_add_item)
+        imr.addWidget(self.item_add_combo, 1)
+        imr.addWidget(item_confirm_btn)
+        self.item_manual_row.hide()
+        ds_lay.addWidget(self.item_manual_row)
+
+        self.degraded_sync_frame.hide()
+        body_lay.addWidget(self.degraded_sync_frame)
 
         # 7. Collapsible Tools Row (Dataset + Manual Hero override, tucked behind header '⚙' to save 28px in-game!)
         self.tools_row = QWidget()
@@ -1595,7 +1713,11 @@ class EdgeBuildDrawer(QWidget):
                     ch = hfw if hfw > 0 else max(w_child.sizeHint().height(), w_child.minimumSizeHint().height())
                     explicit_h += ch + (b_sp if vis_cnt > 0 else 0)
                     vis_cnt += 1
-        body_hint_h = explicit_h if explicit_h > 0 else max(body_h_for_w if body_h_for_w > 0 else 0, self.panel_body.sizeHint().height())
+        body_hint_h = max(
+            explicit_h,
+            body_h_for_w if body_h_for_w > 0 else 0,
+            self.panel_body.sizeHint().height(),
+        )
         header_chrome_h = m.px(56)
         max_h = max(
             self.EXPANDED_MIN_H,
@@ -1612,6 +1734,8 @@ class EdgeBuildDrawer(QWidget):
         y: int | None = None,
         force_scale: bool = False,
         auto_fit_h: bool = False,
+        anchor_bottom: bool = False,
+        anchor_bottom_y: int | None = None,
     ) -> None:
         w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, int(w)))
         h_for_scale = None if auto_fit_h else max(self.EXPANDED_MIN_H, int(h))
@@ -1630,44 +1754,152 @@ class EdgeBuildDrawer(QWidget):
             self._rebuild_scaled_dynamic_widgets()
 
         self._invalidate_expanded_layouts()
+        screen = self._active_screen()
+        geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+        auto_h = self._compute_auto_expanded_height(w, geo)
+        max_allowed_h = max(self.EXPANDED_MIN_H, geo.height() - 32)
         if auto_fit_h:
-            screen = self._active_screen()
-            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
-            eff_h = self._compute_auto_expanded_height(w, geo)
-            eff_y = max(geo.top() + 12, min(geo.bottom() - eff_h - 12, int(y) if y is not None else self.y()))
+            eff_h = auto_h
         else:
-            eff_h = max(self.EXPANDED_MIN_H, int(h))
-            eff_y = int(y) if y is not None else self.y()
+            eff_h = min(max_allowed_h, max(self.EXPANDED_MIN_H, int(h), auto_h))
+        if anchor_bottom and anchor_bottom_y is not None:
+            raw_y = int(anchor_bottom_y) - eff_h
+        else:
+            raw_y = int(y) if y is not None else self.y()
+        eff_y = max(geo.top() + 12, min(geo.bottom() - eff_h - 12, raw_y))
 
         self.setFixedWidth(w)
         self.setFixedHeight(eff_h)
         self.panel.setFixedHeight(eff_h)
-        if x is not None and y is not None:
+        if x is not None and (y is not None or anchor_bottom):
             self.setGeometry(int(x), eff_y, w, eff_h)
         self._layout_corner_grips()
 
+    def get_tracked_scrollbars(self) -> dict[str, QScrollBar]:
+        """Return key internal vertical scrollbars for optional DevLab overflow observation."""
+        return {"edge_drawer.panel": self.panel_scroll.verticalScrollBar()}
+
+    def _emit_subcard_action(
+        self,
+        card: str,
+        action: str,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        payload = dict(meta) if isinstance(meta, dict) else {}
+        self.subcard_action.emit(card, action, payload)
+        if self._on_subcard_action is not None:
+            self._on_subcard_action(card, action, payload)
+
+    def _user_expand(self) -> None:
+        self.set_expanded(True)
+        self._emit_subcard_action("drawer_panel", "expand", {"expanded": True})
+
+    def _user_collapse(self) -> None:
+        self.set_expanded(False)
+        self._emit_subcard_action("drawer_panel", "collapse", {"expanded": False})
+
+    def _user_toggle_expanded(self) -> None:
+        target = not self._expanded
+        self.set_expanded(target)
+        self._emit_subcard_action("drawer_panel", "expand" if target else "collapse", {"expanded": target})
+
+    def _close_inline_preview(self) -> None:
+        self.inline_preview_box.hide()
+        self._emit_subcard_action("inline_preview", "close", {"visible": False})
+
+    def _capture_norm_rect(self) -> tuple[list[float], QRect, int, int, float]:
+        screens = list(QGuiApplication.screens())
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
+        if screen is not None:
+            geo = screen.geometry()
+            dpr = max(1.0, float(screen.devicePixelRatio() or 1.0))
+            try:
+                screen_idx = screens.index(screen)
+            except ValueError:
+                screen_idx = 0
+        else:
+            geo = QRect(0, 0, 1920, 1080)
+            dpr = 1.0
+            screen_idx = 0
+        sw = max(1, geo.width())
+        sh = max(1, geo.height())
+        norm = [
+            round((self.x() - geo.x()) / sw, 4),
+            round((self.y() - geo.y()) / sh, 4),
+            round(self.width() / sw, 4),
+            round(self.height() / sh, 4),
+        ]
+        return norm, geo, screen_idx, max(1, len(screens)), dpr
+
+    def _emit_geometry_changed(self, action: str) -> None:
+        norm, geo, screen_idx, screen_cnt, dpr = self._capture_norm_rect()
+        prev_norm = self._gesture_start_norm_rect
+        self._gesture_start_norm_rect = None
+        saved_size = [int(self._expanded_w), int(self._custom_h or 0)] if self._has_custom_w else None
+        saved_scale = round(float(self._ui_scale), 3) if self._has_custom_w else None
+        saved_pos = [int(self._custom_pos.x()), int(self._custom_pos.y())] if self._custom_pos is not None else None
+        payload: dict[str, Any] = {
+            "overlay": "edge_drawer",
+            "action": action,
+            "x": int(self.x()),
+            "y": int(self.y()),
+            "width": int(self.width()),
+            "height": int(self.height()),
+            "pos": saved_pos,
+            "size": saved_size,
+            "scale": saved_scale,
+            "expanded": bool(self._expanded),
+            "snapped_edge": "right" if self._anchor_right else "detached",
+            "screen_rect": [int(geo.x()), int(geo.y()), int(geo.width()), int(geo.height())],
+            "screen_index": int(screen_idx),
+            "screen_count": int(screen_cnt),
+            "dpr": round(float(dpr), 3),
+            "norm_rect": norm,
+            "prev_norm_rect": prev_norm,
+        }
+        self.geometry_changed.emit(payload)
+        if self._on_geometry_changed is not None:
+            self._on_geometry_changed(payload)
+
     def _on_live_resize(self, target: QRect, edge: str) -> None:
+        if self._gesture_start_norm_rect is None:
+            self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
         self._has_custom_w = True
-        has_v = ("t" in edge) or ("b" in edge)
-        if has_v:
-            self._custom_h = max(self.EXPANDED_MIN_H, target.height())
-        auto_fit_h = (not has_v) and (self._custom_h is None)
-        eff_h = self._custom_h if self._custom_h is not None else target.height()
-        self._apply_expanded_dimensions(
-            target.width(),
-            eff_h,
-            x=target.x(),
-            y=target.y(),
-            force_scale=False,
-            auto_fit_h=auto_fit_h,
-        )
-
-    def _on_resize_finished(self, target: QRect, edge: str) -> None:
-        self._has_custom_w = True
         w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
         has_v = ("t" in edge) or ("b" in edge)
+        is_corner = ("l" in edge or "r" in edge) and has_v
+        if is_corner:
+            # Corner drag adjusts width & scale without locking _custom_h below content
+            self._apply_expanded_dimensions(
+                w,
+                target.height(),
+                x=target.x(),
+                y=target.y(),
+                force_scale=False,
+                auto_fit_h=True,
+                anchor_bottom=("t" in edge),
+                anchor_bottom_y=target.y() + target.height(),
+            )
+            screen = self._active_screen()
+            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+            auto_h = self._compute_auto_expanded_height(w, geo)
+            if target.height() > auto_h + 12:
+                self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+                self._apply_expanded_dimensions(
+                    w,
+                    self._custom_h,
+                    x=target.x(),
+                    y=target.y(),
+                    force_scale=False,
+                    auto_fit_h=False,
+                    anchor_bottom=("t" in edge),
+                    anchor_bottom_y=target.y() + target.height(),
+                )
+            else:
+                self._custom_h = None
+            return
         if has_v:
             self._custom_h = max(self.EXPANDED_MIN_H, target.height())
         auto_fit_h = (not has_v) and (self._custom_h is None)
@@ -1677,15 +1909,69 @@ class EdgeBuildDrawer(QWidget):
             eff_h,
             x=target.x(),
             y=target.y(),
-            force_scale=True,
+            force_scale=False,
             auto_fit_h=auto_fit_h,
+            anchor_bottom=("t" in edge),
+            anchor_bottom_y=target.y() + target.height(),
         )
+
+    def _on_resize_finished(self, target: QRect, edge: str) -> None:
+        self._has_custom_w = True
+        w = max(self.MIN_EXPANDED_W, min(self.MAX_EXPANDED_W, target.width()))
+        has_v = ("t" in edge) or ("b" in edge)
+        is_corner = ("l" in edge or "r" in edge) and has_v
+        if is_corner:
+            self._apply_expanded_dimensions(
+                w,
+                target.height(),
+                x=target.x(),
+                y=target.y(),
+                force_scale=True,
+                auto_fit_h=True,
+                anchor_bottom=("t" in edge),
+                anchor_bottom_y=target.y() + target.height(),
+            )
+            screen_est = self._active_screen()
+            geo_est = screen_est.geometry() if screen_est is not None else QRect(0, 0, 1920, 1080)
+            auto_h = self._compute_auto_expanded_height(w, geo_est)
+            if target.height() > auto_h + 12:
+                self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+                self._apply_expanded_dimensions(
+                    w,
+                    self._custom_h,
+                    x=target.x(),
+                    y=target.y(),
+                    force_scale=True,
+                    auto_fit_h=False,
+                    anchor_bottom=("t" in edge),
+                    anchor_bottom_y=target.y() + target.height(),
+                )
+            else:
+                self._custom_h = None
+        else:
+            if has_v:
+                self._custom_h = max(self.EXPANDED_MIN_H, target.height())
+            auto_fit_h = (not has_v) and (self._custom_h is None)
+            eff_h = self._custom_h if self._custom_h is not None else target.height()
+            self._apply_expanded_dimensions(
+                w,
+                eff_h,
+                x=target.x(),
+                y=target.y(),
+                force_scale=True,
+                auto_fit_h=auto_fit_h,
+                anchor_bottom=("t" in edge),
+                anchor_bottom_y=target.y() + target.height(),
+            )
         screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
         if screen is not None:
             self._target_screen = screen
             geo = screen.geometry()
-            self._anchor_right = (geo.right() - (self.x() + self.width())) <= 28
+            snap_tol = self._right_snap_tolerance(geo)
+            self._anchor_right = (geo.right() - (self.x() + self.width())) <= snap_tol
             if self._anchor_right:
+                snapped_x = geo.right() - self.width() + 1
+                self.move(snapped_x, self.y())
                 self._custom_pos = QPoint(geo.right() - self.COLLAPSED_W + 1, self.y())
             else:
                 self._custom_pos = self.pos()
@@ -1696,8 +1982,10 @@ class EdgeBuildDrawer(QWidget):
             self._on_scale_changed(round(self._ui_scale, 3))
         if self._on_pos_changed and self._custom_pos is not None:
             self._on_pos_changed([self._custom_pos.x(), self._custom_pos.y()])
+        self._emit_geometry_changed("resize")
 
     def reset_default_size(self) -> None:
+        self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         self._has_custom_w = False
         self._custom_h = None
         screen = self._active_screen()
@@ -1717,6 +2005,7 @@ class EdgeBuildDrawer(QWidget):
             self._on_size_changed(None)
         if self._on_scale_changed:
             self._on_scale_changed(None)
+        self._emit_geometry_changed("reset_size")
 
     def _get_item_pixmap(self, item_id: str, size: int) -> QPixmap | None:
         norm = normalize_item_id(item_id)
@@ -1745,7 +2034,13 @@ class EdgeBuildDrawer(QWidget):
                 try:
                     p = store.static.ensure_icon("item", norm)
                     if not self._is_closed and p is not None and p.exists() and p.stat().st_size > 64:
-                        self._icon_invoker.invoke.emit(self._on_icon_ready)
+                        try:
+                            from shiboken6 import isValid as _qt_is_valid
+
+                            if _qt_is_valid(self) and _qt_is_valid(self._icon_invoker):
+                                self._icon_invoker.invoke.emit(self._on_icon_ready)
+                        except (RuntimeError, ImportError):
+                            pass
                 finally:
                     self._fetching_icons.discard(norm)
 
@@ -1760,6 +2055,12 @@ class EdgeBuildDrawer(QWidget):
         self._is_closed = True
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
+        if self._brief_auto_collapse_timer.isActive():
+            self._brief_auto_collapse_timer.stop()
+        if self._quick_confirm_timer.isActive():
+            self._quick_confirm_timer.stop()
+        if self._rescan_cooldown_timer.isActive():
+            self._rescan_cooldown_timer.stop()
         super().closeEvent(event)
 
     def _on_icon_ready(self) -> None:
@@ -1772,7 +2073,13 @@ class EdgeBuildDrawer(QWidget):
             return
 
     def _toggle_manual_aug_picker(self) -> None:
-        self.aug_manual_row.setVisible(not self.aug_manual_row.isVisible())
+        now_visible = not self.aug_manual_row.isVisible()
+        self.aug_manual_row.setVisible(now_visible)
+        self._emit_subcard_action(
+            "manual_aug_picker",
+            "expand" if now_visible else "collapse",
+            {"expanded": now_visible},
+        )
         if self._commercial and self._lifecycle is not None and self._lifecycle.is_sealed_dormant:
             self._sync_seal_slots()
         if self.isVisible():
@@ -1781,7 +2088,13 @@ class EdgeBuildDrawer(QWidget):
     def _toggle_tools_row(self) -> None:
         if self._is_full_locked:
             return
-        self.tools_row.setVisible(not self.tools_row.isVisible())
+        now_visible = not self.tools_row.isVisible()
+        self.tools_row.setVisible(now_visible)
+        self._emit_subcard_action(
+            "tools_row",
+            "expand" if now_visible else "collapse",
+            {"expanded": now_visible},
+        )
         if self._commercial and self._lifecycle is not None and self._lifecycle.is_sealed_dormant:
             self._sync_seal_slots()
         if self.isVisible():
@@ -1792,6 +2105,10 @@ class EdgeBuildDrawer(QWidget):
         color = "#D946EF" if is_transmute_augment(aug_id) else "#0AC8B9"
         self.aug_frame.trigger_pulse(color, duration_ms=620)
 
+    @staticmethod
+    def _right_snap_tolerance(geo: QRect) -> int:
+        return max(72, int(geo.width() * 0.05))
+
     @classmethod
     def _infer_initial_anchor_right(cls, pos: QPoint | None) -> bool:
         if pos is None:
@@ -1800,9 +2117,10 @@ class EdgeBuildDrawer(QWidget):
         if screen is None:
             return False
         geo = screen.geometry()
+        tol = cls._right_snap_tolerance(geo)
         ix = pos.x()
-        near_collapsed_right = (geo.right() - (ix + cls.COLLAPSED_W)) <= 32
-        near_expanded_right = abs(ix - (geo.right() - cls.EXPANDED_W + 1)) <= 32
+        near_collapsed_right = (geo.right() - (ix + cls.COLLAPSED_W)) <= tol
+        near_expanded_right = abs(ix - (geo.right() - cls.EXPANDED_W + 1)) <= tol
         return near_collapsed_right or near_expanded_right
 
     def _on_slide_finished(self) -> None:
@@ -1861,10 +2179,12 @@ class EdgeBuildDrawer(QWidget):
                 self._last_rendered_w = w
                 self._rebuild_scaled_dynamic_widgets()
             self._invalidate_expanded_layouts()
+            auto_h = self._compute_auto_expanded_height(w, geo)
             if self._custom_h is not None:
-                h = min(geo.height() - 32, max(self.EXPANDED_MIN_H, self._custom_h))
+                max_allowed_h = max(self.EXPANDED_MIN_H, geo.height() - 32)
+                h = min(max_allowed_h, max(self.EXPANDED_MIN_H, self._custom_h, auto_h))
             else:
-                h = self._compute_auto_expanded_height(w, geo)
+                h = auto_h
             if self.panel.height() != h or self.panel.minimumHeight() != h or self.panel.maximumHeight() != h:
                 self.panel.setFixedHeight(h)
         else:
@@ -1900,26 +2220,31 @@ class EdgeBuildDrawer(QWidget):
             x = geo.right() - w + 1
 
         target_rect = QRect(x, y, w, h)
-        if self.minimumWidth() != w or self.maximumWidth() != w:
-            self.setFixedWidth(w)
-        if self.minimumHeight() != h or self.maximumHeight() != h:
-            self.setFixedHeight(h)
+        if (
+            self.minimumWidth() != w
+            or self.maximumWidth() != w
+            or self.minimumHeight() != h
+            or self.maximumHeight() != h
+        ):
+            self.setFixedSize(w, h)
         if self.geometry() != target_rect:
             self.setGeometry(target_rect)
         if self._expanded:
             self._layout_corner_grips()
 
     def _close_by_user(self) -> None:
-        self.hide()
         if self._on_closed_by_user:
             self._on_closed_by_user()
+        self.hide()
 
     def reset_to_right_edge(self) -> None:
+        self._gesture_start_norm_rect = self._capture_norm_rect()[0]
         self._custom_pos = None
         self._anchor_right = True
         self._reposition_right_edge()
         if self._on_pos_changed:
             self._on_pos_changed([self.x(), self.y()])
+        self._emit_geometry_changed("reset_edge")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1930,13 +2255,17 @@ class EdgeBuildDrawer(QWidget):
                 return
             header_drag_h = self._px(40, floor=36)
             if (not self._expanded) or event.position().y() <= header_drag_h:
-                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                self._gesture_start_norm_rect = self._capture_norm_rect()[0]
+                gpos = event.globalPosition().toPoint()
+                self._drag_press_global = gpos
+                self._drag_offset = gpos - self.frameGeometry().topLeft()
+                self._did_drag = False
                 event.accept()
                 return
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
             a_toggle = QAction("收起成小条" if self._expanded else "展开抽屉", menu)
-            a_toggle.triggered.connect(self.toggle_expanded)
+            a_toggle.triggered.connect(self._user_toggle_expanded)
             a_reset_size = QAction("恢复默认尺寸（适配屏幕）", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_reset = QAction("复位到屏幕右侧", menu)
@@ -1955,8 +2284,14 @@ class EdgeBuildDrawer(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_offset is not None:
-            screen = QGuiApplication.screenAt(event.globalPosition().toPoint()) or self._active_screen()
-            pos = event.globalPosition().toPoint() - self._drag_offset
+            gpos = event.globalPosition().toPoint()
+            if not self._did_drag:
+                if self._drag_press_global is None or (gpos - self._drag_press_global).manhattanLength() < 4:
+                    event.accept()
+                    return
+                self._did_drag = True
+            screen = QGuiApplication.screenAt(gpos) or self._active_screen()
+            pos = gpos - self._drag_offset
             if screen is not None:
                 geo = screen.geometry()
                 pos.setX(max(geo.left(), min(geo.right() - self.width() + 1, pos.x())))
@@ -1969,19 +2304,30 @@ class EdgeBuildDrawer(QWidget):
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and not self._expanded:
             self._drag_offset = None
-            self.set_expanded(True)
+            self._drag_press_global = None
+            self._did_drag = False
+            self._gesture_start_norm_rect = None
+            self._user_expand()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_offset is not None:
+            did_drag = self._did_drag
             self._drag_offset = None
+            self._drag_press_global = None
+            self._did_drag = False
+            if not did_drag:
+                self._gesture_start_norm_rect = None
+                event.accept()
+                return
             screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
             if screen is not None:
                 self._target_screen = screen
                 geo = screen.geometry()
-                self._anchor_right = (geo.right() - (self.x() + self.width())) <= 28
+                snap_tol = self._right_snap_tolerance(geo)
+                self._anchor_right = (geo.right() - (self.x() + self.width())) <= snap_tol
                 if self._anchor_right:
                     snapped_x = geo.right() - self.width() + 1
                     self.move(snapped_x, self.y())
@@ -1993,19 +2339,57 @@ class EdgeBuildDrawer(QWidget):
                 self._custom_pos = self.pos()
             if self._on_pos_changed:
                 self._on_pos_changed([self._custom_pos.x(), self._custom_pos.y()])
+            self._emit_geometry_changed("drag")
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
+    def _apply_anti_strand_on_collapse(self, *, was_expanded: bool, prev_right: int) -> None:
+        """Prevent the 48px pill from stranding in mid-screen when collapsing while un-anchored."""
+        if not was_expanded or self._anchor_right:
+            return
+        screen = QGuiApplication.screenAt(self.frameGeometry().center()) or self._active_screen()
+        if screen is None:
+            return
+        geo = screen.geometry()
+        right_ratio = (prev_right - geo.left()) / float(max(1, geo.width()))
+        if right_ratio >= 0.65:
+            self._anchor_right = True
+            self._custom_pos = QPoint(geo.right() - self.COLLAPSED_W + 1, self.y())
+        else:
+            aligned_x = max(geo.left(), min(geo.right() - self.COLLAPSED_W + 1, prev_right - self.COLLAPSED_W))
+            self._custom_pos = QPoint(aligned_x, self.y())
+
     def set_expanded(self, expanded: bool) -> None:
         was_visible = self.isVisible()
+        was_expanded = self._expanded
+        prev_right = self.x() + self.width()
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
-        self._expanded = bool(expanded)
-        self.pill.setVisible(not self._expanded)
-        self.panel.setVisible(self._expanded)
-        # Single-frame snap eliminates 14x 60fps WS_EX_LAYERED HWND resize reallocations (saves ~30% DX11 1% Low!)
-        self._reposition_right_edge()
+        target_exp = bool(expanded)
+        if not target_exp and self._brief_auto_collapse_timer.isActive():
+            self._brief_auto_collapse_timer.stop()
+        self._expanded = target_exp
+        if target_exp:
+            # Wrap with updates disabled and resize BEFORE showing panel so ScrollOverflowTracker
+            # never sees a 1-frame 188px transient squeeze.
+            self.setUpdatesEnabled(False)
+            try:
+                self.pill.hide()
+                self._reposition_right_edge()
+                self.panel.show()
+                self._reposition_right_edge()
+            finally:
+                self.setUpdatesEnabled(True)
+        else:
+            self._apply_anti_strand_on_collapse(was_expanded=was_expanded, prev_right=prev_right)
+            self.setUpdatesEnabled(False)
+            try:
+                self.panel.hide()
+                self.pill.show()
+                self._reposition_right_edge()
+            finally:
+                self.setUpdatesEnabled(True)
         if was_visible:
             show_no_activate(self, click_through=False)
         if self._expanded and self._pending_auto_unseal:
@@ -2050,6 +2434,7 @@ class EdgeBuildDrawer(QWidget):
         self._opening_brief_seal_dismissed = True
         self._opening_brief_seal_dismissed_count += 1
         self.opening_brief_seal_wrap.hide()
+        self._emit_subcard_action("opening_brief_seal", "dismiss", {"dismissed_count": self._opening_brief_seal_dismissed_count})
         if self._on_opening_brief_seal_dismissed:
             self._on_opening_brief_seal_dismissed()
         if self._expanded and self.isVisible():
@@ -2279,10 +2664,16 @@ class EdgeBuildDrawer(QWidget):
         self._is_player_dead = bool(is_dead)
         self._match_game_time_s = max(0.0, float(game_time_s or 0.0))
         now_collapsed = self._match_game_time_s >= 90.0
+        need_reposition = False
         if self._lobby_scout is not None and prev_collapsed != now_collapsed:
             self._sync_lobby_radar()
+        if self._opening_brief_data and not self._opening_brief_dismissed and prev_collapsed != now_collapsed:
+            self._render_opening_brief()
+            need_reposition = True
         if self._commercial and self._lifecycle is not None and self._lifecycle.is_sealed_dormant:
             self._sync_seal_slots()
+        if need_reposition and self._expanded and self.isVisible():
+            self._reposition_right_edge()
 
     def set_warning(self, message: str) -> None:
         self._warning_text = message
@@ -2614,44 +3005,76 @@ class EdgeBuildDrawer(QWidget):
                 f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {self._fs(10)}px;"
             )
 
+    def _on_brief_auto_collapse_timeout(self) -> None:
+        if not self._expanded:
+            return
+        if self._is_player_dead or self.underMouse():
+            return
+        self.set_expanded(False)
+
     def dismiss_opening_brief(self) -> None:
         """Hide the opening 10-player brief card for the remainder of the current match."""
+        if self._brief_auto_collapse_timer.isActive():
+            self._brief_auto_collapse_timer.stop()
         self._opening_brief_dismissed = True
         self.opening_brief_card.hide()
+        self._emit_subcard_action("opening_brief", "dismiss", {"visible": False})
         if self._expanded and self.isVisible():
             self._reposition_right_edge()
 
     def reset_opening_brief_state(self) -> None:
         """Clear opening brief dismissal and content on new match start or match end."""
+        if self._brief_auto_collapse_timer.isActive():
+            self._brief_auto_collapse_timer.stop()
         self._opening_brief_dismissed = False
         self._opening_brief_seal_dismissed = False
+        self._opening_brief_compacted = False
         self._opening_brief_data = {}
+        self.opening_brief_title_lbl.setText("◈ 开局 10 人作战简报")
+        self.opening_brief_title_lbl.setToolTip("")
+        self.opening_brief_card.setToolTip("")
         self.opening_brief_card.hide()
         self._sync_seal_slots()
 
     def _render_opening_brief(self) -> bool:
-        """Render the collapsible opening 10-player brief card; returns True when shown."""
+        """Render the collapsible opening 10-player brief card; compacts to 1 line at game_time_s >= 90s."""
         if self._is_full_locked or self._opening_brief_dismissed or not self._opening_brief_data:
             self.opening_brief_card.hide()
             return False
         rows = (
-            ("enemy_threat", self.opening_brief_threat_row, self.opening_brief_threat_lbl),
-            ("augment_goal", self.opening_brief_augment_row, self.opening_brief_augment_lbl),
-            ("opening_buy", self.opening_brief_buy_row, self.opening_brief_buy_lbl),
+            ("enemy_threat", "敌方威胁", self.opening_brief_threat_row, self.opening_brief_threat_lbl),
+            ("augment_goal", "海克斯目标", self.opening_brief_augment_row, self.opening_brief_augment_lbl),
+            ("opening_buy", "出门对策", self.opening_brief_buy_row, self.opening_brief_buy_lbl),
         )
+        compact = self._match_game_time_s >= 90.0
+        self._opening_brief_compacted = compact
         any_shown = False
-        for key, row_w, val_lbl in rows:
+        tip_lines: list[str] = []
+        first_summary = ""
+        for key, zh_tag, row_w, val_lbl in rows:
             txt = (self._opening_brief_data.get(key) or "").strip()
             if txt:
                 val_lbl.setText(txt)
                 val_lbl.setToolTip(txt)
-                row_w.show()
+                tip_lines.append(f"【{zh_tag}】{txt}")
+                if not first_summary:
+                    first_summary = txt
+                row_w.setVisible(not compact)
                 any_shown = True
             else:
                 val_lbl.setText("")
                 val_lbl.setToolTip("")
                 row_w.hide()
         if any_shown:
+            full_tip = "\n".join(tip_lines)
+            self.opening_brief_card.setToolTip(full_tip)
+            self.opening_brief_title_lbl.setToolTip(full_tip)
+            if compact:
+                self.opening_brief_title_lbl.setText(
+                    f"◈ 开局简报 · {_clip_text(first_summary, 22)}" if first_summary else "◈ 开局 10 人作战简报"
+                )
+            else:
+                self.opening_brief_title_lbl.setText("◈ 开局 10 人作战简报")
             self.opening_brief_card.show()
             return True
         self.opening_brief_card.hide()
@@ -2741,11 +3164,17 @@ class EdgeBuildDrawer(QWidget):
 
     def _toggle_radar_detail(self) -> None:
         self._radar_detail_expanded = not self._radar_detail_expanded
+        self._emit_subcard_action(
+            "lobby_radar",
+            "expand" if self._radar_detail_expanded else "collapse",
+            {"expanded": self._radar_detail_expanded},
+        )
         self._sync_lobby_radar()
 
     def _dismiss_lobby_radar(self) -> None:
         self._radar_dismissed = True
         self._radar_detail_expanded = False
+        self._emit_subcard_action("lobby_radar", "dismiss", {"visible": False})
         self._sync_lobby_radar()
 
     def _sync_top_threat_badge(self, *, threat_chars: int | None = None) -> bool:
@@ -2940,6 +3369,7 @@ class EdgeBuildDrawer(QWidget):
             self.opening_brief_card.trigger_pulse("#0AC8B9", duration_ms=560)
             if allow_auto_expand and not self._expanded and not self._is_full_locked:
                 self.set_expanded(True)
+                self._brief_auto_collapse_timer.start(self.BRIEF_AUTO_COLLAPSE_MS)
             elif self._expanded and self.isVisible():
                 self._reposition_right_edge()
         elif self._expanded and self.isVisible():
@@ -2997,11 +3427,30 @@ class EdgeBuildDrawer(QWidget):
         if self._expanded and self.isVisible():
             self._reposition_right_edge()
 
-    def set_recent_offered(self, offered: list[AugmentInfo], auto_committed_id: str = "") -> None:
+    def set_recent_offered(
+        self,
+        offered: list[AugmentInfo],
+        auto_committed_id: str = "",
+        confidence: float = 1.0,
+    ) -> None:
         """Surface 1-click quick-confirm OR 1-click swap strip for the last 3 offered cards."""
+        if self._quick_confirm_timer.isActive():
+            self._quick_confirm_timer.stop()
+        self._quick_confirm_case_a_active = False
         self._recent_offered = list(offered)
         self._recent_auto_committed_id = auto_committed_id
+        self._quick_confirm_confidence = float(confidence)
         self._rebuild_quick_confirm()
+        if self._expanded and self.isVisible():
+            self._reposition_right_edge()
+
+    def _on_quick_confirm_auto_dismiss(self) -> None:
+        self._quick_confirm_case_a_active = False
+        if not self._recent_offered:
+            return
+        self._recent_offered = []
+        self._recent_auto_committed_id = ""
+        self.quick_confirm_wrap.hide()
         if self._expanded and self.isVisible():
             self._reposition_right_edge()
 
@@ -3015,6 +3464,9 @@ class EdgeBuildDrawer(QWidget):
                 w.deleteLater()
 
         if not self._recent_offered:
+            self._quick_confirm_case_a_active = False
+            if self._quick_confirm_timer.isActive():
+                self._quick_confirm_timer.stop()
             self.quick_confirm_wrap.hide()
             return
 
@@ -3023,6 +3475,9 @@ class EdgeBuildDrawer(QWidget):
         if self._recent_auto_committed_id and self._recent_auto_committed_id in self._selected_augments:
             alts = [a for a in self._recent_offered if a.augment_id != self._recent_auto_committed_id]
             if not alts:
+                self._quick_confirm_case_a_active = False
+                if self._quick_confirm_timer.isActive():
+                    self._quick_confirm_timer.stop()
                 self.quick_confirm_wrap.hide()
                 return
             lbl = QLabel("改选:")
@@ -3046,12 +3501,23 @@ class EdgeBuildDrawer(QWidget):
             dismiss.setStyleSheet(
                 f"padding: 0px; font-size: {m.font_px(11)}px; color: #09C269; border: none; background: transparent;"
             )
-            dismiss.clicked.connect(lambda: self.set_recent_offered([]))
+            dismiss.clicked.connect(self._dismiss_quick_confirm_ok)
             self.quick_confirm_lay.addWidget(dismiss)
             self.quick_confirm_wrap.show()
+            if not self._quick_confirm_case_a_active:
+                self._quick_confirm_case_a_active = True
+                delay_ms = (
+                    self.QUICK_CONFIRM_HIGH_CONF_MS
+                    if self._quick_confirm_confidence >= 0.90
+                    else self.QUICK_CONFIRM_LOW_CONF_MS
+                )
+                self._quick_confirm_timer.start(delay_ms)
             return
 
         # Case B: Nothing recorded yet -> 1-click confirm buttons
+        self._quick_confirm_case_a_active = False
+        if self._quick_confirm_timer.isActive():
+            self._quick_confirm_timer.stop()
         unrecorded = [a for a in self._recent_offered if a.augment_id not in self._selected_augments]
         if not unrecorded or len(unrecorded) < len(self._recent_offered) or len(self._selected_augments) >= 4:
             self.quick_confirm_wrap.hide()
@@ -3073,17 +3539,29 @@ class EdgeBuildDrawer(QWidget):
             self.quick_confirm_lay.addWidget(btn)
         self.quick_confirm_wrap.show()
 
+    def _dismiss_quick_confirm_ok(self) -> None:
+        self._emit_subcard_action("quick_confirm", "confirm_ok", {})
+        self.set_recent_offered([])
+
     def _quick_pick_augment(self, aug_id: str) -> None:
+        if self._quick_confirm_timer.isActive():
+            self._quick_confirm_timer.stop()
+        self._quick_confirm_case_a_active = False
         self._recent_offered = []
         self._recent_auto_committed_id = ""
         self.quick_confirm_wrap.hide()
+        self._emit_subcard_action("quick_confirm", "pick", {"augment_id": aug_id})
         if self._on_select_augment:
             self._on_select_augment(aug_id)
 
     def _swap_last_augment(self, aug_id: str) -> None:
+        if self._quick_confirm_timer.isActive():
+            self._quick_confirm_timer.stop()
+        self._quick_confirm_case_a_active = False
         self._recent_offered = []
         self._recent_auto_committed_id = ""
         self.quick_confirm_wrap.hide()
+        self._emit_subcard_action("quick_confirm", "swap", {"augment_id": aug_id})
         if self._on_replace_last_augment:
             self._on_replace_last_augment(aug_id)
 
@@ -3110,8 +3588,117 @@ class EdgeBuildDrawer(QWidget):
             for h in sorted(store.all_heroes(), key=lambda x: x.name):
                 self.hero_combo.addItem(h.name, h.hero_id)
             self.hero_combo.setCurrentIndex(-1)
+
+            self.item_add_combo.clear()
+            items_sorted = sorted(
+                (
+                    info
+                    for info in store.static.items.values()
+                    if info.name and int(getattr(info, "gold", 0) or 0) >= 300 and str(info.item_id) not in ("2052", "220013")
+                ),
+                key=lambda x: (-int(getattr(x, "gold", 0) or 0), x.name),
+            )
+            for info in items_sorted:
+                self.item_add_combo.addItem(f"{info.name} ({int(getattr(info, 'gold', 0) or 0)}G)", str(info.item_id))
+            self.item_add_combo.setCurrentIndex(-1)
         finally:
             self._updating_combos = False
+
+    def _toggle_manual_item_picker(self) -> None:
+        show = not self.item_manual_row.isVisible()
+        self.item_manual_row.setVisible(show)
+        self._emit_subcard_action("degraded_sync", "toggle_item_picker", {"visible": show})
+        if self._expanded and self.isVisible():
+            self._reposition_right_edge()
+        if show:
+            self.panel_scroll.ensureWidgetVisible(self.item_manual_row)
+
+    def _handle_manual_add_item(self) -> None:
+        idx = self.item_add_combo.currentIndex()
+        item_id = ""
+        if idx >= 0:
+            item_id = str(self.item_add_combo.itemData(idx) or "").strip()
+        if not item_id and self._store_ref is not None:
+            txt = self.item_add_combo.currentText().strip()
+            if txt:
+                for iid, info in self._store_ref.static.items.items():
+                    if info.name and (txt == info.name or txt in info.name):
+                        item_id = str(iid)
+                        break
+        if item_id and self._on_manual_add_item:
+            self._on_manual_add_item(item_id)
+            self.item_add_combo.setCurrentIndex(-1)
+            if self.item_add_combo.lineEdit():
+                self.item_add_combo.lineEdit().clear()
+
+    def _handle_plan_b_rescan(self) -> None:
+        if self._rescan_cooldown_timer.isActive():
+            return
+        self.degraded_rescan_btn.setEnabled(False)
+        self.degraded_rescan_btn.setText("扫描中…")
+        self._rescan_cooldown_timer.start(self.PLAN_B_RESCAN_COOLDOWN_MS)
+        self._emit_subcard_action("degraded_sync", "manual_rescan", {})
+        if self._on_plan_b_rescan:
+            self._on_plan_b_rescan()
+
+    def _reset_plan_b_rescan_btn(self) -> None:
+        self.degraded_rescan_btn.setEnabled(True)
+        self.degraded_rescan_btn.setText("扫画面")
+
+    def set_degraded_2999_mode(
+        self,
+        active: bool,
+        *,
+        synced_items: list[tuple[str, str]] | None = None,
+        status_hint: str = "",
+    ) -> None:
+        self._degraded_2999_active = bool(active)
+        if synced_items is not None:
+            self._degraded_synced_items = list(synced_items)
+        hint_txt = (status_hint or "").strip() or "游戏未开启2999接口 · 自动视觉识别+手动补录已购装备"
+        self.degraded_hint_lbl.setText(hint_txt)
+        self.degraded_hint_lbl.hide()
+        self.degraded_sync_hdr_lbl.setToolTip(hint_txt)
+        self.degraded_sync_frame.setToolTip(hint_txt)
+
+        if not active or self._is_full_locked:
+            self.degraded_sync_frame.hide()
+            self.item_manual_row.hide()
+        else:
+            self._render_degraded_item_chips()
+            self.degraded_sync_frame.show()
+        if self._expanded and self.isVisible():
+            self._reposition_right_edge()
+
+    def _render_degraded_item_chips(self) -> None:
+        while self.degraded_items_lay.count():
+            it = self.degraded_items_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        if not self._degraded_synced_items:
+            empty_lbl = QLabel("当前已同步 0 件装备（点「扫画面」或「+装备」）")
+            empty_lbl.setStyleSheet("border: none; background: transparent; color: #787366; font-size: 9px;")
+            self.degraded_items_lay.addWidget(empty_lbl, 0, 0)
+            return
+        for idx, (iid, name) in enumerate(self._degraded_synced_items[:6]):
+            chip = QPushButton(f"{_clip_text(name, 7)} ×")
+            chip.setFixedHeight(20)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setToolTip(f"点击移除已同步装备【{name}】")
+            chip.setStyleSheet(
+                "QPushButton { padding: 0px 6px; font-size: 10px; border: 1px solid #785A28; "
+                "background-color: rgba(9, 20, 40, 220); color: #F0E6D2; border-radius: 2px; }"
+                "QPushButton:hover { border-color: #0AC8B9; color: #FFFFFF; }"
+            )
+            chip.clicked.connect(
+                lambda _=False, target_id=iid: self._on_manual_remove_item(target_id)
+                if self._on_manual_remove_item
+                else None
+            )
+            self.degraded_items_lay.addWidget(chip, idx // 2, idx % 2)
 
     def refresh_match_view(
         self,
@@ -3763,6 +4350,7 @@ class EdgeBuildDrawer(QWidget):
                 self.aug_manual_row.hide()
 
     def _handle_call_coach(self) -> None:
+        self._emit_subcard_action("toolbar_coach_btn", "click", {})
         if self._on_call_coach:
             self._on_call_coach()
 

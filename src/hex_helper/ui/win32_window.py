@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QWidget
 
 logger = logging.getLogger(__name__)
 
-_user32 = ctypes.windll.user32
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.GetWindowLongW.restype = wintypes.LONG
 _user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
@@ -28,6 +28,23 @@ _user32.SetWindowPos.argtypes = [
     wintypes.UINT,
 ]
 _user32.SetWindowPos.restype = wintypes.BOOL
+_user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+_user32.RegisterHotKey.restype = wintypes.BOOL
+_user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.UnregisterHotKey.restype = wintypes.BOOL
+
+_WIN32_HOTKEY_ERROR_DESCS: dict[int, str] = {
+    1409: "already registered",
+    1408: "invalid thread",
+    87: "invalid parameter",
+    5: "access denied",
+}
+
+
+def _describe_win32_hotkey_error(err: int) -> str:
+    if err in _WIN32_HOTKEY_ERROR_DESCS:
+        return _WIN32_HOTKEY_ERROR_DESCS[err]
+    return f"win32 error {err}" if err else "unknown error"
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -173,6 +190,8 @@ def apply_overlay_styles(
     When force=False and GWL_EXSTYLE already carries all required bits (including WS_EX_TOPMOST),
     skip SetWindowLongW & SetWindowPos(SWP_FRAMECHANGED) to avoid forcing DWM surface recomposition.
     """
+    if QGuiApplication.platformName() == "offscreen":
+        return 0
     hwnd = int(widget.winId())
     if not hwnd:
         return 0
@@ -287,6 +306,7 @@ class GlobalHotkeyManager(QAbstractNativeEventFilter):
         super().__init__()
         self._callbacks: dict[int, Callable[[], None]] = {}
         self._registered_specs: dict[int, str] = {}
+        self.last_failed_hotkeys: dict[str, int] = {}
         self._next_id = 100
         self._suspended = False
 
@@ -306,6 +326,7 @@ class GlobalHotkeyManager(QAbstractNativeEventFilter):
         if canonical in self._registered_specs.values():
             return True, ""
         probe_id = 0x7E00
+        ctypes.set_last_error(0)
         ok = bool(_user32.RegisterHotKey(None, probe_id, mods | MOD_NOREPEAT, vk))
         if ok:
             try:
@@ -313,6 +334,9 @@ class GlobalHotkeyManager(QAbstractNativeEventFilter):
             except Exception:
                 pass
             return True, ""
+        err = int(ctypes.get_last_error() or 0)
+        if err and err != 1409:
+            return False, f"「{canonical}」注册受限 (err={err}: {_describe_win32_hotkey_error(err)})"
         return False, f"「{canonical}」已被 Windows 或其他程序占用"
 
     def register(self, key_name: str, callback: Callable[[], None]) -> int | None:
@@ -326,10 +350,19 @@ class GlobalHotkeyManager(QAbstractNativeEventFilter):
         mods, vk, canonical = parsed
         hk_id = self._next_id
         self._next_id += 1
+        ctypes.set_last_error(0)
         ok = _user32.RegisterHotKey(None, hk_id, mods | MOD_NOREPEAT, vk)
         if not ok:
-            logger.warning("RegisterHotKey failed for %s (already registered by another app?)", canonical)
+            err = int(ctypes.get_last_error() or 0)
+            self.last_failed_hotkeys[canonical] = err
+            logger.warning(
+                "RegisterHotKey failed for %s: err=%d (%s)",
+                canonical,
+                err,
+                _describe_win32_hotkey_error(err),
+            )
             return None
+        self.last_failed_hotkeys.pop(canonical, None)
         self._callbacks[hk_id] = callback
         self._registered_specs[hk_id] = canonical
         return hk_id
@@ -342,6 +375,7 @@ class GlobalHotkeyManager(QAbstractNativeEventFilter):
                 pass
         self._callbacks.clear()
         self._registered_specs.clear()
+        self.last_failed_hotkeys.clear()
 
     def nativeEventFilter(self, event_type, message):  # noqa: N802
         if self._suspended:

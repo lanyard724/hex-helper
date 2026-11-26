@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-import os
 from pathlib import Path
 import pytest
 
@@ -20,9 +19,9 @@ from hex_helper.ui.match_recap_card import (
     render_match_recap_image,
 )
 
-LOCAL_ICON_CACHE = (
-    Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-    / "HexHelper" / "cache" / "icons"
+LOCAL_ICON_CACHE = Path(r"C:\Users\Administrator\AppData\Local\HexHelper\cache\icons")
+VISUAL_PROOF_PATH = Path(
+    r"C:\Users\Administrator\.gemini\antigravity\brain\c6d79029-fe63-4195-8605-30bd8143d2a5\audit_visual\match_recap_card_demo.png"
 )
 
 
@@ -128,7 +127,7 @@ def test_match_recap_data_is_frozen_and_has_expected_defaults():
         d.won = 1  # type: ignore[misc]
 
 
-def test_render_full_win_card_and_save_visual_proof(tmp_path: Path):
+def test_render_full_win_card_and_save_visual_proof():
     _qt_app()
     data = _build_full_win_data()
     img = render_match_recap_image(data)
@@ -144,12 +143,12 @@ def test_render_full_win_card_and_save_visual_proof(tmp_path: Path):
     assert stats["prism_hits"] > 5
     assert stats["web_orange_hits"] == 0
 
-    # Save real rendered visual proof PNG into temp directory
-    proof_path = tmp_path / "match_recap_card_demo.png"
-    saved = img.save(str(proof_path), "PNG")
+    # Save real rendered visual proof PNG for inspection
+    VISUAL_PROOF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    saved = img.save(str(VISUAL_PROOF_PATH), "PNG")
     assert saved is True
-    assert proof_path.is_file()
-    assert proof_path.stat().st_size > 15_000
+    assert VISUAL_PROOF_PATH.is_file()
+    assert VISUAL_PROOF_PATH.stat().st_size > 15_000
 
 
 def test_render_loss_and_unknown_status_cards_differ_visually():
@@ -321,3 +320,260 @@ def test_match_recap_dialog_preview_copy_and_save(tmp_path: Path, monkeypatch: p
 
     dlg.close()
     app.processEvents()
+
+
+def test_recap_dialog_live_update_data_and_poro_snax_filter_and_eog_snapshot(tmp_path: Path) -> None:
+    from hex_helper.data.static_assets import StaticAssetsManager
+    from hex_helper.game.lcu_client import LcuClient
+    from hex_helper.scoring.matchup_optimizer import TRINKET_AND_FREE_ITEM_IDS
+
+    # 1. ARAM Mayhem Poro-Snax 220013 must be filtered out of 6-slot builds
+    assert "220013" in TRINKET_AND_FREE_ITEM_IDS
+
+    # 2. StaticAssetsManager.ensure_icon falls back from 6-digit ARAM ID to 4-digit base ID
+    app = _qt_app()
+
+    def _make_png(path: Path, color: str) -> Path:
+        img = QImage(32, 32, QImage.Format.Format_ARGB32)
+        img.fill(QColor(color))
+        assert img.save(str(path), "PNG")
+        return path
+
+    fetched_urls: list[str] = []
+    png_stub = _make_png(tmp_path / "stub3114.png", "#3B82F6").read_bytes()
+
+    def fake_fetch(url: str) -> bytes:
+        fetched_urls.append(url)
+        if url.endswith("/item/3114.png"):
+            return png_stub
+        raise RuntimeError("404")
+
+    sm = StaticAssetsManager(tmp_path / "cache", fetcher=fake_fetch)
+    resolved = sm.ensure_icon("item", "223114")
+    assert resolved is not None and resolved.is_file()
+    assert any(u.endswith("/item/223114.png") for u in fetched_urls)
+    assert any(u.endswith("/item/3114.png") for u in fetched_urls)
+
+    # 3. LcuClient.get_eog_snapshot extracts authoritative ITEM0..ITEM5, KDA, won, duration
+    lcu = LcuClient()
+    lcu._get_json = lambda _path: {  # type: ignore[method-assign]
+        "gameLength": 969,
+        "localPlayer": {
+            "teamId": 100,
+            "stats": {
+                "WIN": 1,
+                "CHAMPIONS_KILLED": 5,
+                "NUM_DEATHS": 9,
+                "ASSISTS": 53,
+                "ITEM0": 2530,
+                "ITEM1": 6617,
+                "ITEM2": 6621,
+                "ITEM3": 6616,
+                "ITEM4": 3504,
+                "ITEM5": 3114,
+            },
+        },
+    }
+    snap = lcu.get_eog_snapshot()
+    assert snap["won"] == 1
+    assert snap["item_ids"] == ("2530", "6617", "6621", "6616", "3504", "3114")
+    assert snap["kda"] == "5/9/53"
+    assert snap["duration_s"] == 969
+
+    # 4. MatchRecapDialog.update_data live re-renders once missing item icon arrives
+    data_before = MatchRecapData(
+        hero_id="37",
+        hero_name="娑娜",
+        won=1,
+        kda="5/9/53",
+        duration_s=969,
+        item_entries=(("禁忌雕像", ""),),
+        item_ids=("3114",),
+    )
+    dlg = MatchRecapDialog(data_before)
+    app.processEvents()
+    before_bytes = dlg.card_image.bits().tobytes()
+
+    icon_3114 = _make_png(tmp_path / "3114.png", "#22C55E")
+    data_after = MatchRecapData(
+        hero_id="37",
+        hero_name="娑娜",
+        won=1,
+        kda="5/9/53",
+        duration_s=969,
+        item_entries=(("禁忌雕像", str(icon_3114)),),
+        item_ids=("3114",),
+    )
+    dlg.update_data(data_after)
+    app.processEvents()
+    after_bytes = dlg.card_image.bits().tobytes()
+    assert after_bytes != before_bytes
+    assert dlg.data is data_after
+    dlg.close()
+    app.processEvents()
+
+
+def test_v2_compute_match_rating_and_normalize_final_stats() -> None:
+    from hex_helper.ui.match_recap_card import compute_match_rating, normalize_final_stats
+
+    # Default canvas upgraded to 760x480 for unobstructed 6-item labels + telemetry dashboard
+    assert CARD_DEFAULT_WIDTH == 760
+    assert CARD_DEFAULT_HEIGHT == 480
+
+    # High-carry victory -> S+ & MVP
+    sc_mvp, gr_mvp, bd_mvp = compute_match_rating(
+        kda="18/3/26", won=1, damage_share=0.38, damage_taken_share=0.22, kp=0.82, gold_per_min=1150.0
+    )
+    assert 12.8 <= sc_mvp <= 16.0
+    assert gr_mvp == "S+"
+    assert bd_mvp == "MVP"
+
+    # High-carry defeat -> S+/S & SVP
+    sc_svp, gr_svp, bd_svp = compute_match_rating(
+        kda="16/4/24", won=0, damage_share=0.36, damage_taken_share=0.20, kp=0.80, gold_per_min=1100.0
+    )
+    assert sc_svp >= 12.0
+    assert gr_svp in ("S+", "S")
+    assert bd_svp == "SVP"
+
+    # Modest KDA & shares -> lower grade, no MVP/SVP badge
+    sc_low, gr_low, bd_low = compute_match_rating(
+        kda="2/10/5", won=0, damage_share=0.09, damage_taken_share=0.10, kp=0.25, gold_per_min=620.0
+    )
+    assert 1.0 <= sc_low < 9.5
+    assert gr_low in ("A", "B")
+    assert bd_low == ""
+
+    # Empty metrics -> zeroed gracefully
+    assert compute_match_rating(kda="", won=-1) == (0.0, "", "")
+
+    # normalize_final_stats handles LiveClient camelCase, canonical keys, and filters NaN/negative
+    norm = normalize_final_stats(
+        {
+            "attackDamage": 542.4,
+            "abilityPower": 120.0,
+            "maxHealth": 9240.0,
+            "abilityHaste": 165.0,
+            "armor": 310.0,
+            "magicResist": 245.0,
+            "attackSpeed": 2.65,
+            "moveSpeed": 430.0,
+            "bad_neg": -5.0,
+            "ad_nan": float("nan"),
+        }
+    )
+    assert norm == {
+        "ad": 542.4,
+        "ap": 120.0,
+        "hp": 9240.0,
+        "ah": 165.0,
+        "armor": 310.0,
+        "mr": 245.0,
+        "as": 2.65,
+        "ms": 430.0,
+    }
+
+
+def test_v2_card_renders_final_stats_eog_telemetry_augment_icons_and_no_ai_highlight(tmp_path: Path) -> None:
+    _qt_app()
+
+    def _stub_icon(name: str, color: str) -> str:
+        p = tmp_path / f"{name}.png"
+        im = QImage(48, 48, QImage.Format.Format_ARGB32)
+        im.fill(QColor(color))
+        assert im.save(str(p), "PNG")
+        return str(p)
+
+    aug_icons = (
+        _stub_icon("aug0", "#D946EF"),
+        _stub_icon("aug1", "#C8AA6E"),
+        _stub_icon("aug2", "#0AC8B9"),
+        _stub_icon("aug3", "#94A3B8"),
+    )
+    item_icons = tuple(
+        (nm, _stub_icon(f"item_{i}", "#3B82F6"))
+        for i, nm in enumerate(
+            ("海妖杀手", "鬼索的狂暴之刃", "破败王者之刃", "卢安娜的飓风", "死亡之舞", "多米尼克领主的致意")
+        )
+    )
+
+    base_kw = dict(
+        hero_id="6",
+        hero_name="厄加特",
+        hero_icon_path=_stub_icon("hero_6", "#10B981"),
+        won=1,
+        kda="17/5/23",
+        duration_s=1040,
+        team_kills="54:40",
+        is_first_prismatic=True,
+        augments=(
+            ("双刀流", "prismatic"),
+            ("歌利亚巨人", "prismatic"),
+            ("回归基本功", "gold"),
+            ("灵巧", "silver"),
+        ),
+        augment_icon_paths=aug_icons,
+        combo_title="巨像特效战神 · 满配成型",
+        combo_completed=True,
+        item_entries=item_icons,
+        final_stats={
+            "attackDamage": 512.0,
+            "abilityPower": 85.0,
+            "maxHealth": 8850.0,
+            "abilityHaste": 152.0,
+            "armor": 320.0,
+            "magicResist": 235.0,
+            "attackSpeed": 2.75,
+        },
+        damage_dealt=68420,
+        damage_share=0.34,
+        damage_taken=59310,
+        heal_and_shield=18400,
+        gold_earned=21400,
+        kill_participation=0.74,
+        match_score=14.2,
+        rating_grade="S+",
+        mvp_badge="MVP",
+        dataset_patch="26.23",
+    )
+
+    img_without_ai = render_match_recap_image(MatchRecapData(**base_kw, ai_highlight=""))
+    img_with_ai = render_match_recap_image(
+        MatchRecapData(**base_kw, ai_highlight="旧版 AI 副驾高光文案绝不应绘制到 v2 战报图上！")
+    )
+
+    assert img_without_ai.width() == 760 and img_without_ai.height() == 480
+    # Strictly ZERO legacy "AI 副驾高光" box rendered: passing ai_highlight produces identical pixels!
+    assert img_without_ai.bits().tobytes() == img_with_ai.bits().tobytes()
+
+    src_text = (Path(__file__).resolve().parents[1] / "src" / "hex_helper" / "ui" / "match_recap_card.py").read_text(
+        encoding="utf-8"
+    )
+    assert "AI 副驾高光" not in src_text
+    assert "#FF5A1F" not in src_text.upper()
+
+    # Verify augment icon regions actually reflect loaded local PNG pixels (differs from no-icon render)
+    img_no_aug_icons = render_match_recap_image(MatchRecapData(**{**base_kw, "augment_icon_paths": ()}))
+    assert img_without_ai.bits().tobytes() != img_no_aug_icons.bits().tobytes()
+
+    # Verify telemetry dashboard region differs when stats + EOG data are populated vs empty
+    img_no_stats = render_match_recap_image(
+        MatchRecapData(
+            **{
+                **base_kw,
+                "final_stats": {},
+                "damage_dealt": 0,
+                "damage_share": 0.0,
+                "damage_taken": 0,
+                "heal_and_shield": 0,
+                "gold_earned": 0,
+            }
+        )
+    )
+    assert img_without_ai.bits().tobytes() != img_no_stats.bits().tobytes()
+
+    st = _sample_pixel_stats(img_without_ai)
+    assert st["unique_buckets"] >= 50
+    assert st["gold_hits"] > 40
+    assert st["cyan_hits"] > 20
+    assert st["web_orange_hits"] == 0

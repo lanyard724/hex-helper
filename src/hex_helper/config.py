@@ -76,27 +76,41 @@ def resolve_thinking_level(
     *,
     adaptive: bool = True,
     model: str = "gemini-4-hydrogen",
+    is_transformative: bool | None = None,
+    fast_death: bool = False,
 ) -> str:
     """Resolve effective Gemini thinking_level based on trigger urgency and model floor.
 
     - Caps legacy 'xhigh' -> 'medium' so local direct Gemini never stalls ~50s in live ARAM.
     - Gemini 4 models enforce minimum level 'low' ('minimal' is Flash-only).
     - When adaptive=True, caps level by real-time latency budget without ever exceeding configured_level:
-      * augment_picking / connection_test -> <= 'low'
-      * game_start / augment_selected / death_enemy_build_changed -> <= 'medium'
+      * augment_picking -> <= 'minimal' (clamped to 'low' on Gemini 4, 'minimal' on Flash)
+      * connection_test / pre_death_warmup -> <= 'low'
+      * death_enemy_build_changed -> <= 'low' when fast_death=True (or Flash model); <= 'medium' otherwise
+      * augment_selected -> <= 'low' when is_transformative is False; <= 'medium' for transformative pivots or unspecified
+      * game_start -> <= 'medium'
       * manual_f6 (explicit user deep analysis) -> configured_level (with 'xhigh' capped to 'medium')
     """
     lvl = (configured_level or "medium").strip().lower()
     if lvl not in _THINKING_RANK or lvl == "xhigh":
         lvl = "medium"
-    min_rank = 1 if (model or "").strip().lower().startswith("gemini-4") else 0
+    is_gemini4 = (model or "").strip().lower().startswith("gemini-4")
+    min_rank = 1 if is_gemini4 else 0
     rank = max(min_rank, _THINKING_RANK[lvl])
 
     if adaptive:
         reason = (trigger_reason or "").strip().lower()
-        if reason in ("augment_picking", "connection_test"):
+        if reason == "augment_picking":
+            rank = min(rank, max(min_rank, _THINKING_RANK["minimal"]))
+        elif reason in ("connection_test", "pre_death_warmup"):
             rank = min(rank, max(min_rank, _THINKING_RANK["low"]))
-        elif reason in ("game_start", "augment_selected", "death_enemy_build_changed"):
+        elif reason == "death_enemy_build_changed":
+            target = "low" if (fast_death or not is_gemini4) else "medium"
+            rank = min(rank, max(min_rank, _THINKING_RANK[target]))
+        elif reason == "augment_selected":
+            target = "low" if is_transformative is False else "medium"
+            rank = min(rank, max(min_rank, _THINKING_RANK[target]))
+        elif reason == "game_start":
             rank = min(rank, max(min_rank, _THINKING_RANK["medium"]))
     return _RANK_TO_THINKING[rank]
 
@@ -153,23 +167,28 @@ class AppConfig:
     cloud_api_base: str = field(default_factory=_default_cloud_api_base)
     gemini_api_key: str = ""
     gemini_model: str = "gemini-4-hydrogen"
+    gemini_picker_fast_model: str = "gemini-3.8-flash"
     gemini_thinking_level: str = "medium"
     gemini_adaptive_thinking: bool = True
     telemetry_enabled: bool = True
+    devlab_enabled: bool = False
+    devlab_roi_snapshots: bool = False
+    devlab_debug_log: bool = False
+    devlab_max_matches: int = 120
     auto_first_prismatic_mode: bool = True
     smart_picker_ai_gate: bool = True
     card_band_roi: NormalizedRect = field(
         default_factory=lambda: NormalizedRect(x=0.08, y=0.24, w=0.84, h=0.48)
     )
     title_band_roi: NormalizedRect = field(
-        default_factory=lambda: NormalizedRect(x=0.08, y=0.31, w=0.84, h=0.25)
+        default_factory=lambda: NormalizedRect(x=0.08, y=0.385, w=0.84, h=0.052)
     )
     champ_window_pos: list[int] | None = None
     champ_window_size: list[int] | None = None
     drawer_pos: list[int] | None = None
     drawer_size: list[int] | None = None
     drawer_scale: float | None = None
-    drawer_y_ratio: float = 0.34
+    drawer_y_ratio: float = 0.16
     combo_drawer_pos: list[int] | None = None
     combo_drawer_size: list[int] | None = None
     combo_drawer_scale: float | None = None
@@ -199,6 +218,10 @@ class AppConfig:
 
     def to_dict(self) -> dict:
         data = asdict(self)
+        if is_commercial_edition():
+            data["devlab_enabled"] = False
+            data["devlab_roi_snapshots"] = False
+            data["devlab_debug_log"] = False
         return data
 
     @classmethod
@@ -222,9 +245,14 @@ class AppConfig:
             "cloud_api_base",
             "gemini_api_key",
             "gemini_model",
+            "gemini_picker_fast_model",
             "gemini_thinking_level",
             "gemini_adaptive_thinking",
             "telemetry_enabled",
+            "devlab_enabled",
+            "devlab_roi_snapshots",
+            "devlab_debug_log",
+            "devlab_max_matches",
             "auto_first_prismatic_mode",
             "smart_picker_ai_gate",
             "champ_window_pos",
@@ -254,6 +282,13 @@ class AppConfig:
         cfg.champ_select_goal_mode = goal_mode if goal_mode in ("climb", "fun") else "climb"
         cfg.lobby_scout_enabled = bool(cfg.lobby_scout_enabled)
         cfg.telemetry_enabled = bool(cfg.telemetry_enabled)
+        cfg.devlab_enabled = bool(cfg.devlab_enabled)
+        cfg.devlab_roi_snapshots = bool(cfg.devlab_roi_snapshots)
+        cfg.devlab_debug_log = bool(cfg.devlab_debug_log)
+        try:
+            cfg.devlab_max_matches = max(10, min(500, int(cfg.devlab_max_matches or 120)))
+        except (TypeError, ValueError):
+            cfg.devlab_max_matches = 120
         cfg.auto_first_prismatic_mode = bool(cfg.auto_first_prismatic_mode)
         cfg.smart_picker_ai_gate = bool(cfg.smart_picker_ai_gate)
         if isinstance(cfg.unsealed_user_ids, list):
@@ -287,12 +322,16 @@ class AppConfig:
             cfg.bridge_enabled = False
             cfg.coach_mode = "off" if str(cfg.coach_mode) == "off" else "cloud"
             cfg.gemini_api_key = ""
+            cfg.devlab_enabled = False
+            cfg.devlab_roi_snapshots = False
+            cfg.devlab_debug_log = False
         else:
             if str(cfg.coach_mode) not in COACH_MODES:
                 cfg.coach_mode = "auto"
             cfg.gemini_api_key = str(cfg.gemini_api_key or "").strip()
 
         cfg.gemini_model = str(cfg.gemini_model or "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+        cfg.gemini_picker_fast_model = str(cfg.gemini_picker_fast_model or "").strip()
         lvl = str(cfg.gemini_thinking_level or "medium").strip().lower()
         cfg.gemini_thinking_level = lvl if lvl in GEMINI_THINKING_LEVELS else "medium"
 
@@ -321,14 +360,17 @@ class AppConfig:
 
         if isinstance(raw.get("title_band_roi"), dict):
             r = raw["title_band_roi"]
-            if _is_legacy_3card_roi(r, 0.14, 0.31, 0.72, 0.25):
-                cfg.title_band_roi = NormalizedRect(x=0.08, y=0.31, w=0.84, h=0.25)
+            if (
+                _is_legacy_3card_roi(r, 0.14, 0.31, 0.72, 0.25)
+                or _is_legacy_3card_roi(r, 0.08, 0.31, 0.84, 0.25)
+            ):
+                cfg.title_band_roi = NormalizedRect(x=0.08, y=0.385, w=0.84, h=0.052)
             else:
                 cfg.title_band_roi = NormalizedRect(
                     x=r.get("x", 0.08),
-                    y=r.get("y", 0.31),
+                    y=r.get("y", 0.385),
                     w=r.get("w", 0.84),
-                    h=r.get("h", 0.25),
+                    h=r.get("h", 0.052),
                 ).clamp()
 
         if isinstance(raw.get("hotkeys"), dict):
@@ -376,6 +418,14 @@ def get_app_data_dir() -> Path:
 
 def get_config_path() -> Path:
     return get_app_data_dir() / "config.json"
+
+
+def get_devlab_dir() -> Path:
+    """Return the local DevLab Flight Recorder directory without creating it."""
+    override = os.environ.get("HEX_DEVLAB_DIR", "").strip()
+    if override:
+        return Path(override)
+    return get_app_data_dir() / "devlab"
 
 
 def load_config(path: Path | None = None) -> AppConfig:

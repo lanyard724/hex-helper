@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 DEFAULT_PRIOR_K = 100.0
+LATE_STACKER_AUGMENT_DISCOUNTS: dict[str, float] = {
+    "1353": -4.2,  # 坦克引擎：第4轮/12分钟后叠层周期不足
+    "1152": -4.6,  # 钢化你心：第4轮/12分钟后心之钢任务难叠满
+}
 
 
 @dataclass(frozen=True)
@@ -205,10 +209,14 @@ def rank_picker_cards(
     scored_cards: Sequence[tuple[int, AugmentScore]],
     combo_by_slot: dict[int, Any] | None = None,
     pair_deltas: dict[str, tuple[float, int]] | None = None,
+    *,
+    game_time_s: float = 0.0,
+    round_index: int = 0,
 ) -> tuple[list[UnifiedAugmentDecision], str]:
-    """Compute unified scores, apply live synergy/conflict re-ranking, and preserve all-weak reroll guard."""
+    """Compute unified scores, apply live synergy/conflict/late-stacker re-ranking, and preserve all-weak reroll guard."""
     combo_map = combo_by_slot or {}
     pair_map = pair_deltas or {}
+    is_late_stacker_window = (int(round_index or 0) >= 4) or (float(game_time_s or 0.0) >= 720.0)
 
     prelim: list[dict[str, Any]] = []
     base_best_slot: int | None = None
@@ -229,7 +237,9 @@ def rank_picker_cards(
         shift_kind = ""
         shift_reason = ""
         verdict_name = getattr(vc, "verdict", "") if vc is not None else ""
+        verdict_label = str(getattr(vc, "verdict_label", "") or "") if vc is not None else ""
         raw_cd = float(getattr(vc, "combo_delta", 0.0) or 0.0) if vc is not None else 0.0
+        late_stacker_applied = verdict_label == "末轮叠层折价"
 
         if verdict_name == "jackpot":
             combo_shift = min(11.5, max(5.5, raw_cd * 0.85))
@@ -244,9 +254,24 @@ def rank_picker_cards(
             shift_kind = "gamble"
             shift_reason = str(getattr(vc, "reason", "") or "")
         elif verdict_name == "conflict":
-            combo_shift = max(-10.0, min(-3.5, raw_cd * 1.15))
+            if late_stacker_applied:
+                combo_shift = max(-5.0, min(-3.8, raw_cd))
+            else:
+                combo_shift = max(-10.0, min(-3.5, raw_cd * 1.15))
             shift_kind = "conflict"
             shift_reason = str(getattr(vc, "reason", "") or "")
+
+        if is_late_stacker_window and sc.augment_id in LATE_STACKER_AUGMENT_DISCOUNTS and not late_stacker_applied:
+            late_disc = LATE_STACKER_AUGMENT_DISCOUNTS[sc.augment_id]
+            combo_shift = combo_shift + late_disc
+            late_stacker_applied = True
+            if combo_shift < 0:
+                shift_kind = "conflict"
+                shift_reason = (
+                    f"局末({int(game_time_s)}s)叠层周期不足 · 优先即时战力"
+                    if float(game_time_s or 0.0) >= 720.0
+                    else "第4轮收官叠层周期不足 · 叠层卡大幅折价，优先即时战力"
+                )
 
         combo_shift = round(combo_shift, 1)
 
@@ -270,7 +295,11 @@ def rank_picker_cards(
         elif total_shift >= 1.5:
             shift_label = f"联动 ↑{total_shift:.1f}"
         elif total_shift <= -1.5:
-            shift_label = f"互斥 ↓{abs(total_shift):.1f}"
+            shift_label = (
+                f"折价 ↓{abs(total_shift):.1f}"
+                if late_stacker_applied
+                else f"互斥 ↓{abs(total_shift):.1f}"
+            )
         else:
             shift_label = ""
 
@@ -296,7 +325,8 @@ def rank_picker_cards(
         for sc in valid_scores
     )
     has_combo_upside = any(
-        p["verdict_name"] in ("jackpot", "gamble", "synergy") or p["pair_shift"] >= 1.5
+        (p["verdict_name"] in ("jackpot", "gamble", "synergy") and p["combo_shift"] > 0)
+        or p["pair_shift"] >= 1.5
         for p in prelim
     )
 
