@@ -6,7 +6,7 @@
 
 **为《英雄联盟》海克斯大乱斗打造的纯只读 Windows 桌面悬浮窗助手**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.7-C89B3C?style=flat-square)](https://priswebtool.site)
+[![Version](https://img.shields.io/badge/Version-v1.5.0-C89B3C?style=flat-square)](https://priswebtool.site)
 [![Patch](https://img.shields.io/badge/LOL%20CN-26.23-0AC8B9?style=flat-square)](https://priswebtool.site)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-091428?style=flat-square)](https://priswebtool.site)
 [![License](https://img.shields.io/badge/License-MIT-785A28?style=flat-square)](LICENSE)

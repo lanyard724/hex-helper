@@ -183,6 +183,24 @@ def _canonical_item_id(item_id: int) -> int:
     return _ITEM_EQUIVALENCE.get(item_id, item_id)
 
 
+def _is_augment_granted_special_item(item_id: str | int, price: int = 0) -> bool:
+    """Return True for 6-digit ARAM Mayhem augment-upgraded (22xxxx) or Prismatic-anvil (99xxxx) items."""
+    _ = price  # Reserved for future cost-aware heuristics
+    raw_str = str(item_id if item_id is not None else "").strip()
+    if not raw_str:
+        return False
+    if raw_str.isdigit():
+        digits = raw_str
+    else:
+        val = _safe_int(raw_str, 0)
+        if val <= 0:
+            return False
+        digits = str(val)
+    if len(digits) != 6 or digits == "220013":
+        return False
+    return digits.startswith("22") or digits.startswith("99")
+
+
 def _hero_key(player: PlayerLiveInfo) -> str:
     raw = str(player.raw_champion_name or "").strip()
     if raw:
@@ -291,6 +309,7 @@ class _DeathShopWindow:
     first_buy_time: float | None = None
     coach_triggered: bool = False
     coach_skip_reason: str = ""
+    warmup_served: bool = False
     coach_arrived: bool = False
     coach_arrived_before_buy: bool = False
     coach_request_id: str = ""
@@ -370,7 +389,8 @@ class MatchActionTracker:
         # Death-shop window
         self._was_dead: bool = False
         self._death_window: _DeathShopWindow | None = None
-        self._pending_death_decision: tuple[bool, str, float] | None = None
+        self._death_warmup_served: bool = False
+        self._pending_death_decision: tuple[bool, str, bool, float] | None = None
 
         # Level & augment unlock silent-miss timers
         self._emitted_level_milestones: set[int] = set()
@@ -776,16 +796,32 @@ class MatchActionTracker:
             if not timer.alerted:
                 timer.picker_opened = True
 
-    def note_death_coach_decision(self, triggered: bool, skip_reason: str = "") -> None:
+    def note_death_coach_decision(
+        self,
+        triggered: bool,
+        skip_reason: str = "",
+        *,
+        warmup_served: bool | None = None,
+    ) -> None:
         """Inform tracker whether AI coach was triggered or skipped for the active death window."""
         trig = bool(triggered)
         reason = str(skip_reason or "").strip()
+        is_warmup_served = (
+            bool(warmup_served)
+            if warmup_served is not None
+            else (reason == "pre_death_warmup_cached")
+        )
+        self._death_warmup_served = is_warmup_served
         if self._death_window is not None:
             self._death_window.coach_triggered = trig
             self._death_window.coach_skip_reason = reason
+            self._death_window.warmup_served = is_warmup_served
+            if is_warmup_served:
+                self._death_window.coach_arrived = True
+                self._death_window.coach_arrived_before_buy = True
             self._pending_death_decision = None
         else:
-            self._pending_death_decision = (trig, reason, self._clock())
+            self._pending_death_decision = (trig, reason, is_warmup_served, self._clock())
 
     # ------------------------------------------------------------------
     # 3. Causal Lookups & Pending Purchase Confirmation
@@ -821,6 +857,8 @@ class MatchActionTracker:
         return None
 
     def _is_meaningful_purchase(self, pending: _PendingPurchase) -> bool:
+        if _is_augment_granted_special_item(pending.item_id, pending.price):
+            return True
         norm_id = _canonical_item_id(pending.item_id)
         if self._is_complete_item_fn is not None:
             if norm_id in TIER2_BOOT_IDS:
@@ -858,8 +896,13 @@ class MatchActionTracker:
         if not self._is_meaningful_purchase(pending):
             return
 
+        augment_granted = _is_augment_granted_special_item(pending.item_id, pending.price)
         norm_id = _canonical_item_id(pending.item_id)
-        dedup_key = str(norm_id if norm_id > 0 else pending.item_id)
+        dedup_key = (
+            f"aug:{pending.item_id}"
+            if augment_granted
+            else str(norm_id if norm_id > 0 else pending.item_id)
+        )
         if dedup_key in self._attributed_completed_items:
             return
         self._attributed_completed_items.add(dedup_key)
@@ -904,6 +947,7 @@ class MatchActionTracker:
                 "item_id": pending.item_id,
                 "action": pending.action,
                 "price": pending.price,
+                "augment_granted": augment_granted,
                 "consumed_components": list(pending.consumed_components),
                 "matched_local_rank": matched_local_rank,
                 "matched_local_top1": matched_local_rank == 1,
@@ -970,6 +1014,10 @@ class MatchActionTracker:
         if dw is None:
             return
         self._death_window = None
+        warmup_served = bool(dw.warmup_served or self._death_warmup_served)
+        self._death_warmup_served = False
+        arrived = bool(dw.coach_arrived or warmup_served)
+        arrived_before_buy = bool(dw.coach_arrived_before_buy or warmup_served)
         duration_s = max(0.0, round(respawn_game_time_s - dw.death_start_time, 2))
         self._emit(
             "coach",
@@ -983,8 +1031,9 @@ class MatchActionTracker:
                 "items_bought": list(dw.items_bought),
                 "bought_count": len(dw.items_bought),
                 "coach_triggered": dw.coach_triggered,
-                "coach_arrived": dw.coach_arrived,
-                "coach_arrived_before_buy": dw.coach_arrived_before_buy,
+                "coach_arrived": arrived,
+                "coach_arrived_before_buy": arrived_before_buy,
+                "warmup_served": warmup_served,
                 "coach_skip_reason": dw.coach_skip_reason,
                 "coach_request_id": dw.coach_request_id,
                 "coach_latency_ms": round(dw.coach_latency_ms, 1),
@@ -1433,6 +1482,7 @@ class MatchActionTracker:
             killer = ""
             if self._last_my_death_killer and abs(gt - self._last_my_death_event_time) <= 15.0:
                 killer = self._last_my_death_killer
+            self._death_warmup_served = False
             self._death_window = _DeathShopWindow(
                 death_start_time=gt,
                 death_start_mono=now_mono,
@@ -1440,11 +1490,16 @@ class MatchActionTracker:
                 killer_hero=killer,
             )
             if self._pending_death_decision is not None:
-                trig, reason, dec_mono = self._pending_death_decision
+                trig, reason, is_warmup, dec_mono = self._pending_death_decision
                 self._pending_death_decision = None
                 if (now_mono - dec_mono) <= 2.0:
                     self._death_window.coach_triggered = trig
                     self._death_window.coach_skip_reason = reason
+                    self._death_window.warmup_served = is_warmup
+                    self._death_warmup_served = is_warmup
+                    if is_warmup:
+                        self._death_window.coach_arrived = True
+                        self._death_window.coach_arrived_before_buy = True
         elif not is_dead and self._was_dead and self._death_window is not None:
             self._close_death_window(
                 respawn_game_time_s=gt,

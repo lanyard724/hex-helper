@@ -174,6 +174,65 @@ def filter_excluded_lines(
     return kept
 
 
+def _mask_excluded_regions(
+    crop_bgr: np.ndarray,
+    origin_x: int,
+    origin_y: int,
+    exclude_rects: Sequence[tuple[int, int, int, int]] | None,
+) -> np.ndarray:
+    """Paint neutral dark fill over pixels intersecting our own overlay rectangles before OCR."""
+    if not exclude_rects or crop_bgr is None or crop_bgr.size == 0:
+        return crop_bgr
+    ch, cw = crop_bgr.shape[:2]
+    ox, oy = int(origin_x), int(origin_y)
+    masked: np.ndarray | None = None
+    for (el, et, er, eb) in exclude_rects:
+        lx0 = max(0, int(el) - ox)
+        ly0 = max(0, int(et) - oy)
+        lx1 = min(cw, int(er) - ox)
+        ly1 = min(ch, int(eb) - oy)
+        if lx1 > lx0 and ly1 > ly0:
+            if masked is None:
+                masked = crop_bgr.copy()
+            if masked.ndim == 2:
+                masked[ly0:ly1, lx0:lx1] = 14
+            else:
+                masked[ly0:ly1, lx0:lx1] = (16, 14, 12)
+    return masked if masked is not None else crop_bgr
+
+
+def _filter_excluded_shadowed_pass2(
+    shadowed: Sequence[dict[str, Any]],
+    origin_x: float,
+    origin_y: float,
+    exclude_rects: Sequence[tuple[int, int, int, int]] | None,
+    *,
+    coord_scale: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Drop shadowed_pass2 entries whose kept_bbox or dropped_bbox center falls inside `exclude_rects`."""
+    if not shadowed:
+        return []
+    if not exclude_rects:
+        return list(shadowed)
+
+    def _bbox_in_excluded(bbox: Any) -> bool:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return False
+        bx, by, bw, bh = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+        sx = origin_x + (bx + bw * 0.5) * coord_scale
+        sy = origin_y + (by + bh * 0.5) * coord_scale
+        return any(l <= sx <= r and t <= sy <= b for (l, t, r, b) in exclude_rects)
+
+    kept: list[dict[str, Any]] = []
+    for entry in shadowed:
+        if not isinstance(entry, dict):
+            continue
+        if _bbox_in_excluded(entry.get("kept_bbox")) or _bbox_in_excluded(entry.get("dropped_bbox")):
+            continue
+        kept.append(entry)
+    return kept
+
+
 class AugmentPickerDetector:
     """Two-stage picker gate + adaptive 3/4-card WinRT OCR + per-slot recovery + anti-false-reroll."""
 
@@ -705,11 +764,24 @@ class AugmentPickerDetector:
                 sy_start, sy_end = cand_y0, cand_y1
 
         slot_crop = title_crop[sy_start:sy_end, sx_start:sx_end]
-        enhanced_crop = self._enhance_slot_crop(slot_crop)
+        masked_slot_crop = _mask_excluded_regions(
+            slot_crop,
+            band_origin_x + sx_start,
+            band_origin_y + sy_start,
+            exclude_rects,
+        )
+        enhanced_crop = self._enhance_slot_crop(masked_slot_crop)
         t_ocr0 = time.perf_counter()
         raw_retry_lines = self._call_ocr(enhanced_crop, dual_pass=True, force_dual_pass=True)
         ocr_ms = (time.perf_counter() - t_ocr0) * 1000.0
-        retry_shadowed = list(getattr(self.ocr, "last_shadowed_pass2", []) or [])
+        raw_retry_shadowed = list(getattr(self.ocr, "last_shadowed_pass2", []) or [])
+        retry_shadowed = _filter_excluded_shadowed_pass2(
+            raw_retry_shadowed,
+            band_origin_x + sx_start,
+            band_origin_y + sy_start,
+            exclude_rects,
+            coord_scale=0.5,
+        )
 
         mapped_lines = [
             OcrLine(
@@ -764,7 +836,7 @@ class AugmentPickerDetector:
             match, mdiag = self._match_line_with_diag(mline.text, rarity_hint=rarity_hint)
             crop_bbox = self._clamp_title_bbox(mline, title_w, title_h)
             if match is None:
-                if mdiag.get("is_near_miss"):
+                if mdiag.get("is_near_miss") and float(mline.h) >= 12.0 and float(mline.w) >= 16.0:
                     nm_score = float(mdiag.get("near_miss_top1_score", 0.0))
                     if best_near_miss is None or nm_score > float(best_near_miss.get("near_miss_score", 0.0)):
                         best_near_miss = {
@@ -990,8 +1062,9 @@ class AugmentPickerDetector:
         excl = exclude_rects or []
 
         use_dual_pass = bool(prev_locked_cards or self._pending_ids or force)
+        ocr_title_crop = _mask_excluded_regions(title_crop, band_origin_x, band_origin_y, excl)
         t_ocr0 = time.perf_counter()
-        raw_lines = self._call_ocr(title_crop, dual_pass=use_dual_pass)
+        raw_lines = self._call_ocr(ocr_title_crop, dual_pass=use_dual_pass)
         ocr_total_ms = (time.perf_counter() - t_ocr0) * 1000.0
         ocr_timings = getattr(self.ocr, "last_pass_timings_ms", None)
         if isinstance(ocr_timings, dict) and ("ocr_p1_ms" in ocr_timings or "ocr_p2_ms" in ocr_timings):
@@ -1000,7 +1073,14 @@ class AugmentPickerDetector:
         else:
             ocr_p1_ms = round(ocr_total_ms, 3)
             ocr_p2_ms = 0.0
-        shadowed_pass2: list[dict[str, Any]] = list(getattr(self.ocr, "last_shadowed_pass2", []) or [])
+        raw_shadowed_pass2: list[dict[str, Any]] = list(getattr(self.ocr, "last_shadowed_pass2", []) or [])
+        shadowed_pass2 = _filter_excluded_shadowed_pass2(
+            raw_shadowed_pass2,
+            band_origin_x,
+            band_origin_y,
+            excl,
+            coord_scale=1.0,
+        )
 
         # Reject ARAM Mayhem Stat Anvil popup ('属性锻造器' or >=2 '*碎片' lines) immediately
         if _is_stat_anvil_lines(raw_lines):
@@ -1052,7 +1132,7 @@ class AugmentPickerDetector:
             match, mdiag = self._match_line_with_diag(line.text, rarity_hint=rarity_hint)
             crop_bbox = self._clamp_title_bbox(line, title_w, title_h)
             if match is None:
-                if mdiag.get("is_near_miss"):
+                if mdiag.get("is_near_miss") and float(line.h) >= 12.0 and float(line.w) >= 16.0:
                     raw_near_misses.append(
                         (
                             float(line.cx),
@@ -1216,6 +1296,44 @@ class AugmentPickerDetector:
                         ):
                             near_miss_by_slot[missing_slot] = r_nm
 
+        # Locked-slot ambiguous reroll guard: preserve high-confidence locked card against low-margin / hover occlusion
+        preserved_locked_slots: set[int] = set()
+        if prev_locked_cards:
+            prev_locked_by_slot = {c.slot_index: c for c in prev_locked_cards}
+            for sidx, cand_card in list(slot_matches.items()):
+                prev_card = prev_locked_by_slot.get(sidx)
+                if (
+                    prev_card is None
+                    or prev_card.confidence < 0.85
+                    or cand_card.augment.augment_id == prev_card.augment.augment_id
+                ):
+                    continue
+                cand_meta = recovered_meta_by_slot.get(sidx) or hit_meta_by_box.get(cand_card.screen_box)
+                if cand_meta is not None:
+                    cand_score = float(cand_meta.get("score", cand_card.confidence))
+                    cand_margin = float(cand_meta.get("margin", 1.0))
+                    cand_top2_id = str(cand_meta.get("top2_id", ""))
+                else:
+                    cand_score = float(cand_card.confidence)
+                    cand_margin = 1.0
+                    cand_top2_id = ""
+                if cand_margin < 0.08 or (cand_score < 0.78 and cand_top2_id == prev_card.augment.augment_id):
+                    slot_matches[sidx] = prev_card
+                    preserved_locked_slots.add(sidx)
+                    if sidx in recovered_meta_by_slot:
+                        recovered_meta_by_slot.pop(sidx, None)
+                    if sidx in recovered_slots:
+                        recovered_slots.remove(sidx)
+                        self.recovered_slot_count = max(0, self.recovered_slot_count - 1)
+                    self.false_reroll_suppressed_count += 1
+
+        # Suppress spurious background/synergy-tag near-misses when every card slot is cleanly identified
+        if len(slot_matches) >= total_slots and all(
+            card.confidence >= 0.85 for card in slot_matches.values()
+        ):
+            near_misses = []
+            near_miss_by_slot = {}
+
         # Assemble per-slot diagnostic list
         slots_diag: list[dict[str, Any]] = []
         matched_slot_indices = set(slot_matches.keys())
@@ -1225,7 +1343,35 @@ class AugmentPickerDetector:
         for sidx in all_diag_slots:
             if sidx in slot_matches:
                 card = slot_matches[sidx]
-                if sidx in recovered_meta_by_slot:
+                if sidx in preserved_locked_slots:
+                    px0 = max(0, min(title_w, card.screen_box[0] - band_origin_x))
+                    py0 = max(0, min(title_h, card.screen_box[1] - band_origin_y))
+                    px1 = max(px0, min(title_w, card.screen_box[2] - band_origin_x))
+                    py1 = max(py0, min(title_h, card.screen_box[3] - band_origin_y))
+                    meta = {
+                        "slot_idx": sidx,
+                        "raw_text": card.augment.name,
+                        "matched_id": card.augment.augment_id,
+                        "matched_name": card.augment.name,
+                        "score": round(float(card.confidence), 4),
+                        "top2_id": "",
+                        "top2_name": "",
+                        "top2_score": 0.0,
+                        "margin": 1.0,
+                        "seq_ratio": 1.0,
+                        "jaccard_ratio": 1.0,
+                        "rarity_hint": card.rarity_hint,
+                        "rarity_ratios": {"gold": 0.0, "prismatic": 0.0, "silver": 0.0},
+                        "pass_id": 1,
+                        "substring_hit": False,
+                        "rarity_boosted": False,
+                        "near_miss_id": "",
+                        "near_miss_score": 0.0,
+                        "title_crop_bbox": (px0, py0, px1, py1),
+                        "recovered": False,
+                        "ambiguous_reroll_guarded": True,
+                    }
+                elif sidx in recovered_meta_by_slot:
                     meta = dict(recovered_meta_by_slot[sidx])
                 else:
                     base = hit_meta_by_box.get(card.screen_box)

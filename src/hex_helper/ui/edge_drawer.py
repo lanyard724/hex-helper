@@ -133,6 +133,7 @@ class EdgeBuildDrawer(QWidget):
     EXPANDED_MIN_H = 220
     MAX_EXPANDED_H = 1850
     _MIN_COMFORT_H = 300
+    _AUTO_HEIGHT_CUSHION_PX = 20
     _QWIDGETSIZE_MAX = 16777215
     BRIEF_AUTO_COLLAPSE_MS = 20_000
     QUICK_CONFIRM_HIGH_CONF_MS = 15_000
@@ -312,6 +313,7 @@ class EdgeBuildDrawer(QWidget):
         self._last_radar_detail_sig: LobbyScoutSnapshot | None = None
         self._last_pivot_banner_text: str = ""
         self._last_top_threat_sig: tuple[str, str, bool] | None = None
+        self._post_layout_sync_scheduled: bool = False
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -1696,9 +1698,9 @@ class EdgeBuildDrawer(QWidget):
             play.invalidate()
             play.activate()
 
-    def _compute_auto_expanded_height(self, w: int, geo: QRect) -> int:
+    def _compute_auto_expanded_height(self, w: int, geo: QRect, *, extra_overflow_px: int = 0) -> int:
         m = self._metrics()
-        inner_w = max(200, w - m.px(22))
+        inner_w = max(180, w - m.px(26))
         minimap_guard_h = int(geo.height() * 0.25)
         blay = self.panel_body.layout()
         body_h_for_w = self.panel_body.heightForWidth(inner_w)
@@ -1710,20 +1712,85 @@ class EdgeBuildDrawer(QWidget):
                 w_child = blay.itemAt(i).widget()
                 if w_child is not None and not w_child.isHidden():
                     hfw = w_child.heightForWidth(inner_w)
-                    ch = hfw if hfw > 0 else max(w_child.sizeHint().height(), w_child.minimumSizeHint().height())
+                    ch = (
+                        max(hfw, w_child.minimumSizeHint().height())
+                        if hfw > 0
+                        else max(w_child.sizeHint().height(), w_child.minimumSizeHint().height())
+                    )
                     explicit_h += ch + (b_sp if vis_cnt > 0 else 0)
                     vis_cnt += 1
         body_hint_h = max(
             explicit_h,
             body_h_for_w if body_h_for_w > 0 else 0,
             self.panel_body.sizeHint().height(),
+            self.panel_body.minimumSizeHint().height(),
         )
         header_chrome_h = m.px(56)
+        cushion_h = m.px(self._AUTO_HEIGHT_CUSHION_PX)
         max_h = max(
             self.EXPANDED_MIN_H,
             (geo.height() - minimap_guard_h - 24) if self._anchor_right else (geo.height() - 48),
         )
-        return min(max_h, max(self.EXPANDED_MIN_H, header_chrome_h + body_hint_h + m.px(28)))
+        raw_h = header_chrome_h + body_hint_h + m.px(28) + cushion_h + max(0, int(extra_overflow_px))
+        return min(max_h, max(self.EXPANDED_MIN_H, raw_h))
+
+    def _sync_auto_height(self) -> None:
+        """Re-sync expanded drawer height after Qt finishes multi-line word-wrap layout."""
+        if self._is_closed or not self._expanded or not self.isVisible():
+            return
+        self._reposition_right_edge()
+        if self._custom_h is not None:
+            return
+        sb_max = int(self.panel_scroll.verticalScrollBar().maximum() or 0)
+        if sb_max <= 0:
+            return
+        screen = self._active_screen()
+        if screen is None:
+            return
+        geo = screen.geometry()
+        minimap_guard_h = int(geo.height() * 0.25)
+        max_h = max(
+            self.EXPANDED_MIN_H,
+            (geo.height() - minimap_guard_h - 24) if self._anchor_right else (geo.height() - 48),
+        )
+        target_h = min(max_h, max(self.EXPANDED_MIN_H, self.height() + sb_max + self._px(4)))
+        if target_h <= self.height():
+            return
+        w = self.width()
+        if self._custom_pos is not None and not self._anchor_right:
+            x = max(geo.left(), min(geo.right() - w + 1, self._custom_pos.x()))
+            y = max(geo.top(), min(geo.bottom() - target_h + 1, self._custom_pos.y()))
+        else:
+            y_base = self._custom_pos.y() if self._custom_pos is not None else int(geo.top() + geo.height() * self._y_ratio)
+            bottom_limit = geo.bottom() - minimap_guard_h - 8
+            max_y = max(geo.top() + 12, bottom_limit - target_h)
+            y = max(geo.top() + 12, min(max_y, y_base))
+            x = geo.right() - w + 1
+        self.panel.setFixedHeight(target_h)
+        self.setFixedSize(w, target_h)
+        target_rect = QRect(x, y, w, target_h)
+        if self.geometry() != target_rect:
+            self.setGeometry(target_rect)
+        self._layout_corner_grips()
+
+    def _run_post_layout_height_sync(self) -> None:
+        self._post_layout_sync_scheduled = False
+        if self._is_closed:
+            return
+        try:
+            from shiboken6 import isValid as _qt_is_valid
+
+            if not _qt_is_valid(self):
+                return
+        except ImportError:
+            pass
+        self._sync_auto_height()
+
+    def _schedule_post_layout_height_sync(self) -> None:
+        if self._is_closed or self._post_layout_sync_scheduled:
+            return
+        self._post_layout_sync_scheduled = True
+        QTimer.singleShot(0, self._run_post_layout_height_sync)
 
     def _apply_expanded_dimensions(
         self,
@@ -2392,6 +2459,8 @@ class EdgeBuildDrawer(QWidget):
                 self.setUpdatesEnabled(True)
         if was_visible:
             show_no_activate(self, click_through=False)
+        if self._expanded:
+            self._schedule_post_layout_height_sync()
         if self._expanded and self._pending_auto_unseal:
             self._pending_auto_unseal = False
             QTimer.singleShot(120, lambda: self.play_ingame_auto_unseal(force_now=True))
@@ -3004,6 +3073,8 @@ class EdgeBuildDrawer(QWidget):
             self.rm_hdr_lbl.setStyleSheet(
                 f"border: none; background: transparent; color: #C8AA6E; font-weight: bold; font-size: {self._fs(10)}px;"
             )
+        if self._expanded and self.isVisible():
+            self._schedule_post_layout_height_sync()
 
     def _on_brief_auto_collapse_timeout(self) -> None:
         if not self._expanded:
@@ -3354,6 +3425,8 @@ class EdgeBuildDrawer(QWidget):
             if self._ai_cutoff:
                 self._apply_cutoff_content_hint()
             self._render_decision_cards()
+            if self._expanded and self.isVisible():
+                self._schedule_post_layout_height_sync()
             return
         self._opening_brief_data = normalize_opening_brief(advice.opening_brief)
         shown_brief = self._render_opening_brief()
@@ -3372,8 +3445,10 @@ class EdgeBuildDrawer(QWidget):
                 self._brief_auto_collapse_timer.start(self.BRIEF_AUTO_COLLAPSE_MS)
             elif self._expanded and self.isVisible():
                 self._reposition_right_edge()
+                self._schedule_post_layout_height_sync()
         elif self._expanded and self.isVisible():
             self._reposition_right_edge()
+            self._schedule_post_layout_height_sync()
 
     def get_exclude_rect(self) -> tuple[int, int, int, int] | None:
         """Return physical screen bounding box of this drawer when visible so OCR never reads self UI."""

@@ -388,7 +388,12 @@ def test_opening_brief_card_render_auto_expand_dismiss_and_balance_pill(
             drawer._on_slide_finished()
             drawer._reposition_right_edge()
             qapp.processEvents()
-            assert drawer.width() == EdgeBuildDrawer.EXPANDED_W
+            screen = drawer.screen() or qapp.primaryScreen()
+            geo = screen.geometry()
+            expected_w = EdgeBuildDrawer.compute_default_expanded_width(
+                geo.width(), geo.height(), max(1.0, float(screen.devicePixelRatio() or 1.0))
+            )
+            assert drawer.width() == expected_w
 
             # Save headless visual audit snapshot to verify crisp LOL V16.23 Hextech styling
             audit_dir = Path(r"C:\Users\Administrator\.gemini\antigravity\brain\c6d79029-fe63-4195-8605-30bd8143d2a5\audit_visual")

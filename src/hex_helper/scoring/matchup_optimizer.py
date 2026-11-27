@@ -1805,7 +1805,8 @@ def reconcile_match_build_plan(
     4. Only allow full plan overhaul when `allow_overhaul=True` (initial plan lock or transformative
        augment like 迷人蝴蝶 / 装甲冲击 / 珠光护手 / 没法力) — never flip-flop between routine deaths!
        When `cur_lock` already has >= 800G invested in components and `transformative_overhaul=False`,
-       preserve `cur_lock` in slot 1 and only reorder slots 2-5.
+       OR when `cur_lock` already has >= 1200G invested in components and is still present in
+       `clean_proposed`, preserve `cur_lock` in slot 1 and only reorder slots 2-5.
     """
     if analyze_inventory_slots(store, my_items).is_full_build:
         return "", []
@@ -1830,7 +1831,14 @@ def reconcile_match_build_plan(
 
     # Initial establishment or legitimate transformative-augment / augment-correction overhaul
     if allow_overhaul or not clean_committed:
-        if cur_lock and lock_credit >= 800 and not transformative_overhaul:
+        protect_cur_lock = bool(
+            cur_lock
+            and (
+                (lock_credit >= 800 and not transformative_overhaul)
+                or (lock_credit >= 1200 and cur_lock in clean_proposed)
+            )
+        )
+        if protect_cur_lock:
             merged = [cur_lock] + [pid for pid in clean_proposed if pid != cur_lock]
             merged = merged[:5]
         else:
@@ -1994,7 +2002,14 @@ def reconcile_match_build_plan_with_trace(
 
     # Initial establishment or legitimate transformative-augment / augment-correction overhaul
     if allow_overhaul or not clean_committed:
-        if cur_lock and lock_credit >= 800 and not transformative_overhaul:
+        protect_cur_lock = bool(
+            cur_lock
+            and (
+                (lock_credit >= 800 and not transformative_overhaul)
+                or (lock_credit >= 1200 and cur_lock in clean_proposed)
+            )
+        )
+        if protect_cur_lock:
             merged = [cur_lock] + [pid for pid in clean_proposed if pid != cur_lock]
             merged = merged[:5]
         else:

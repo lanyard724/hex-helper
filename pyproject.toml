@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hex-helper"
-version = "1.4.7"
+version = "1.5.0"
 description = "Read-only Windows overlay assistant for League of Legends ARAM: Mayhem (CN 26.23) with real-time 10-player matchup optimizer and direct Gemini AI Coach (optional local bridge)."
 requires-python = ">=3.12"
 dependencies = [

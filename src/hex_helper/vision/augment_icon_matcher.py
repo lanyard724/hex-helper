@@ -216,6 +216,7 @@ def build_hud_icon_strip_crop(
     hud_slot_rois: Sequence[tuple[float, float, float, float]] | None = None,
     edge_trim_ratio: float = 0.06,
     tile_size: int = TEMPLATE_SIZE,
+    hud_scale: float = 1.0,
 ) -> np.ndarray | None:
     """Compose a compact 4 x tile_size x tile_size horizontal BGR strip (default 28x112x3) of the 4 HUD slots."""
     ts = max(8, int(tile_size))
@@ -228,7 +229,7 @@ def build_hud_icon_strip_crop(
             hud_slot_rois=hud_slot_rois,
             edge_trim_ratio=edge_trim_ratio,
         )
-        patches = helper.extract_hud_augment_patches(patches_or_frame, game_rect)
+        patches = helper.extract_hud_augment_patches(patches_or_frame, game_rect, hud_scale=hud_scale)
         if not patches:
             return None
     else:
@@ -358,9 +359,10 @@ class AugmentIconMatcher:
         game_rect: WindowRect | None = None,
         *,
         tile_size: int = TEMPLATE_SIZE,
+        hud_scale: float = 1.0,
     ) -> np.ndarray | None:
         """Extract the 4 HUD augment slots and compose a compact 4 x 28 x 28 horizontal BGR strip."""
-        patches = self.extract_hud_augment_patches(frame_bgr, game_rect)
+        patches = self.extract_hud_augment_patches(frame_bgr, game_rect, hud_scale=hud_scale)
         if not patches:
             return None
         return build_hud_icon_strip_crop(patches, tile_size=tile_size)
@@ -543,16 +545,32 @@ class AugmentIconMatcher:
             return frame_bgr[game_rect.top : game_rect.bottom, game_rect.left : game_rect.right]
         return frame_bgr
 
-    def get_hud_slot_rects(self, frame_width: int, frame_height: int) -> list[tuple[int, tuple[int, int, int, int]]]:
+    def get_hud_slot_rects(
+        self,
+        frame_width: int,
+        frame_height: int,
+        *,
+        hud_scale: float = 1.0,
+    ) -> list[tuple[int, tuple[int, int, int, int]]]:
         """Return pixel bounding boxes `(slot_index, (x0, y0, x1, y1))` for the 4 HUD augment slots."""
         fw = max(1, int(frame_width))
         fh = max(1, int(frame_height))
+        scale = 0.5 + 0.5 * max(0.0, min(1.0, float(hud_scale)))
+        use_identity = abs(scale - 1.0) <= 0.02
         rects: list[tuple[int, tuple[int, int, int, int]]] = []
         for idx, (rx, ry, rw, rh) in enumerate(self._hud_slot_rois):
             # Preserve square aspect ratio anchored on height so ultrawide/16:10 stay square
-            cx = (rx + rw * 0.5) * fw
-            cy = (ry + rh * 0.5) * fh
-            side = max(8, int(round(min(rw * fw, rh * fh))))
+            if use_identity:
+                cx = (rx + rw * 0.5) * fw
+                cy = (ry + rh * 0.5) * fh
+                side = max(8, int(round(min(rw * fw, rh * fh))))
+            else:
+                # Scale relative to bottom-center anchor (0.5, 1.0) matching LoL GlobalScale HUD scaling
+                cx_norm = 0.5 + ((rx + rw * 0.5) - 0.5) * scale
+                cy_norm = 1.0 - (1.0 - (ry + rh * 0.5)) * scale
+                cx = cx_norm * fw
+                cy = cy_norm * fh
+                side = max(8, int(round(min(rw * fw, rh * fh) * scale)))
             half = side * 0.5
             x0 = max(0, int(round(cx - half)))
             y0 = max(0, int(round(cy - half)))
@@ -566,6 +584,8 @@ class AugmentIconMatcher:
         self,
         frame_bgr: np.ndarray,
         game_rect: WindowRect | None = None,
+        *,
+        hud_scale: float = 1.0,
     ) -> list[tuple[int, np.ndarray]]:
         """Extract the 4 square HUD augment icon patches with automatic square edge trimming."""
         if not self.is_valid_frame(frame_bgr):
@@ -577,7 +597,7 @@ class AugmentIconMatcher:
             return []
 
         patches: list[tuple[int, np.ndarray]] = []
-        for slot_idx, (x0, y0, x1, y1) in self.get_hud_slot_rects(vw, vh):
+        for slot_idx, (x0, y0, x1, y1) in self.get_hud_slot_rects(vw, vh, hud_scale=hud_scale):
             crop = view[y0:y1, x0:x1]
             ch, cw = crop.shape[:2]
             if ch < 8 or cw < 8:
@@ -762,6 +782,7 @@ class AugmentIconMatcher:
         slot_index_hint: int | None = None,
         *,
         min_score: float = 0.58,
+        hud_scale: float = 1.0,
     ) -> IconMatchResult | None:
         """Scan HUD augment slots against `candidate_ids` (or full 237-template bank when None for Transmute)."""
         diag: dict[str, Any] = {
@@ -775,6 +796,7 @@ class AugmentIconMatcher:
             "top2_score": 0.0,
             "margin": 0.0,
             "min_score": float(min_score),
+            "hud_scale": round(float(hud_scale), 3),
             "slot_index_hint": slot_index_hint,
             "outcome": "invalid_frame",
         }
@@ -783,7 +805,7 @@ class AugmentIconMatcher:
             return None
         diag["frame_valid"] = True
 
-        patches = self.extract_hud_augment_patches(frame_bgr, game_rect)
+        patches = self.extract_hud_augment_patches(frame_bgr, game_rect, hud_scale=hud_scale)
         if not patches:
             diag["outcome"] = "no_patches"
             self._last_verify_diagnostics = diag
@@ -959,36 +981,9 @@ class AugmentIconMatcher:
         if self.template_count == 0 or not self.is_valid_frame(frame_bgr):
             return []
 
-        scale = 0.5 + 0.5 * max(0.0, min(1.0, float(hud_scale)))
-        if abs(scale - 1.0) <= 0.02:
-            patches = self.extract_hud_augment_patches(frame_bgr, game_rect)
-        else:
-            view = self._resolve_game_view(frame_bgr, game_rect)
-            vh, vw = view.shape[:2]
-            if vh < 64 or vw < 64:
-                return []
-            patches = []
-            for idx, (rx, ry, rw, rh) in enumerate(self._hud_slot_rois):
-                # Scale relative to bottom-center anchor (0.5, 1.0)
-                cx_norm = 0.5 + ((rx + rw * 0.5) - 0.5) * scale
-                cy_norm = 1.0 - (1.0 - (ry + rh * 0.5)) * scale
-                side = max(8, int(round(min(rw * vw, rh * vh) * scale)))
-                half = side * 0.5
-                x0 = max(0, int(round(cx_norm * vw - half)))
-                y0 = max(0, int(round(cy_norm * vh - half)))
-                x1 = min(vw, x0 + side)
-                y1 = min(vh, y0 + side)
-                if x1 <= x0 + 6 or y1 <= y0 + 6:
-                    continue
-                crop = view[y0:y1, x0:x1]
-                ch, cw = crop.shape[:2]
-                s_min = min(ch, cw)
-                if s_min >= 20 and self._edge_trim_ratio > 0.0:
-                    trim = min(int(round(s_min * self._edge_trim_ratio)), (s_min - 8) // 2)
-                    if trim > 0:
-                        crop = crop[trim : s_min - trim, trim : s_min - trim]
-                if crop.size > 0 and crop.shape[0] >= 8 and crop.shape[1] >= 8:
-                    patches.append((idx, crop.copy()))
+        patches = self.extract_hud_augment_patches(frame_bgr, game_rect, hud_scale=hud_scale)
+        if not patches:
+            return []
 
         self._ensure_matrices()
         cand_key = tuple(str(c).strip() for c in candidate_ids) if candidate_ids is not None else None

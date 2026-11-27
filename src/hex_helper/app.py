@@ -244,7 +244,7 @@ class HexStateMachine:
     DEATH_SHOPPING_GOLD_THRESHOLD = 1100.0
     DEATH_FALLING_BEHIND_DIFF = 5
     VISUAL_ITEM_SUPPRESS_TTL_S = 45.0
-    PRE_DEATH_WARMUP_COOLDOWN_S = 55.0
+    PRE_DEATH_WARMUP_COOLDOWN_S = 90.0
     PRE_DEATH_WARMUP_GOLD_THRESHOLD = 1400.0
 
     def __init__(self, store: DataStore | None = None) -> None:
@@ -273,6 +273,7 @@ class HexStateMachine:
         self._last_death_coach_mono: float = -999.0
         self._last_warmup_coach_mono: float = -999.0
         self._last_warmup_enemy_sig: str = ""
+        self._last_warmup_state_sig: tuple[Any, ...] = ()
         self._match_started_notified: bool = False
 
     def reset_match(self) -> None:
@@ -298,6 +299,7 @@ class HexStateMachine:
         self._last_death_coach_mono = -999.0
         self._last_warmup_coach_mono = -999.0
         self._last_warmup_enemy_sig = ""
+        self._last_warmup_state_sig = ()
         self._match_started_notified = False
 
     def prune_suppressed_visual_items(self, now_mono: float | None = None) -> set[str]:
@@ -537,9 +539,11 @@ class HexStateMachine:
             self._last_enemy_items_sig = enemy_sig
             self._last_warmup_coach_mono = now_mono
             self._last_warmup_enemy_sig = enemy_sig
+            self._last_warmup_state_sig = ()
             eff.coach_trigger = "game_start"
 
         eff_store = store if store is not None else self._store
+        owned_complete_ids: list[str] = []
         owned_complete_count = 0
         if snap.my_player is not None:
             for iid in snap.my_player.item_ids:
@@ -550,11 +554,14 @@ class HexStateMachine:
                 if eff_store is not None and getattr(eff_store, "static", None) is not None:
                     if is_valid_plan_item(eff_store, raw_iid) or norm_iid in TIER2_BOOT_IDS:
                         owned_complete_count += 1
+                        owned_complete_ids.append(norm_iid or raw_iid)
                 elif norm_iid in TIER2_BOOT_IDS or (norm_iid.isdigit() and int(norm_iid) >= 2500):
                     owned_complete_count += 1
+                    owned_complete_ids.append(norm_iid or raw_iid)
 
         is_dead = bool(snap.my_player and snap.my_player.is_dead)
         if is_dead and not self._was_dead:
+            self._last_warmup_state_sig = ()
             eff.auto_peek_drawer = True
             eff.death_detected = True
             if eff.coach_trigger != "game_start":
@@ -602,7 +609,8 @@ class HexStateMachine:
             and float(snap.game_time or 0.0) >= 90.0
             and owned_complete_count < 6
         ):
-            # WS-3 Pre-Death Warmup: pre-fetch low-thinking shop advice while alive so death-shop opens in 0ms
+            # WS-3 / v1.5.0 Pre-Death Warmup: pre-fetch low-thinking shop advice while alive
+            # with 90s cooldown + state-signature dedup so unchanged states never spam tokens
             warmup_cd_ok = (
                 (now_mono - self._last_warmup_coach_mono) >= self.PRE_DEATH_WARMUP_COOLDOWN_S
                 and (now_mono - self._last_death_coach_mono) >= self.PRE_DEATH_WARMUP_COOLDOWN_S
@@ -613,9 +621,19 @@ class HexStateMachine:
                     enemy_sig != self._last_enemy_items_sig
                     and enemy_sig != self._last_warmup_enemy_sig
                 )
-                if my_gold >= self.PRE_DEATH_WARMUP_GOLD_THRESHOLD or warmup_enemy_changed:
+                cur_warmup_sig = (
+                    enemy_sig,
+                    tuple(sorted(owned_complete_ids)),
+                    tuple(self.selected_augments),
+                    int(my_gold // 600),
+                )
+                if (
+                    (my_gold >= self.PRE_DEATH_WARMUP_GOLD_THRESHOLD or warmup_enemy_changed)
+                    and cur_warmup_sig != self._last_warmup_state_sig
+                ):
                     self._last_warmup_coach_mono = now_mono
                     self._last_warmup_enemy_sig = enemy_sig
+                    self._last_warmup_state_sig = cur_warmup_sig
                     eff.coach_trigger = "pre_death_warmup"
         self._was_dead = is_dead
         return eff
@@ -863,6 +881,8 @@ class HexHelperController:
     TELEMETRY_MIN_DURATION_S = 180
     PENDING_EOG_TIMEOUT_S = 18.0
     LIVE_DISCONNECT_DEBOUNCE_FAILS = 3
+    LCU_2999_DEGRADED_GRACE_FAILURES = 12
+    WARMUP_COVERS_DEATH_WINDOW_S = 75.0
 
     # Safe class-level defaults for lightweight unit tests instantiating via __new__
     _commercial: bool = False
@@ -894,6 +914,7 @@ class HexHelperController:
     _vision_window_idle_dual_frames: int = 0
     _last_fast_vanish_diffs: dict[int, float] | None = None
     _port_2999_conflict_detected: bool = False
+    _port_2999_conflict_probed: bool = False
     _item_vote_tracker: VisualSlotVoteTracker | None = None
     _aug_vote_tracker: VisualSlotVoteTracker | None = None
     _last_plan_b_scan_mono: float = 0.0
@@ -3856,6 +3877,8 @@ class HexHelperController:
         self._last_warmup_advice_mono = 0.0
         self._last_warmup_advice_enemy_sig = ""
         self._pending_manual_f6_after_plan_b = False
+        self._port_2999_conflict_detected = False
+        self._port_2999_conflict_probed = False
         if clear_sm_visual and getattr(self, "sm", None) is not None:
             self.sm.visual_owned_items.clear()
             self.sm.suppressed_visual_items.clear()
@@ -3894,8 +3917,16 @@ class HexHelperController:
 
     @staticmethod
     def _probe_port_2999_conflict() -> bool:
-        """Return True if another process holds 2999 (WSAEACCES 10013 / WSAEADDRINUSE 10048) blocking LoL."""
+        """Return True only when 127.0.0.1:2999 is unreachable AND local bind fails (WSAEACCES/WSAEADDRINUSE)."""
         import socket
+
+        # If 127.0.0.1:2999 accepts TCP connections (e.g. LoL LiveClient warming up during loading screen),
+        # port 2999 is actively listening rather than blocked by an ephemeral/excluded port conflict.
+        try:
+            with socket.create_connection(("127.0.0.1", 2999), timeout=0.15):
+                return False
+        except OSError:
+            pass
 
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -4325,6 +4356,7 @@ class HexHelperController:
         lcu_fallback_started_mono: float = 0.0
         live_2999_seen_for_match: bool = False
         fallback_logged: bool = False
+        last_degraded_enemy_count: int = -1
 
         def _resolve_hero_names(cid_str: str) -> tuple[str, str]:
             hero = self.store.get_hero(cid_str)
@@ -4344,6 +4376,7 @@ class HexHelperController:
                     live_2999_seen_for_match = True
                     lcu_fallback_started_mono = 0.0
                     fallback_logged = False
+                    last_degraded_enemy_count = -1
                     self.ui_invoker.invoke.emit(lambda s=live_snap: self._apply_live_snapshot(s, degraded_2999=False))
                     self._stop_event.wait(1.0)
                     continue
@@ -4355,9 +4388,17 @@ class HexHelperController:
                     lcu_fallback_started_mono = 0.0
                     live_2999_seen_for_match = False
                     fallback_logged = False
+                    last_degraded_enemy_count = -1
+                    if self.sm.state not in (GameState.IN_GAME, GameState.AUGMENT_PICKING):
+                        reset_fn = getattr(self.live, "reset_failures", None)
+                        if callable(reset_fn):
+                            reset_fn()
                 elif (
                     not live_2999_seen_for_match
-                    and self.live.consecutive_failures >= 3
+                    and (
+                        fallback_logged
+                        or self.live.consecutive_failures >= int(self.LCU_2999_DEGRADED_GRACE_FAILURES)
+                    )
                     and find_game_window() is not None
                 ):
                     now_m = time.monotonic()
@@ -4371,14 +4412,17 @@ class HexHelperController:
                             allow_all_modes=bool(self.cfg.force_all_modes),
                         )
                     if fb_snap is not None:
+                        cur_enemies = len(fb_snap.enemies)
                         if not fallback_logged:
                             fallback_logged = True
+                            last_degraded_enemy_count = cur_enemies
                             logger.warning(
-                                "LiveClient 127.0.0.1:2999 unavailable during InProgress; "
+                                "LiveClient 127.0.0.1:2999 unavailable during InProgress (fails=%d); "
                                 "entering LCU degraded in-game mode (hero=%s, allies=%d, enemies=%d)",
+                                int(getattr(self.live, "consecutive_failures", 0) or 0),
                                 fb_snap.my_player.champion_name if fb_snap.my_player else "?",
                                 len(fb_snap.allies),
-                                len(fb_snap.enemies),
+                                cur_enemies,
                             )
                             self._emit_devlab(
                                 "game",
@@ -4391,6 +4435,14 @@ class HexHelperController:
                                 },
                                 game_time_s=elapsed_s,
                             )
+                        elif cur_enemies > last_degraded_enemy_count:
+                            logger.info(
+                                "LCU degraded enemy roster refreshed: %d -> %d enemies (allies=%d)",
+                                last_degraded_enemy_count,
+                                cur_enemies,
+                                len(fb_snap.allies),
+                            )
+                            last_degraded_enemy_count = cur_enemies
                         self.ui_invoker.invoke.emit(lambda s=fb_snap: self._apply_live_snapshot(s, degraded_2999=True))
                         self._stop_event.wait(1.0)
                         continue
@@ -4927,6 +4979,8 @@ class HexHelperController:
         vdiag["candidate_ids"] = list(candidate_ids)
         vdiag["slot_index_hint"] = slot_index_hint
         vdiag["action_taken"] = action_taken
+        hud_scale = float(getattr(self, "_hud_scale", 1.0) or 1.0)
+        vdiag.setdefault("hud_scale", round(hud_scale, 3))
         ev_seq = self._emit_devlab("vision", "vision.icon_verify.outcome", vdiag)
 
         # Capture compact 4x28x28 HUD strip crop on anomaly / low-margin / empty bank / flat patches
@@ -4940,7 +4994,10 @@ class HexHelperController:
             strip_fn = getattr(self.icon_matcher, "build_hud_icon_strip_crop", None)
             if callable(strip_fn):
                 try:
-                    strip = strip_fn(frame_bgr, game_rect)
+                    try:
+                        strip = strip_fn(frame_bgr, game_rect, hud_scale=hud_scale)
+                    except TypeError:
+                        strip = strip_fn(frame_bgr, game_rect)
                     if strip is not None:
                         self._devlab.enqueue_roi_snapshot("hud_icon_strip", strip, ev_seq=ev_seq)
                 except Exception:
@@ -4968,12 +5025,22 @@ class HexHelperController:
                 hit=None,
             )
             return None
-        hit = self.icon_matcher.verify_picked_augment(
-            frame_bgr,
-            game_rect,
-            candidate_ids=candidate_ids,
-            slot_index_hint=slot_index_hint,
-        )
+        hud_scale = float(getattr(self, "_hud_scale", 1.0) or 1.0)
+        try:
+            hit = self.icon_matcher.verify_picked_augment(
+                frame_bgr,
+                game_rect,
+                candidate_ids=candidate_ids,
+                slot_index_hint=slot_index_hint,
+                hud_scale=hud_scale,
+            )
+        except TypeError:
+            hit = self.icon_matcher.verify_picked_augment(
+                frame_bgr,
+                game_rect,
+                candidate_ids=candidate_ids,
+                slot_index_hint=slot_index_hint,
+            )
         if hit is None:
             self._emit_icon_verify_devlab(
                 frame_bgr,
@@ -5130,13 +5197,24 @@ class HexHelperController:
             idx = self.sm.selected_augments.index(pt.source_augment_id)
             if 0 <= idx < 4:
                 slot_hint = idx
-        hit = self.icon_matcher.verify_picked_augment(
-            frame_bgr,
-            game_rect,
-            candidate_ids=candidate_ids,
-            slot_index_hint=slot_hint,
-            min_score=0.68,
-        )
+        hud_scale = float(getattr(self, "_hud_scale", 1.0) or 1.0)
+        try:
+            hit = self.icon_matcher.verify_picked_augment(
+                frame_bgr,
+                game_rect,
+                candidate_ids=candidate_ids,
+                slot_index_hint=slot_hint,
+                min_score=0.68,
+                hud_scale=hud_scale,
+            )
+        except TypeError:
+            hit = self.icon_matcher.verify_picked_augment(
+                frame_bgr,
+                game_rect,
+                candidate_ids=candidate_ids,
+                slot_index_hint=slot_hint,
+                min_score=0.68,
+            )
         if hit is not None:
             self._on_resolve_transmute_augment(hit.augment_id, source="hud_icon")
         return hit
@@ -5994,8 +6072,16 @@ class HexHelperController:
         devlab_on = bool(getattr(self, "_devlab_active", False))
         self._lcu_no_live_polls = 0
         was_degraded = bool(getattr(self.sm, "is_degraded_2999", False))
+        prev_live = self._last_live
+        degraded_roster_expanded = False
         if degraded_2999:
-            if not was_degraded:
+            live_obj = getattr(self, "live", None)
+            live_fails = int(getattr(live_obj, "consecutive_failures", 0) or 0) if live_obj is not None else 0
+            if (
+                not getattr(self, "_port_2999_conflict_probed", False)
+                and live_fails >= int(self.LCU_2999_DEGRADED_GRACE_FAILURES)
+            ):
+                self._port_2999_conflict_probed = True
                 self._port_2999_conflict_detected = self._probe_port_2999_conflict()
                 if self._port_2999_conflict_detected:
                     logger.warning(
@@ -6003,9 +6089,26 @@ class HexHelperController:
                         "bound ephemeral port 2999 before League of Legends started."
                     )
             self.sm.is_degraded_2999 = True
+            if (
+                was_degraded
+                and prev_live is not None
+                and prev_live.my_player is not None
+                and live_snap.my_player is not None
+                and prev_live.my_player.champion_name == live_snap.my_player.champion_name
+            ):
+                if len(live_snap.enemies) > len(prev_live.enemies):
+                    degraded_roster_expanded = True
+                elif (
+                    len(live_snap.enemies) < len(live_snap.allies)
+                    and len(prev_live.enemies) > len(live_snap.enemies)
+                ):
+                    live_snap = replace(live_snap, enemies=prev_live.enemies)
             live_snap = self._hydrate_degraded_snapshot(live_snap)
+            if degraded_roster_expanded:
+                self._last_drawer_refresh_sig = None
         elif was_degraded:
             self._port_2999_conflict_detected = False
+            self._port_2999_conflict_probed = False
             self._visual_is_dead = None
             self.sm.is_degraded_2999 = False
             self.sm.manual_owned_items.clear()
@@ -6225,7 +6328,7 @@ class HexHelperController:
                 warmup_covers_death = (
                     self._latest_advice is not None
                     and float(getattr(self, "_last_warmup_advice_mono", 0.0) or 0.0) > 0.0
-                    and warmup_age <= 45.0
+                    and warmup_age <= float(self.WARMUP_COVERS_DEATH_WINDOW_S)
                     and cur_enemy_sig == getattr(self, "_last_warmup_advice_enemy_sig", "")
                 )
                 my_gold = float(live_snap.current_gold or 0.0)
@@ -6239,7 +6342,14 @@ class HexHelperController:
                         warmup_age,
                     )
                     if self._action_tracker is not None:
-                        self._action_tracker.note_death_coach_decision(False, "pre_death_warmup_cached")
+                        try:
+                            self._action_tracker.note_death_coach_decision(
+                                False,
+                                "pre_death_warmup_cached",
+                                warmup_served=True,
+                            )
+                        except TypeError:
+                            self._action_tracker.note_death_coach_decision(False, "pre_death_warmup_cached")
                 elif not eff.enemy_sig_changed and my_gold < self.sm.DEATH_SHOPPING_GOLD_THRESHOLD and not falling_behind:
                     logger.info(
                         "Skipping death_enemy_build_changed: neither significant enemy item change nor gold>=%dG nor falling behind",

@@ -229,7 +229,12 @@ def test_edge_drawer_instant_expand_and_zero_idle_ring_paints() -> None:
             app.processEvents()
             time.sleep(0.01)
         assert drawer._slide_anim.state() != QVariantAnimation.State.Running
-        assert drawer.width() == EdgeBuildDrawer.EXPANDED_W
+        screen = drawer.screen() or app.primaryScreen()
+        geo = screen.geometry()
+        expected_w = EdgeBuildDrawer.compute_default_expanded_width(
+            geo.width(), geo.height(), max(1.0, float(screen.devicePixelRatio() or 1.0))
+        )
+        assert drawer.width() == expected_w
         assert resize_counter.count <= 2, f"Expected <=2 resizes on instant expand, got {resize_counter.count}"
 
         # 3. Repeated 1Hz refresh_match_view with identical state causes 0 window resizes

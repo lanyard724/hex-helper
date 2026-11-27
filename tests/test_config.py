@@ -74,7 +74,8 @@ def test_resolve_thinking_level_adaptive_and_model_floor():
     # Fixed mode keeps configured level while still capping legacy xhigh -> medium
     assert resolve_thinking_level("xhigh", "augment_picking", adaptive=False, model="gemini-4-hydrogen") == "medium"
     assert resolve_thinking_level("high", "augment_picking", adaptive=False, model="gemini-4-hydrogen") == "high"
-    # Gemini 4 floor clamps 'minimal' -> 'low', while Flash allows 'minimal'
+    # Gemini 4 and Gemini 3.8 Flash clamp 'minimal' -> 'low', while allowlisted Flash models (e.g. 3.6 Flash) allow 'minimal'
     assert resolve_thinking_level("minimal", "augment_picking", adaptive=True, model="gemini-4-hydrogen") == "low"
-    assert resolve_thinking_level("minimal", "augment_picking", adaptive=True, model="gemini-3.8-flash") == "minimal"
+    assert resolve_thinking_level("minimal", "augment_picking", adaptive=True, model="gemini-3.8-flash") == "low"
+    assert resolve_thinking_level("minimal", "augment_picking", adaptive=True, model="gemini-3.6-flash") == "minimal"
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -14,6 +15,23 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _user32 = ctypes.windll.user32
+_E_ACCESSDENIED = -2147024891
+_E_ACCESSDENIED_U32 = 0x80070005
+
+
+def _is_com_access_denied(exc: BaseException) -> bool:
+    """Detect COM E_ACCESSDENIED (-2147024891 / 0x80070005) across COMError, OSError, and wrappers."""
+    for attr in ("hresult", "winerror"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int) and (val == _E_ACCESSDENIED or (val & 0xFFFFFFFF) == _E_ACCESSDENIED_U32):
+            return True
+    if exc.args and isinstance(exc.args[0], int):
+        code = exc.args[0]
+        if code == _E_ACCESSDENIED or (code & 0xFFFFFFFF) == _E_ACCESSDENIED_U32:
+            return True
+    text = str(exc)
+    low = text.lower()
+    return str(_E_ACCESSDENIED) in text or "80070005" in low or "e_accessdenied" in low
 
 
 class _POINT(ctypes.Structure):
@@ -157,21 +175,41 @@ class ScreenCapturer:
         self._last_dx_full: np.ndarray | None = None
         self._last_dx_full_bbox: tuple[int, int, int, int] | None = None
         self._cached_hits = 0
+        self._dxcam_fallback_warned = False
         if not lazy:
             self._init_backends()
 
     def _try_create_dxcam(self) -> bool:
         try:
+            if "comtypes" not in sys.modules and not hasattr(sys, "coinit_flags"):
+                # Align comtypes with MTA threads (COINIT_MULTITHREADED=0) to avoid RPC_E_CHANGED_MODE
+                sys.coinit_flags = 0  # type: ignore[attr-defined]
             import dxcam
 
-            cam = dxcam.create(output_color="BGR")
+            try:
+                cam = dxcam.create(output_color="BGR")
+            except Exception as create_exc:
+                if _is_com_access_denied(create_exc):
+                    logger.debug("dxcam E_ACCESSDENIED during create; attaching default desktop and retrying once")
+                    attach_default_desktop()
+                    cam = dxcam.create(output_color="BGR")
+                else:
+                    raise
+
             if cam is not None:
                 self._dx_cam = cam
                 self._backend = "dxcam"
                 self._dx_fail_count = 0
                 return True
+            if not self._dxcam_fallback_warned:
+                self._dxcam_fallback_warned = True
+                logger.warning("dxcam init failed, falling back to mss: dxcam.create returned None")
         except Exception as exc:
-            logger.debug("dxcam init unavailable: %s", exc)
+            if not self._dxcam_fallback_warned:
+                self._dxcam_fallback_warned = True
+                logger.warning("dxcam init failed, falling back to mss: %s", exc)
+            else:
+                logger.debug("dxcam init unavailable: %s", exc)
         self._dx_cam = None
         return False
 
@@ -290,6 +328,9 @@ class ScreenCapturer:
                 except Exception as exc:
                     logger.debug("dxcam grab failed transiently, single-frame mss fallback: %s", exc)
                     try:
+                        release_fn = getattr(self._dx_cam, "release", None)
+                        if callable(release_fn):
+                            release_fn()
                         del self._dx_cam
                     except Exception:
                         pass
@@ -338,6 +379,9 @@ class ScreenCapturer:
     def close(self) -> None:
         if self._dx_cam is not None:
             try:
+                release_fn = getattr(self._dx_cam, "release", None)
+                if callable(release_fn):
+                    release_fn()
                 del self._dx_cam
             except Exception:
                 pass

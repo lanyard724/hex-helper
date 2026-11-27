@@ -122,10 +122,23 @@ def test_frameless_resize_controller_edges_and_left_anchor() -> None:
     w.close()
 
 
-def test_edge_drawer_resize_adapts_columns_header_and_persists(tmp_path: Path) -> None:
+def test_edge_drawer_resize_adapts_columns_header_and_persists(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtGui import QGuiApplication
+
     app = QApplication.instance() or QApplication([])
     store = _make_store(tmp_path)
     saved_sizes: list[list[int] | None] = []
+
+    class _FakeScreen1080p:
+        def geometry(self) -> QRect:
+            return QRect(0, 0, 1920, 1080)
+
+        def devicePixelRatio(self) -> float:  # noqa: N802
+            return 1.0
+
+    fake_scr = _FakeScreen1080p()
+    monkeypatch.setattr(EdgeBuildDrawer, "_active_screen", lambda self: fake_scr)
+    monkeypatch.setattr(QGuiApplication, "screenAt", staticmethod(lambda _pt: fake_scr))
 
     drawer = EdgeBuildDrawer(
         on_size_changed=lambda sz: saved_sizes.append(sz),
@@ -187,26 +200,26 @@ def test_edge_drawer_resize_adapts_columns_header_and_persists(tmp_path: Path) -
         cols = [drawer.aug_chips_lay.getItemPosition(i)[1] for i in range(drawer.aug_chips_lay.count())]
         return (max(cols) + 1) if cols else 0
 
-    # Expand and resize NARROW (296 x 420)
+    # Expand and resize NARROW (296 x 420; commercial edition elastic cushion may add a few px)
     drawer.set_expanded(True)
     drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 296, 420), "bl")
     app.processEvents()
     assert drawer.width() == 296
-    assert drawer.height() == 420
+    assert 420 <= drawer.height() <= 460
     assert not drawer.hdr_icon.isVisible()
     assert drawer.collapse_btn.text() == "收"
     assert _active_aug_cols() == 2
 
-    # Resize WIDE (490 x 620) -> 3 augment columns + full header
-    drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 490, 620), "bl")
-    drawer._on_resize_finished(QRect(drawer.x(), drawer.y(), 490, 620), "bl")
+    # Resize WIDE (490 x 760) -> 3 augment columns + full header (height clears auto_h + cushion)
+    drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 490, 760), "bl")
+    drawer._on_resize_finished(QRect(drawer.x(), drawer.y(), 490, 760), "bl")
     app.processEvents()
     assert drawer.width() == 490
-    assert drawer.height() == 620
+    assert drawer.height() == 760
     assert drawer.hdr_icon.isVisible()
     assert drawer.collapse_btn.text() == "收起"
     assert _active_aug_cols() == 3
-    assert saved_sizes[-1] == [490, 620]
+    assert saved_sizes[-1] == [490, 760]
 
     # Reset restores default width 368 and notifies None
     drawer.reset_default_size()
@@ -562,12 +575,24 @@ def test_edge_drawer_proportional_font_icon_scaling_and_f9_persistence(
     restarted.close()
 
 
-def test_combo_overlay_proportional_scaling_and_f9_persistence() -> None:
+def test_combo_overlay_proportional_scaling_and_f9_persistence(monkeypatch) -> None:
     import re
+    from PySide6.QtGui import QGuiApplication
 
     app = QApplication.instance() or QApplication([])
     saved_sizes: list[list[int] | None] = []
     saved_scales: list[float | None] = []
+
+    class _FakeScreen1080p:
+        def geometry(self) -> QRect:
+            return QRect(0, 0, 1920, 1080)
+
+        def devicePixelRatio(self) -> float:  # noqa: N802
+            return 1.0
+
+    fake_scr = _FakeScreen1080p()
+    monkeypatch.setattr(AugmentComboOverlay, "_active_screen", lambda self: fake_scr)
+    monkeypatch.setattr(QGuiApplication, "screenAt", staticmethod(lambda _pt: fake_scr))
 
     def _extract_font_px(qss: str) -> int:
         m = re.search(r"font-size:\s*(\d+)px", qss)
@@ -647,8 +672,8 @@ def test_desktop_version_updated_to_1_4_6() -> None:
     import hex_helper
     from hex_helper.edition import APP_VERSION
 
-    # Keep APP_VERSION aligned with live manifest (1.4.7) across edition, package, and pyproject
-    assert APP_VERSION == "1.4.7"
+    # Keep APP_VERSION aligned with live manifest (1.5.0) across edition, package, and pyproject
+    assert APP_VERSION == "1.5.0"
     assert hex_helper.__version__ == APP_VERSION
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     assert f'version = "{APP_VERSION}"' in pyproject

@@ -58,8 +58,16 @@ GEMINI_MODELS = (
     "gemini-4-carbon",
     "gemini-4-neon",
     "gemini-3.8-flash",
+    "gemini-3.6-flash",
 )
 GEMINI_THINKING_LEVELS = ("xhigh", "high", "medium", "low", "minimal")
+_SUPPORTS_MINIMAL_THINKING: tuple[str, ...] = (
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-robotics-er-2-preview",
+)
 _THINKING_RANK: dict[str, int] = {
     "minimal": 0,
     "low": 1,
@@ -68,6 +76,24 @@ _THINKING_RANK: dict[str, int] = {
     "xhigh": 4,
 }
 _RANK_TO_THINKING: dict[int, str] = {v: k for k, v in _THINKING_RANK.items()}
+
+
+def _normalize_model_name(model: str) -> str:
+    norm = (model or "").strip().lower()
+    if norm.startswith("models/"):
+        norm = norm[len("models/") :].strip()
+    return norm
+
+
+def model_supports_minimal_thinking(model: str) -> bool:
+    """Return True iff the Gemini model officially supports thinking_level='minimal'."""
+    norm = _normalize_model_name(model)
+    if not norm:
+        return False
+    return any(
+        norm == prefix or norm.startswith(f"{prefix}-")
+        for prefix in _SUPPORTS_MINIMAL_THINKING
+    )
 
 
 def resolve_thinking_level(
@@ -82,11 +108,12 @@ def resolve_thinking_level(
     """Resolve effective Gemini thinking_level based on trigger urgency and model floor.
 
     - Caps legacy 'xhigh' -> 'medium' so local direct Gemini never stalls ~50s in live ARAM.
-    - Gemini 4 models enforce minimum level 'low' ('minimal' is Flash-only).
+    - Enforces minimum level 'low' unless model_supports_minimal_thinking(model) is True
+      (gemini-3.8-flash and all gemini-4* models reject THINKING_LEVEL_MINIMAL with HTTP 400).
     - When adaptive=True, caps level by real-time latency budget without ever exceeding configured_level:
-      * augment_picking -> <= 'minimal' (clamped to 'low' on Gemini 4, 'minimal' on Flash)
+      * augment_picking -> <= 'minimal' (clamped to 'low' on non-minimal models such as gemini-3.8-flash & Gemini 4)
       * connection_test / pre_death_warmup -> <= 'low'
-      * death_enemy_build_changed -> <= 'low' when fast_death=True (or Flash model); <= 'medium' otherwise
+      * death_enemy_build_changed -> <= 'low' when fast_death=True (or non-Gemini-4 model); <= 'medium' otherwise
       * augment_selected -> <= 'low' when is_transformative is False; <= 'medium' for transformative pivots or unspecified
       * game_start -> <= 'medium'
       * manual_f6 (explicit user deep analysis) -> configured_level (with 'xhigh' capped to 'medium')
@@ -94,8 +121,9 @@ def resolve_thinking_level(
     lvl = (configured_level or "medium").strip().lower()
     if lvl not in _THINKING_RANK or lvl == "xhigh":
         lvl = "medium"
-    is_gemini4 = (model or "").strip().lower().startswith("gemini-4")
-    min_rank = 1 if is_gemini4 else 0
+    norm_model = _normalize_model_name(model)
+    is_gemini4 = norm_model.startswith("gemini-4")
+    min_rank = 0 if model_supports_minimal_thinking(norm_model) else 1
     rank = max(min_rank, _THINKING_RANK[lvl])
 
     if adaptive:

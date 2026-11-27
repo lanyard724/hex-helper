@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 import threading
 import time
 from collections import deque
@@ -25,6 +26,7 @@ from hex_helper.vision.augment_icon_matcher import AugmentIconMatcher
 from hex_helper.vision.capture import (
     ScreenCapturer,
     WindowRect,
+    attach_default_desktop,
     find_game_window,
     get_primary_screen_rect,
     is_hwnd_foreground,
@@ -38,6 +40,20 @@ from hex_helper.vision.transmute import TransmuteRevealWatcher, get_cursor_pos
 logger = logging.getLogger(__name__)
 
 COINIT_MULTITHREADED = 0x0
+COINIT_APARTMENTTHREADED = 0x2
+
+
+def _resolve_worker_coinit_mode() -> int:
+    """Choose worker COM apartment consistent with comtypes to prevent RPC_E_CHANGED_MODE."""
+    if "comtypes" in sys.modules:
+        if getattr(sys, "coinit_flags", COINIT_APARTMENTTHREADED) != COINIT_MULTITHREADED:
+            return COINIT_APARTMENTTHREADED
+        return COINIT_MULTITHREADED
+    if not hasattr(sys, "coinit_flags"):
+        sys.coinit_flags = COINIT_MULTITHREADED  # type: ignore[attr-defined]
+    if getattr(sys, "coinit_flags", COINIT_MULTITHREADED) != COINIT_MULTITHREADED:
+        return COINIT_APARTMENTTHREADED
+    return COINIT_MULTITHREADED
 
 
 @dataclass(frozen=True)
@@ -883,10 +899,16 @@ class HexVisionWorker:
     def _thread_entry(self) -> None:
         com_inited = False
         try:
-            hr = int(ctypes.windll.ole32.CoInitializeEx(None, COINIT_MULTITHREADED))
+            coinit_mode = _resolve_worker_coinit_mode()
+            hr = int(ctypes.windll.ole32.CoInitializeEx(None, coinit_mode))
             com_inited = hr in (0, 1)  # S_OK or S_FALSE
         except Exception as exc:
             logger.debug("HexVisionWorker CoInitializeEx skipped: %s", exc)
+
+        try:
+            attach_default_desktop()
+        except Exception as exc:
+            logger.debug("HexVisionWorker attach_default_desktop skipped: %s", exc)
 
         try:
             self._run_loop()

@@ -211,7 +211,12 @@ def test_edge_drawer_collapsed_height_never_grows_and_panel_shrinks():
             _time.sleep(0.01)
         app.processEvents()
         expanded_base_h = drawer.height()
-        assert drawer.width() == EdgeBuildDrawer.EXPANDED_W
+        screen = drawer.screen() or app.primaryScreen()
+        geo = screen.geometry()
+        expected_w = EdgeBuildDrawer.compute_default_expanded_width(
+            geo.width(), geo.height(), max(1.0, float(screen.devicePixelRatio() or 1.0))
+        )
+        assert drawer.width() == expected_w
         drawer.set_warning("测试长告警文案" * 8)
         drawer.tools_row.show()
         drawer._reposition_right_edge()
