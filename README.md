@@ -6,7 +6,7 @@
 
 **为《英雄联盟》海克斯大乱斗打造的纯只读 Windows 桌面悬浮窗助手**
 
-[![Version](https://img.shields.io/badge/Version-v1.5.0-C89B3C?style=flat-square)](https://priswebtool.site)
+[![Version](https://img.shields.io/badge/Version-v1.5.2-C89B3C?style=flat-square)](https://github.com/lanyard724/hex-helper/releases/latest)
 [![Patch](https://img.shields.io/badge/LOL%20CN-26.23-0AC8B9?style=flat-square)](https://priswebtool.site)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-091428?style=flat-square)](https://priswebtool.site)
 [![License](https://img.shields.io/badge/License-MIT-785A28?style=flat-square)](LICENSE)
@@ -40,11 +40,15 @@
 - **8 向自由拖拽缩放 & 4K 等比放大（v1.4.6）**：左右推荐悬浮窗支持完整 8 方向边角自由拖动调整尺寸，字号、装备图标与卡片间距随窗口真正等比缩放（`0.85x-2.20x`），4K 高分屏首次启动自动匹配清晰倍率，双击缩放把手或设置页一键重置；9 项常用操作支持游戏级自定义改键与冲突一键互换（默认 `F9` 一键收放左右浮窗）。
 - **20 局滚动日志 & 一键问题反馈**：按局切片自动滚动保留最近 20 局运行日志（超 20 局自动清理最旧记录），遇识别异常或报错可一键脱敏压缩回传排查，也可导出本地日志包。
 - **异步视觉引擎 & Plan B 双通道同步**：独立线程执行硬件采帧、单通空闲 OCR 与 BLAS 向量化图标匹配，彻底解除主线程卡顿；当本地 2999 端口被代理占用时自动降级为视觉 + 手动双同步并保留死亡灰屏自动展开。
-- **赛后海克斯战报卡 v2**：对局结束自动生成 `760×480` 海克斯战报图，内置终局属性面板（AD/AP/HP/AH/双抗/攻速）、硬核战绩（输出占比/承伤/治疗护盾/参团率/经济）、4 枚海克斯真实图标与 S+/MVP 金属评分徽章，一键复制直接发给开黑车队。
+- **海外中文多服适配与无感繁中 OCR（v1.5.2）**：设置页原生支持国服简体（`zh_cn`）、新加坡/马来服简体（`zh_my`）与台港澳繁体（`zh_tw`）切换，覆盖 600 枚海克斯、862 件装备及 173+ 英雄官方译名；大陆简体 Windows 未额外安装系统繁体语言包时自动启用简转繁免装兼容识别，开箱即用。
+- **后期成长装与末轮海克斯动态评估（v1.5.2）**：针对心之钢、时光之杖、女神泪系、狂妄、收集者等叠层成长装按局内时长与进度动态衰减优先级；3-4 轮海克斯按格位与经济自动折价；精准区分「罪恶快感」与「罪恶快感！」等同名词条，隔离跨局残余状态防止串局。
+- **4 套高清赛后战报卡模板（v1.5.2）**：支持「01 干员档案双栏」「02 宽银幕头图海报」「03 14° 斜切全息界面」「04 极简黑金通透玻璃」四套设计，内置英雄皮肤原画、终局攻防急速面板（AD/AP/HP/AH/双抗/攻速）、4 枚海克斯图标、6 神装全名与 S+/MVP 徽章，结算弹窗内实时切换预览并一键复制发给开黑车队，永久免费。
 
-<p align="center">
-  <img src="docs/assets/preview_recap.png" alt="HexHelper 赛后海克斯战报卡效果" width="760" />
-</p>
+| 01 干员档案双栏 · 科加斯 | 02 宽银幕头图海报 · 暗星 莫德凯撒 |
+| :---: | :---: |
+| <img src="docs/assets/recap_tpl01_endfield.webp" alt="01 干员档案双栏 科加斯" width="100%" /> | <img src="docs/assets/recap_tpl02_cinematic.webp" alt="02 宽银幕头图海报 暗星 莫德凯撒" width="100%" /> |
+| **03 14° 斜切全息 · 至臻 灵魂莲华 拉克丝** | **04 极简黑金通透玻璃 · 暗杀星 蒙多** |
+| <img src="docs/assets/recap_tpl03_hologram.webp" alt="03 14° 斜切全息 至臻 灵魂莲华 拉克丝" width="100%" /> | <img src="docs/assets/recap_tpl04_glass.webp" alt="04 极简黑金通透玻璃 暗杀星 蒙多" width="100%" /> |
 
 ---
 
@@ -68,7 +72,7 @@
 
 前往官网 **[https://priswebtool.site](https://priswebtool.site)** 或本仓库 **[GitHub Releases](https://github.com/lanyard724/hex-helper/releases)** 直接下载：
 - **Windows 一键安装包（`.exe`）**、**免安装绿色包（`.zip`）** 或老版本 **12MB 增量热更包（`_patch.zip`）**
-- 国内高速直连，已内置 `26.23` 离线数据包与 126 个核心装备图标，装完打开就能打。
+- 国内高速直连，已内置 `26.23` 离线数据包与 160 个核心装备图标，装完打开就能打。
 
 ### 从源码运行
 
@@ -109,6 +113,7 @@ python -m venv .venv
 
 ## 开源协议与免责声明
 
+- **数据与 AI 建议免责声明**：本助手基于对局统计数据库与 AI 相关能力开发，所有海克斯选卡、出装与战术建议均为大数据统计建议与 AI 基于大数据产生的实时推演，可能与个人游戏经验或临场手感存在差异，仅供游戏参考与情绪价值，不构成胜率承诺。
 - 本仓库开源全部 Windows 桌面客户端源码，采用 [MIT License](LICENSE) 协议；本地对局统计参考整理自开源社区公开统计项目（`aramhex-data`）汇总样本（随版本动态更新，仅供参考，不构成胜负承诺）。
 - HexHelper wasn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.
 - 本项目为独立玩家社区工具，与 Riot Games 及腾讯游戏无任何官方隶属或合作关系。
