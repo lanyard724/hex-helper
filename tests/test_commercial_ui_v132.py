@@ -254,6 +254,10 @@ def test_lookup_window_940x610_match_friendly_balance_recap_button_and_tier_card
         assert lw.coach_output_card.height() >= 150, (
             f"Coach timeline card crushed at 940x610: {lw.coach_output_card.height()}px"
         )
+        assert "大数据" in lw.footer_disclaimer_lbl.text()
+        assert "仅供对局参考" in lw.footer_disclaimer_lbl.text()
+        assert "大数据" in lw.coach_disclaimer_lbl.text()
+        assert "仅供对局参考" in lw.coach_disclaimer_lbl.text()
 
         # 5. Strict LOL Hextech palette check: zero Web orange #FF5A1F
         all_qss = lw.styleSheet() + " ".join(w.styleSheet() for w in lw.findChildren(QWidget))

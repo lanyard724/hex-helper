@@ -578,6 +578,11 @@
       "force_items": [
         "3084"
       ],
+      "force_item_gate": {
+        "item_id": "3084",
+        "min_pr": 0.08,
+        "min_delta": -0.012
+      },
       "required_tags": [
         "Health"
       ],
@@ -643,6 +648,11 @@
       "force_items": [
         "3084"
       ],
+      "force_item_gate": {
+        "item_id": "3084",
+        "min_pr": 0.08,
+        "min_delta": -0.012
+      },
       "required_tags": [
         "Health"
       ],
@@ -2388,6 +2398,41 @@
       "penalize_tags": [],
       "avoid_note": "避免叠体型类肉装(心之钢/歌利亚)，保持小体型配百分比穿透切碎前排",
       "playstyle_tip": "利用小体型与移速拉扯规避控制，优先集火敌方心之钢/坦克大核打满增伤"
+    },
+    {
+      "id": "3094",
+      "name": "巫妖大脑",
+      "aliases": [
+        "Lich Brain",
+        "血量转法强"
+      ],
+      "rarity": "silver",
+      "archetype": "血量转法强半肉法坦流",
+      "mechanic": "提供30法强并将4%生命值转化为额外法术强度，血量装兼具坦度与输出",
+      "transformative": false,
+      "allow_off_profile": false,
+      "shifts_profile": "",
+      "boost": 2.8,
+      "core_items": [
+        "4633",
+        "3116",
+        "6653",
+        "6657",
+        "4629",
+        "3065",
+        "3084",
+        "2502",
+        "3083"
+      ],
+      "force_items": [],
+      "required_tags": [],
+      "stat_keys": [
+        "FlatHPPoolMod",
+        "FlatMagicDamageMod"
+      ],
+      "penalize_tags": [],
+      "avoid_note": "优先选择兼具生命值与法强的半肉装（裂隙制造者/冰杖/兰德里/时光）或契合英雄的叠血坦装",
+      "playstyle_tip": "利用裂隙制造者双重血转法强或振奋/心之钢滚雪球，中后期又肉法强又高"
     }
   ]
 }

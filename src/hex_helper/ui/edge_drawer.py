@@ -9,14 +9,16 @@ import threading
 import time
 from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QPoint, QRect, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QRect, Qt, QTimer, QVariantAnimation, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QMouseEvent, QPixmap, QScreen
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -57,6 +59,7 @@ from hex_helper.ui.hextech_widgets import (
     HextechPulseFrame,
     HextechShimmerBar,
 )
+from hex_helper.ui.pinyin_match import matches_augment_query, to_pinyin_initials
 from hex_helper.ui.resizable_overlay import (
     FramelessResizeController,
     HextechCornerGrip,
@@ -67,12 +70,18 @@ from hex_helper.ui.resizable_overlay import (
 )
 from hex_helper.ui.theme import (
     BASE_OVERLAY_QSS,
+    HEXTECH_MENU_QSS,
     RARITY_COLORS,
     display_font,
     latin_serif_font,
     load_app_pixmap,
 )
-from hex_helper.ui.win32_window import UiBridgeInvoker, show_no_activate
+from hex_helper.ui.win32_window import (
+    UiBridgeInvoker,
+    apply_capture_exclusion,
+    set_allow_keyboard_focus,
+    show_no_activate,
+)
 from hex_helper.vision.transmute import NON_TARGET_AUGMENT_IDS, PendingTransmute, is_transmute_augment
 
 _SHORT_ITEM_ALIASES: dict[str, str] = {
@@ -102,6 +111,16 @@ _SHORT_ITEM_ALIASES: dict[str, str] = {
     "铁板靴": "布甲鞋",
     "明朗之靴": "CD鞋",
     "巫术合剂": "法合剂",
+}
+
+
+_AUGMENT_RARITY_ORDER: dict[str, int] = {
+    "prismatic": 0,
+    "棱彩": 0,
+    "gold": 1,
+    "黄金": 1,
+    "silver": 2,
+    "白银": 2,
 }
 
 
@@ -150,6 +169,7 @@ class EdgeBuildDrawer(QWidget):
         on_call_coach: Callable[[], None] | None = None,
         on_switch_dataset: Callable[[str, str, str], None] | None = None,
         on_manual_hero: Callable[[str], None] | None = None,
+        on_select_archetype: Callable[[str], None] | None = None,
         on_pos_changed: Callable[[list[int]], None] | None = None,
         on_size_changed: Callable[[list[int] | None], None] | None = None,
         on_scale_changed: Callable[[float | None], None] | None = None,
@@ -165,6 +185,8 @@ class EdgeBuildDrawer(QWidget):
         on_manual_add_item: Callable[[str], None] | None = None,
         on_manual_remove_item: Callable[[str], None] | None = None,
         on_plan_b_rescan: Callable[[], None] | None = None,
+        on_toggle_screen_recording: Callable[[bool], None] | None = None,
+        on_request_restore_game_focus: Callable[[], None] | None = None,
         initial_tier: str = "a",
         initial_pos: list[int] | None = None,
         initial_size: list[int] | None = None,
@@ -181,6 +203,7 @@ class EdgeBuildDrawer(QWidget):
         self._on_call_coach = on_call_coach
         self._on_switch_dataset = on_switch_dataset
         self._on_manual_hero = on_manual_hero
+        self._on_select_archetype = on_select_archetype
         self._on_pos_changed = on_pos_changed
         self._on_size_changed = on_size_changed
         self._on_scale_changed = on_scale_changed
@@ -196,6 +219,14 @@ class EdgeBuildDrawer(QWidget):
         self._on_manual_add_item = on_manual_add_item
         self._on_manual_remove_item = on_manual_remove_item
         self._on_plan_b_rescan = on_plan_b_rescan
+        self._on_toggle_screen_recording = on_toggle_screen_recording
+        self._on_request_restore_game_focus = on_request_restore_game_focus
+        self._allow_screen_recording: bool = False
+        self._recent_unrecorded_augments: list[str] = []
+        self._all_augment_entries: list[tuple[str, str, str, str]] = []
+        self._transmute_candidates: list[tuple[str, str, str, str]] = []
+        self._aug_alt_names: dict[str, str] = {}
+        self._text_input_active: bool = False
         self._degraded_2999_active: bool = False
         self._degraded_synced_items: list[tuple[str, str]] = []
         self._gesture_start_norm_rect: list[float] | None = None
@@ -246,6 +277,11 @@ class EdgeBuildDrawer(QWidget):
         self._applied_ui_scale: float = 0.0
         self._coach_status_color: str = "#A09B8C"
         self._rm_hdr_color: str = "#C8AA6E"
+        self._archetype_btns: list[QPushButton] = []
+        self._archetype_options: list[tuple[str, str]] = []
+        self._archetype_active_profile: str = ""
+        self._archetype_is_manual: bool = False
+        self._last_archetype_sig: tuple[Any, ...] | None = None
         self._coach_balance_color: str = "#FDE68A"
         self._cutoff_banner_color: str = "#E2D9C5"
         self._cost_badge_state: tuple[int, bool, int] | None = None
@@ -358,17 +394,20 @@ class EdgeBuildDrawer(QWidget):
         self.pill_hero_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pill_hero_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2; font-weight: bold; font-size: 11px;")
 
-        # 4 miniature rarity-colored augment progress dots
+        # 4 base + 2 on-demand miniature rarity-colored augment progress dots (up to 6 augments)
         dots_wrap = QWidget()
         dots_wrap.setStyleSheet("background: transparent; border: none;")
         dots_lay = QHBoxLayout(dots_wrap)
-        dots_lay.setContentsMargins(2, 0, 2, 0)
+        dots_lay.setContentsMargins(0, 0, 0, 0)
         dots_lay.setSpacing(3)
+        self._pill_dots_lay = dots_lay
         self._pill_aug_dots: list[QFrame] = []
-        for _ in range(4):
+        for idx in range(6):
             dot = QFrame()
             dot.setFixedSize(6, 6)
             dot.setStyleSheet("background-color: #334155; border: none; border-radius: 3px;")
+            if idx >= 4:
+                dot.hide()
             dots_lay.addWidget(dot)
             self._pill_aug_dots.append(dot)
 
@@ -748,6 +787,19 @@ class EdgeBuildDrawer(QWidget):
         )
         nb_lay.addWidget(self.buy_now_lbl)
 
+        # P0-7: Compact 1-line next_augment_goal capsule during death/shop review (< 4 augments)
+        self.next_aug_goal_lbl = QLabel("")
+        self.next_aug_goal_lbl.setWordWrap(True)
+        self.next_aug_goal_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.next_aug_goal_lbl.setStyleSheet(
+            "background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            "stop:0 rgba(6, 36, 48, 232), stop:1 rgba(24, 30, 42, 228)); "
+            "border: 1px solid #0AC8B9; border-left: 3px solid #C8AA6E; "
+            "border-radius: 2px; padding: 3px 7px; color: #F0E6D2; font-size: 10px; font-weight: bold;"
+        )
+        self.next_aug_goal_lbl.hide()
+        nb_lay.addWidget(self.next_aug_goal_lbl)
+
         # Compact tactical micro-bar: counter Tier-2 boots tag + top enemy threat KDA/spells
         self.tactical_micro_wrap = QWidget()
         self.tactical_micro_wrap.setObjectName("NextMicroWrap")
@@ -792,6 +844,19 @@ class EdgeBuildDrawer(QWidget):
         rm_top.addStretch(1)
         rm_top.addWidget(self.backup_item_lbl)
         rm_lay.addLayout(rm_top)
+
+        self.archetype_bar_wrap = QWidget()
+        self.archetype_bar_wrap.setObjectName("ArchetypeBarWrap")
+        self.archetype_bar_wrap.setStyleSheet("QWidget#ArchetypeBarWrap { background: transparent; border: none; }")
+        self.archetype_bar_lay = QHBoxLayout(self.archetype_bar_wrap)
+        self.archetype_bar_lay.setContentsMargins(0, 0, 0, 0)
+        self.archetype_bar_lay.setSpacing(4)
+        self.archetype_bar_lbl = QLabel("流派")
+        self.archetype_bar_lbl.setStyleSheet("border: none; background: transparent; color: #7E7A70; font-size: 9px;")
+        self.archetype_bar_lay.addWidget(self.archetype_bar_lbl)
+        self.archetype_bar_lay.addStretch(1)
+        self.archetype_bar_wrap.hide()
+        rm_lay.addWidget(self.archetype_bar_wrap)
 
         self.pivot_banner_lbl = QLabel("")
         self.pivot_banner_lbl.setWordWrap(True)
@@ -1096,6 +1161,7 @@ class EdgeBuildDrawer(QWidget):
         self.transmute_combo = QComboBox()
         self.transmute_combo.setEditable(True)
         self.transmute_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.transmute_combo.setCompleter(None)
         self.transmute_combo.setFixedHeight(25)
         self.transmute_combo.setStyleSheet(
             "QComboBox { padding: 1px 6px; font-size: 11px; border: 1px solid #9333EA; }"
@@ -1103,6 +1169,7 @@ class EdgeBuildDrawer(QWidget):
         if self.transmute_combo.lineEdit():
             self.transmute_combo.lineEdit().setPlaceholderText("或手选质变结果...")
             self.transmute_combo.lineEdit().setStyleSheet("padding: 0px 2px; font-size: 11px;")
+            self.transmute_combo.lineEdit().textEdited.connect(self._on_transmute_search_text_edited)
         tb_ok_btn = QPushButton("确认")
         tb_ok_btn.setFixedHeight(25)
         tb_ok_btn.setStyleSheet("padding: 0px 8px; font-size: 11px; border: 1px solid #D946EF; color: #F0E6D2;")
@@ -1122,7 +1189,11 @@ class EdgeBuildDrawer(QWidget):
         self.aug_add_combo = QComboBox()
         self.aug_add_combo.setEditable(True)
         self.aug_add_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.aug_add_combo.setPlaceholderText("搜海克斯名...")
+        self.aug_add_combo.setCompleter(None)
+        self.aug_add_combo.setPlaceholderText("搜海克斯名/首字母...")
+        if self.aug_add_combo.lineEdit():
+            self.aug_add_combo.lineEdit().setPlaceholderText("搜海克斯名/首字母...")
+            self.aug_add_combo.lineEdit().textEdited.connect(self._on_aug_search_text_edited)
         aug_confirm_btn = QPushButton("添加")
         aug_confirm_btn.setFixedHeight(22)
         aug_confirm_btn.clicked.connect(self._handle_manual_add_augment)
@@ -1286,6 +1357,14 @@ class EdgeBuildDrawer(QWidget):
         self._slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._slide_anim.valueChanged.connect(self._apply_animated_width)
         self._slide_anim.finished.connect(self._on_slide_finished)
+        self.installEventFilter(self)
+        for _le in (
+            self.aug_add_combo.lineEdit(),
+            self.transmute_combo.lineEdit(),
+            self.item_add_combo.lineEdit(),
+        ):
+            if _le is not None:
+                _le.installEventFilter(self)
         self._apply_ui_scale(1.0, force=True)
         self._reposition_right_edge()
 
@@ -1483,6 +1562,13 @@ class EdgeBuildDrawer(QWidget):
             f"border-radius: 2px; padding: {m.px(5)}px {m.px(8)}px; color: #FDE68A; "
             f"font-size: {m.font_px(12)}px; font-weight: bold;"
         )
+        self.next_aug_goal_lbl.setStyleSheet(
+            "background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            "stop:0 rgba(6, 36, 48, 232), stop:1 rgba(24, 30, 42, 228)); "
+            "border: 1px solid #0AC8B9; border-left: 3px solid #C8AA6E; "
+            f"border-radius: 2px; padding: {m.px(3)}px {m.px(7)}px; color: #F0E6D2; "
+            f"font-size: {m.font_px(10)}px; font-weight: bold;"
+        )
         self.boots_hint_lbl.setStyleSheet(
             "background-color: rgba(10, 200, 185, 28); border: 1px solid rgba(10, 200, 185, 130); "
             f"border-radius: 2px; padding: {m.px(1)}px {m.px(5)}px; color: #A5F3FC; "
@@ -1509,6 +1595,10 @@ class EdgeBuildDrawer(QWidget):
             f"border-left: 2px solid #C8AA6E; border-radius: 2px; padding: {m.px(2)}px {m.px(6)}px; "
             f"color: #A5F3FC; font-size: {m.font_px(10)}px; font-weight: bold;"
         )
+        self.archetype_bar_lbl.setStyleSheet(
+            f"border: none; background: transparent; color: #7E7A70; font-size: {m.font_px(9)}px;"
+        )
+        self._rebuild_archetype_pills(force=True)
         self._dest_title_lbl.setStyleSheet(
             f"border: none; background: transparent; color: #F0E6D2; font-weight: bold; font-size: {m.font_px(10)}px;"
         )
@@ -2120,8 +2210,12 @@ class EdgeBuildDrawer(QWidget):
 
     def closeEvent(self, event) -> None:
         self._is_closed = True
+        if self._text_input_active:
+            self._exit_text_input_mode(restore_game=False)
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
+        if self._tier_nudge_timer.isActive():
+            self._tier_nudge_timer.stop()
         if self._brief_auto_collapse_timer.isActive():
             self._brief_auto_collapse_timer.stop()
         if self._quick_confirm_timer.isActive():
@@ -2139,14 +2233,135 @@ class EdgeBuildDrawer(QWidget):
         except RuntimeError:
             return
 
+    def set_screen_recording_allowed(self, allowed: bool) -> None:
+        self._allow_screen_recording = bool(allowed)
+        if self.isVisible() or bool(self.internalWinId()):
+            apply_capture_exclusion(self, exclude=not self._allow_screen_recording)
+
+    def _handle_toggle_screen_recording(self, checked: bool) -> None:
+        self.set_screen_recording_allowed(bool(checked))
+        if self._on_toggle_screen_recording is not None:
+            self._on_toggle_screen_recording(bool(checked))
+
+    def set_recent_unrecorded_augments(self, aug_ids: list[str] | tuple[str, ...]) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in aug_ids or ():
+            aid = str(raw or "").strip()
+            if aid and aid not in seen:
+                seen.add(aid)
+                cleaned.append(aid)
+        if cleaned == self._recent_unrecorded_augments:
+            return
+        self._recent_unrecorded_augments = cleaned
+        if self._all_augment_entries:
+            le = self.aug_add_combo.lineEdit()
+            cur_q = le.text() if le is not None else ""
+            self._rebuild_aug_combo_items(cur_q)
+
+    def _enter_text_input_mode(self, line_edit: QLineEdit | None = None) -> None:
+        self._text_input_active = True
+        set_allow_keyboard_focus(self, True)
+        if line_edit is not None:
+            line_edit.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def _exit_text_input_mode(self, restore_game: bool = True) -> None:
+        if not self._text_input_active:
+            return
+        self._text_input_active = False
+        for cb in (self.aug_add_combo, self.transmute_combo, self.item_add_combo):
+            le = cb.lineEdit()
+            if le is not None and le.hasFocus():
+                le.clearFocus()
+        set_allow_keyboard_focus(self, False)
+        if restore_game and self._on_request_restore_game_focus is not None:
+            self._on_request_restore_game_focus()
+
+    @staticmethod
+    def _clear_combo_input(combo: QComboBox) -> None:
+        le = combo.lineEdit()
+        combo.blockSignals(True)
+        if le is not None:
+            le.blockSignals(True)
+        try:
+            combo.setCurrentIndex(-1)
+            if le is not None:
+                le.clear()
+        finally:
+            if le is not None:
+                le.blockSignals(False)
+            combo.blockSignals(False)
+
+    def _cancel_manual_aug_picker(self) -> None:
+        self._clear_combo_input(self.aug_add_combo)
+        self.aug_manual_row.hide()
+        self._exit_text_input_mode(restore_game=True)
+        if self.isVisible():
+            self._reposition_right_edge()
+
+    def _cancel_transmute_input(self) -> None:
+        self._clear_combo_input(self.transmute_combo)
+        self._exit_text_input_mode(restore_game=True)
+
+    def _cancel_manual_item_picker(self) -> None:
+        self._clear_combo_input(self.item_add_combo)
+        self.item_manual_row.hide()
+        self._exit_text_input_mode(restore_game=True)
+        if self.isVisible():
+            self._reposition_right_edge()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        ev_type = event.type()
+        if watched is self:
+            if ev_type == QEvent.Type.WindowDeactivate:
+                if self._text_input_active and QApplication.activePopupWidget() is None:
+                    self._exit_text_input_mode(restore_game=True)
+        elif watched in (
+            self.aug_add_combo.lineEdit(),
+            self.transmute_combo.lineEdit(),
+            self.item_add_combo.lineEdit(),
+        ):
+            if ev_type == QEvent.Type.MouseButtonPress and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
+                self._enter_text_input_mode(watched)
+            elif ev_type == QEvent.Type.KeyPress:
+                key = event.key()
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    if watched is self.aug_add_combo.lineEdit():
+                        self._handle_manual_add_augment()
+                        return True
+                    if watched is self.transmute_combo.lineEdit():
+                        self._handle_manual_resolve_transmute()
+                        return True
+                    if watched is self.item_add_combo.lineEdit():
+                        self._handle_manual_add_item()
+                        return True
+                elif key == Qt.Key.Key_Escape:
+                    if watched is self.aug_add_combo.lineEdit():
+                        self._cancel_manual_aug_picker()
+                        return True
+                    if watched is self.transmute_combo.lineEdit():
+                        self._cancel_transmute_input()
+                        return True
+                    if watched is self.item_add_combo.lineEdit():
+                        self._cancel_manual_item_picker()
+                        return True
+        return super().eventFilter(watched, event)
+
     def _toggle_manual_aug_picker(self) -> None:
-        now_visible = not self.aug_manual_row.isVisible()
+        now_visible = self.aug_manual_row.isHidden()
         self.aug_manual_row.setVisible(now_visible)
         self._emit_subcard_action(
             "manual_aug_picker",
             "expand" if now_visible else "collapse",
             {"expanded": now_visible},
         )
+        if now_visible:
+            self._clear_combo_input(self.aug_add_combo)
+            if self._all_augment_entries:
+                self._rebuild_aug_combo_items("")
+            self._enter_text_input_mode(self.aug_add_combo.lineEdit())
+        else:
+            self._exit_text_input_mode(restore_game=True)
         if self._commercial and self._lifecycle is not None and self._lifecycle.is_sealed_dormant:
             self._sync_seal_slots()
         if self.isVisible():
@@ -2300,6 +2515,8 @@ class EdgeBuildDrawer(QWidget):
             self._layout_corner_grips()
 
     def _close_by_user(self) -> None:
+        if self._text_input_active:
+            self._exit_text_input_mode(restore_game=True)
         if self._on_closed_by_user:
             self._on_closed_by_user()
         self.hide()
@@ -2331,17 +2548,24 @@ class EdgeBuildDrawer(QWidget):
                 return
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
+            menu.setStyleSheet(HEXTECH_MENU_QSS)
             a_toggle = QAction("收起成小条" if self._expanded else "展开抽屉", menu)
             a_toggle.triggered.connect(self._user_toggle_expanded)
             a_reset_size = QAction("恢复默认尺寸（适配屏幕）", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_reset = QAction("复位到屏幕右侧", menu)
             a_reset.triggered.connect(self.reset_to_right_edge)
+            a_rec = QAction("录屏/截屏中显示悬浮窗", menu)
+            a_rec.setCheckable(True)
+            a_rec.setChecked(self._allow_screen_recording)
+            a_rec.triggered.connect(self._handle_toggle_screen_recording)
             a_hide = QAction("隐藏悬浮窗", menu)
             a_hide.triggered.connect(self._close_by_user)
             menu.addAction(a_toggle)
             menu.addAction(a_reset_size)
             menu.addAction(a_reset)
+            menu.addSeparator()
+            menu.addAction(a_rec)
             menu.addSeparator()
             menu.addAction(a_hide)
             menu.exec(event.globalPosition().toPoint())
@@ -2434,6 +2658,8 @@ class EdgeBuildDrawer(QWidget):
         if self._slide_anim.state() == QVariantAnimation.State.Running:
             self._slide_anim.stop()
         target_exp = bool(expanded)
+        if not target_exp and self._text_input_active:
+            self._exit_text_input_mode(restore_game=True)
         if not target_exp and self._brief_auto_collapse_timer.isActive():
             self._brief_auto_collapse_timer.stop()
         self._expanded = target_exp
@@ -2458,12 +2684,16 @@ class EdgeBuildDrawer(QWidget):
             finally:
                 self.setUpdatesEnabled(True)
         if was_visible:
-            show_no_activate(self, click_through=False)
+            show_no_activate(
+                self,
+                click_through=False,
+                exclude_from_capture=not self._allow_screen_recording,
+            )
         if self._expanded:
             self._schedule_post_layout_height_sync()
         if self._expanded and self._pending_auto_unseal:
             self._pending_auto_unseal = False
-            QTimer.singleShot(120, lambda: self.play_ingame_auto_unseal(force_now=True))
+            QTimer.singleShot(120, self._safe_play_ingame_auto_unseal)
 
     @property
     def is_expanded(self) -> bool:
@@ -2494,10 +2724,14 @@ class EdgeBuildDrawer(QWidget):
 
     def show_overlay(self) -> None:
         self._reposition_right_edge()
-        show_no_activate(self, click_through=False)
+        show_no_activate(
+            self,
+            click_through=False,
+            exclude_from_capture=not self._allow_screen_recording,
+        )
         if self._expanded and self._pending_auto_unseal:
             self._pending_auto_unseal = False
-            QTimer.singleShot(120, lambda: self.play_ingame_auto_unseal(force_now=True))
+            QTimer.singleShot(120, self._safe_play_ingame_auto_unseal)
 
     def _dismiss_opening_brief_seal(self) -> None:
         self._opening_brief_seal_dismissed = True
@@ -2561,6 +2795,33 @@ class EdgeBuildDrawer(QWidget):
             elif self._on_recharge_click:
                 self._on_recharge_click()
 
+    def _safe_play_ingame_auto_unseal(self) -> None:
+        if self._is_closed:
+            return
+        try:
+            from shiboken6 import isValid as _qt_is_valid
+
+            if not _qt_is_valid(self):
+                return
+        except ImportError:
+            pass
+        self.play_ingame_auto_unseal(force_now=True)
+
+    def _safe_hide_widget(self, w: QWidget) -> None:
+        if self._is_closed:
+            return
+        try:
+            from shiboken6 import isValid as _qt_is_valid
+
+            if not _qt_is_valid(self) or not _qt_is_valid(w):
+                return
+        except ImportError:
+            pass
+        try:
+            w.hide()
+        except RuntimeError:
+            pass
+
     def play_ingame_auto_unseal(self, *, force_now: bool = False) -> None:
         """Track B: Streamlined 380ms auto-shatter on in-game recharge without blocking shopping."""
         if not force_now and (not self.isVisible() or not self._expanded):
@@ -2571,11 +2832,11 @@ class EdgeBuildDrawer(QWidget):
         played = False
         if self.coach_seal_slot.isVisible() and self.coach_seal_overlay.mode != SealMode.UNLOCKED:
             self.coach_seal_overlay.play_unseal(fast=True)
-            QTimer.singleShot(410, self.coach_seal_slot.hide)
+            QTimer.singleShot(410, lambda w=self.coach_seal_slot: self._safe_hide_widget(w))
             played = True
         if self.opening_brief_seal_wrap.isVisible() and self.opening_brief_seal.mode != SealMode.UNLOCKED:
             self.opening_brief_seal.play_unseal(fast=True)
-            QTimer.singleShot(410, self.opening_brief_seal_wrap.hide)
+            QTimer.singleShot(410, lambda w=self.opening_brief_seal_wrap: self._safe_hide_widget(w))
             played = True
         if not played:
             self.coach_card.trigger_pulse("#0AC8B9", 520)
@@ -2590,7 +2851,12 @@ class EdgeBuildDrawer(QWidget):
                 for aid in self._selected_augments:
                     entry = spec_db.get(aid) if hasattr(spec_db, "get") else None
                     if entry is not None:
-                        special_name = getattr(entry, "name", "") or ""
+                        raw_sn = getattr(entry, "name", "") or ""
+                        special_name = (
+                            self._store_ref.display_augment_name(aid, raw_sn)
+                            if self._store_ref is not None
+                            else raw_sn
+                        )
                         break
             except Exception:
                 pass
@@ -2971,6 +3237,8 @@ class EdgeBuildDrawer(QWidget):
 
         full_locked = self._is_full_locked
         if full_locked:
+            if self._text_input_active:
+                self._exit_text_input_mode(restore_game=False)
             self.opening_brief_card.hide()
         else:
             self._render_opening_brief()
@@ -3075,6 +3343,109 @@ class EdgeBuildDrawer(QWidget):
             )
         if self._expanded and self.isVisible():
             self._schedule_post_layout_height_sync()
+
+    def set_archetype_options(
+        self,
+        options: list[Any] | tuple[Any, ...],
+        active_profile: str = "",
+        *,
+        is_manual: bool = False,
+    ) -> None:
+        """Render compact multi-archetype switcher pills inside roadmap_card when >= 2 templates exist."""
+        norm_opts: list[tuple[str, str]] = []
+        seen_prof: set[str] = set()
+        for entry in options or ():
+            if isinstance(entry, dict):
+                raw_p = entry.get("profile") or ""
+                raw_l = entry.get("label") or raw_p
+            elif isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                raw_p, raw_l = entry[0], entry[1]
+            else:
+                raw_p = getattr(entry, "profile", "")
+                raw_l = getattr(entry, "label", "") or raw_p
+            p = str(raw_p or "").strip().upper()
+            lbl = str(raw_l or p).strip()
+            if p and p not in seen_prof:
+                seen_prof.add(p)
+                norm_opts.append((p, lbl))
+
+        active_norm = (active_profile or "").strip().upper()
+        self._archetype_options = norm_opts
+        self._archetype_active_profile = active_norm
+        self._archetype_is_manual = bool(is_manual)
+        self._rebuild_archetype_pills(force=False)
+        if self._expanded and self.isVisible():
+            self._schedule_post_layout_height_sync()
+
+    def _rebuild_archetype_pills(self, *, force: bool = False) -> None:
+        if len(self._archetype_options) < 2 or self._is_full_locked:
+            self._last_archetype_sig = None
+            for btn in self._archetype_btns:
+                self.archetype_bar_lay.removeWidget(btn)
+                btn.deleteLater()
+            self._archetype_btns.clear()
+            self.archetype_bar_wrap.hide()
+            return
+
+        fs = self._fs(9)
+        pad_x = self._px(6)
+        btn_h = self._px(18, floor=16)
+        sig = (
+            tuple(self._archetype_options),
+            self._archetype_active_profile,
+            self._archetype_is_manual,
+            fs,
+            pad_x,
+            btn_h,
+        )
+        if not force and sig == self._last_archetype_sig:
+            if self.archetype_bar_wrap.isHidden():
+                self.archetype_bar_wrap.show()
+            return
+        self._last_archetype_sig = sig
+
+        for btn in self._archetype_btns:
+            self.archetype_bar_lay.removeWidget(btn)
+            btn.deleteLater()
+        self._archetype_btns.clear()
+
+        active_qss = (
+            "QPushButton { background-color: rgba(10, 200, 185, 65); border: 1px solid #0AC8B9; "
+            f"color: #F0E6D2; font-weight: bold; font-size: {fs}px; padding: 0px {pad_x}px; border-radius: 2px; }}"
+        )
+        idle_qss = (
+            "QPushButton { background-color: rgba(8, 18, 32, 195); border: 1px solid #463714; "
+            f"color: #A09B8C; font-size: {fs}px; padding: 0px {pad_x}px; border-radius: 2px; }}"
+            "QPushButton:hover { border-color: #C8AA6E; color: #F0E6D2; }"
+        )
+
+        # Insert before trailing stretch item (index 1+)
+        for prof, label in self._archetype_options:
+            is_active = prof == self._archetype_active_profile
+            text = f"◆ {label}" if (is_active and self._archetype_is_manual) else label
+            btn = QPushButton(text)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(btn_h)
+            btn.setProperty("archetype_profile", prof)
+            btn.setStyleSheet(active_qss if is_active else idle_qss)
+            btn.setToolTip(
+                "已手动锁定当前流派（点击可恢复自动切换）"
+                if (is_active and self._archetype_is_manual)
+                else f"点击切换为【{label}】出装路线与参谋推荐"
+            )
+            btn.clicked.connect(lambda _checked=False, p=prof: self._handle_archetype_click(p))
+            insert_idx = max(1, self.archetype_bar_lay.count() - 1)
+            self.archetype_bar_lay.insertWidget(insert_idx, btn)
+            self._archetype_btns.append(btn)
+
+        self.archetype_bar_lbl.setText("流派·手动" if self._archetype_is_manual else "流派")
+        self.archetype_bar_wrap.show()
+
+    def _handle_archetype_click(self, profile: str) -> None:
+        self._emit_subcard_action("archetype_pill", "click", {"profile": profile})
+        if self._on_select_archetype:
+            self._on_select_archetype(str(profile or "").strip().upper())
 
     def _on_brief_auto_collapse_timeout(self) -> None:
         if not self._expanded:
@@ -3463,11 +3834,58 @@ class EdgeBuildDrawer(QWidget):
             int(geo.bottom() * dpr) + 6,
         )
 
+    def _on_transmute_search_text_edited(self, text: str) -> None:
+        if self._updating_combos:
+            return
+        self._rebuild_transmute_combo_items(text)
+
+    def _rebuild_transmute_combo_items(self, query: str = "") -> None:
+        q = (query or "").strip()
+        le = self.transmute_combo.lineEdit()
+        saved_text = le.text() if le is not None else ""
+        saved_cursor = le.cursorPosition() if le is not None else 0
+        self.transmute_combo.blockSignals(True)
+        if le is not None:
+            le.blockSignals(True)
+        try:
+            self.transmute_combo.clear()
+            if not q:
+                for aid, nm, rlabel, _py in self._transmute_candidates:
+                    disp = f"{nm} ({rlabel})" if rlabel else nm
+                    self.transmute_combo.addItem(disp, aid)
+            else:
+                scored: list[tuple[int, int, str, str, str]] = []
+                for order_idx, (aid, nm, rlabel, _py) in enumerate(self._transmute_candidates):
+                    matched, score = matches_augment_query(nm, rlabel, q, alt_name=self._aug_alt_names.get(aid, ""))
+                    if matched:
+                        scored.append((-score, order_idx, aid, nm, rlabel))
+                scored.sort()
+                for _neg_s, _oi, aid, nm, rlabel in scored:
+                    disp = f"{nm} ({rlabel})" if rlabel else nm
+                    self.transmute_combo.addItem(disp, aid)
+            self.transmute_combo.setCurrentIndex(-1)
+            if le is not None and saved_text:
+                le.setText(saved_text)
+                le.setCursorPosition(min(saved_cursor, len(saved_text)))
+        finally:
+            if le is not None:
+                le.blockSignals(False)
+            self.transmute_combo.blockSignals(False)
+
     def set_pending_transmute(self, pending: PendingTransmute | None, store: DataStore | None = None) -> None:
         """Show/hide secondary transmute recognition bar with rarity-filtered fallback selector."""
         self._pending_transmute = pending
         if pending is None or pending.remaining_count <= 0:
+            was_shown = not self.transmute_bar.isHidden()
+            self._transmute_candidates = []
             self.transmute_bar.hide()
+            if (
+                was_shown
+                and self._text_input_active
+                and self.aug_manual_row.isHidden()
+                and self.item_manual_row.isHidden()
+            ):
+                self._exit_text_input_mode(restore_game=True)
             if self._expanded and self.isVisible():
                 self._reposition_right_edge()
             return
@@ -3475,30 +3893,45 @@ class EdgeBuildDrawer(QWidget):
         done = len(pending.resolved_ids)
         total = max(1, pending.expected_count)
         rarity_zh = RARITY_COLORS.get(pending.target_rarity or "", ("", "任意阶"))[1]
+        src_disp = (
+            store.display_augment_name(pending.source_augment_id, pending.source_name)
+            if store is not None
+            else pending.source_name
+        )
         if done > 0 and store is not None:
             got_names = "+".join(
-                (store.get_augment(a).name if store.get_augment(a) else a) for a in pending.resolved_ids
+                store.display_augment_name(a, store.get_augment(a).name if store.get_augment(a) else a)
+                for a in pending.resolved_ids
             )
-            txt = f"⚡ {pending.source_name} ({done}/{total}) 已识:{_clip_text(got_names, 8)} · 悬停第{done + 1}个"
+            txt = f"⚡ {src_disp} ({done}/{total}) 已识:{_clip_text(got_names, 8)} · 悬停第{done + 1}个"
         else:
-            txt = f"⚡ {pending.source_name} ({done}/{total}) · 悬停新符文图标自动识别"
+            txt = f"⚡ {src_disp} ({done}/{total}) · 悬停新符文图标自动识别"
         self.transmute_status_lbl.setText(txt)
 
         if store is not None:
-            self.transmute_combo.clear()
+            self._store_ref = store
             owned = set(self._selected_augments) | set(pending.resolved_ids)
-            for aug in sorted(store.all_augments(), key=lambda a: a.name):
+            entries: list[tuple[str, str, str, str]] = []
+            for aug in store.all_augments():
                 if aug.augment_id in NON_TARGET_AUGMENT_IDS or aug.augment_id in owned:
                     continue
                 if pending.target_rarity and aug.rarity != pending.target_rarity:
                     continue
+                self._aug_alt_names[aug.augment_id] = aug.name
+                disp_nm = store.display_augment_name(aug.augment_id, aug.name)
                 rlabel = RARITY_COLORS.get(aug.rarity, ("", ""))[1]
-                self.transmute_combo.addItem(f"{aug.name} ({rlabel})", aug.augment_id)
-            self.transmute_combo.setCurrentIndex(-1)
+                entries.append((aug.augment_id, disp_nm, rlabel, to_pinyin_initials(disp_nm)))
+            entries.sort(key=lambda e: (_AUGMENT_RARITY_ORDER.get(e[2], 9), e[3], e[1]))
+            self._transmute_candidates = entries
+            self._clear_combo_input(self.transmute_combo)
+            self._rebuild_transmute_combo_items("")
             if self.transmute_combo.lineEdit():
                 self.transmute_combo.lineEdit().setPlaceholderText(f"手选{rarity_zh}质变结果...")
 
+        was_hidden = self.transmute_bar.isHidden()
         self.transmute_bar.show()
+        if was_hidden and self._expanded:
+            self._enter_text_input_mode(self.transmute_combo.lineEdit())
         if self._expanded and self.isVisible():
             self._reposition_right_edge()
 
@@ -3559,9 +3992,14 @@ class EdgeBuildDrawer(QWidget):
             lbl.setStyleSheet(f"border: none; background: transparent; color: #A09B8C; font-size: {m.font_px(10)}px;")
             self.quick_confirm_lay.addWidget(lbl)
             for aug in alts[:2]:
-                btn = QPushButton(_clip_text(aug.name, 7))
+                disp_a = (
+                    self._store_ref.display_augment_name(aug.augment_id, aug.name)
+                    if self._store_ref is not None
+                    else aug.name
+                )
+                btn = QPushButton(_clip_text(disp_a, 7))
                 btn.setFixedHeight(m.px(20, floor=18))
-                btn.setToolTip(f"若自动记错，点此替换为【{aug.name}】")
+                btn.setToolTip(f"若自动记错，点此替换为【{disp_a}】")
                 btn.setStyleSheet(
                     f"QPushButton {{ padding: 0px {m.px(6)}px; font-size: {m.font_px(10)}px; border: 1px solid #475569; color: #CBD5E1; }}"
                     "QPushButton:hover { border-color: #0AC8B9; color: #F0E6D2; }"
@@ -3594,7 +4032,7 @@ class EdgeBuildDrawer(QWidget):
         if self._quick_confirm_timer.isActive():
             self._quick_confirm_timer.stop()
         unrecorded = [a for a in self._recent_offered if a.augment_id not in self._selected_augments]
-        if not unrecorded or len(unrecorded) < len(self._recent_offered) or len(self._selected_augments) >= 4:
+        if not unrecorded or len(unrecorded) < len(self._recent_offered) or len(self._selected_augments) >= 6:
             self.quick_confirm_wrap.hide()
             return
         lbl = QLabel("刚选了:")
@@ -3603,9 +4041,14 @@ class EdgeBuildDrawer(QWidget):
         shown_unrec = unrecorded[:4]
         clip_len = 5 if len(shown_unrec) >= 4 else 6
         for aug in shown_unrec:
-            btn = QPushButton(_clip_text(aug.name, clip_len))
+            disp_u = (
+                self._store_ref.display_augment_name(aug.augment_id, aug.name)
+                if self._store_ref is not None
+                else aug.name
+            )
+            btn = QPushButton(_clip_text(disp_u, clip_len))
             btn.setFixedHeight(m.px(20, floor=18))
-            btn.setToolTip(f"点选记录【{aug.name}】")
+            btn.setToolTip(f"点选记录【{disp_u}】")
             btn.setStyleSheet(
                 f"QPushButton {{ padding: 0px {m.px(5)}px; font-size: {m.font_px(10)}px; border: 1px solid #C89B3C; color: #F0E6D2; }}"
                 "QPushButton:hover { border-color: #0AC8B9; background: rgba(10, 200, 185, 45); }"
@@ -3640,6 +4083,108 @@ class EdgeBuildDrawer(QWidget):
         if self._on_replace_last_augment:
             self._on_replace_last_augment(aug_id)
 
+    def _on_aug_search_text_edited(self, text: str) -> None:
+        if self._updating_combos:
+            return
+        self._rebuild_aug_combo_items(text)
+
+    def _rebuild_aug_combo_items(self, query: str = "") -> None:
+        q = (query or "").strip()
+        le = self.aug_add_combo.lineEdit()
+        saved_text = le.text() if le is not None else ""
+        saved_cursor = le.cursorPosition() if le is not None else 0
+        self.aug_add_combo.blockSignals(True)
+        if le is not None:
+            le.blockSignals(True)
+        try:
+            self.aug_add_combo.clear()
+            if not q:
+                selected_set = set(self._selected_augments)
+                entry_by_id = {aid: (aid, nm, rlabel, py) for aid, nm, rlabel, py in self._all_augment_entries}
+                seen_pinned: set[str] = set()
+                for raw_aid in self._recent_unrecorded_augments:
+                    aid = str(raw_aid or "").strip()
+                    if not aid or aid in selected_set or aid in seen_pinned:
+                        continue
+                    entry = entry_by_id.get(aid)
+                    if entry is None:
+                        continue
+                    seen_pinned.add(aid)
+                    _, nm, rlabel, _ = entry
+                    disp = f"★ 近期出现 · {nm} ({rlabel})" if rlabel else f"★ 近期出现 · {nm}"
+                    self.aug_add_combo.addItem(disp, aid)
+                for aid, nm, rlabel, _py in self._all_augment_entries:
+                    if aid in seen_pinned:
+                        continue
+                    disp = f"{nm} ({rlabel})" if rlabel else nm
+                    self.aug_add_combo.addItem(disp, aid)
+            else:
+                scored: list[tuple[int, int, str, str, str]] = []
+                for order_idx, (aid, nm, rlabel, _py) in enumerate(self._all_augment_entries):
+                    matched, score = matches_augment_query(nm, rlabel, q, alt_name=self._aug_alt_names.get(aid, ""))
+                    if matched:
+                        scored.append((-score, order_idx, aid, nm, rlabel))
+                scored.sort()
+                for _neg_s, _oi, aid, nm, rlabel in scored:
+                    disp = f"{nm} ({rlabel})" if rlabel else nm
+                    self.aug_add_combo.addItem(disp, aid)
+            self.aug_add_combo.setCurrentIndex(-1)
+            if le is not None and saved_text:
+                le.setText(saved_text)
+                le.setCursorPosition(min(saved_cursor, len(saved_text)))
+        finally:
+            if le is not None:
+                le.blockSignals(False)
+            self.aug_add_combo.blockSignals(False)
+
+    def _resolve_augment_id_from_input(
+        self,
+        combo: QComboBox,
+        candidates: list[tuple[str, str, str, str]],
+        *,
+        target_rarity: str | None = None,
+    ) -> str:
+        idx = combo.currentIndex()
+        txt = combo.currentText().strip()
+        if idx >= 0:
+            item_txt = combo.itemText(idx).strip()
+            item_aid = str(combo.itemData(idx) or "").strip()
+            if item_aid and (not txt or txt == item_txt):
+                return item_aid
+        if not txt:
+            return ""
+        clean = txt
+        if clean.startswith("★ 近期出现 · "):
+            clean = clean[len("★ 近期出现 · "):].strip()
+        if " (" in clean and clean.endswith(")"):
+            clean = clean.rsplit(" (", 1)[0].strip()
+
+        pool = list(candidates)
+        if not pool and self._store_ref is not None:
+            for aug in self._store_ref.all_augments():
+                if target_rarity and aug.rarity != target_rarity:
+                    continue
+                self._aug_alt_names[aug.augment_id] = aug.name
+                disp_nm = self._store_ref.display_augment_name(aug.augment_id, aug.name)
+                rlabel = RARITY_COLORS.get(aug.rarity, ("", ""))[1]
+                pool.append((aug.augment_id, disp_nm, rlabel, to_pinyin_initials(disp_nm)))
+            pool.sort(key=lambda e: (_AUGMENT_RARITY_ORDER.get(e[2], 9), e[3], e[1]))
+
+        clean_l = clean.lower()
+        for aid, nm, _rlabel, _py in pool:
+            alt_n = self._aug_alt_names.get(aid, "")
+            if nm.lower() == clean_l or (alt_n and alt_n.lower() == clean_l):
+                return aid
+
+        best_aid = ""
+        best_score = 0
+        for aid, nm, rlabel, _py in pool:
+            matched, score = matches_augment_query(nm, rlabel, clean, alt_name=self._aug_alt_names.get(aid, ""))
+            if matched and score > best_score:
+                best_score = score
+                best_aid = aid
+        return best_aid
+
     def populate_catalogs(self, store: DataStore, datasets: list[DatasetDescriptor]) -> None:
         self._store_ref = store
         self._updating_combos = True
@@ -3653,36 +4198,56 @@ class EdgeBuildDrawer(QWidget):
                 if ds.bands:
                     self.dataset_combo.addItem(f"{disp} · 前5%高分段", (ds.patch, ds.mode, "high"))
 
-            self.aug_add_combo.clear()
-            for aug in sorted(store.all_augments(), key=lambda a: a.name):
+            entries: list[tuple[str, str, str, str]] = []
+            alt_map: dict[str, str] = {}
+            for aug in store.all_augments():
+                alt_map[aug.augment_id] = aug.name
+                disp_nm = store.display_augment_name(aug.augment_id, aug.name)
                 rlabel = RARITY_COLORS.get(aug.rarity, ("", ""))[1]
-                self.aug_add_combo.addItem(f"{aug.name} ({rlabel})", aug.augment_id)
-            self.aug_add_combo.setCurrentIndex(-1)
+                initials = to_pinyin_initials(disp_nm)
+                entries.append((aug.augment_id, disp_nm, rlabel, initials))
+            entries.sort(key=lambda e: (_AUGMENT_RARITY_ORDER.get(e[2], 9), e[3], e[1]))
+            self._aug_alt_names = alt_map
+            self._all_augment_entries = entries
+            self._rebuild_aug_combo_items("")
 
             self.hero_combo.clear()
-            for h in sorted(store.all_heroes(), key=lambda x: x.name):
-                self.hero_combo.addItem(h.name, h.hero_id)
+            heroes_disp = [
+                (h.hero_id, store.display_hero_name(h.hero_id, h.name))
+                for h in store.all_heroes()
+            ]
+            heroes_disp.sort(key=lambda x: x[1])
+            for hid_c, hdisp in heroes_disp:
+                self.hero_combo.addItem(hdisp, hid_c)
             self.hero_combo.setCurrentIndex(-1)
 
             self.item_add_combo.clear()
             items_sorted = sorted(
                 (
-                    info
+                    (
+                        str(info.item_id),
+                        int(getattr(info, "gold", 0) or 0),
+                        store.display_item_name(info.item_id, info.name),
+                    )
                     for info in store.static.items.values()
                     if info.name and int(getattr(info, "gold", 0) or 0) >= 300 and str(info.item_id) not in ("2052", "220013")
                 ),
-                key=lambda x: (-int(getattr(x, "gold", 0) or 0), x.name),
+                key=lambda x: (-x[1], x[2]),
             )
-            for info in items_sorted:
-                self.item_add_combo.addItem(f"{info.name} ({int(getattr(info, 'gold', 0) or 0)}G)", str(info.item_id))
+            for iid_c, gold_c, disp_ic in items_sorted:
+                self.item_add_combo.addItem(f"{disp_ic} ({gold_c}G)", iid_c)
             self.item_add_combo.setCurrentIndex(-1)
         finally:
             self._updating_combos = False
 
     def _toggle_manual_item_picker(self) -> None:
-        show = not self.item_manual_row.isVisible()
+        show = self.item_manual_row.isHidden()
         self.item_manual_row.setVisible(show)
         self._emit_subcard_action("degraded_sync", "toggle_item_picker", {"visible": show})
+        if show:
+            self._enter_text_input_mode(self.item_add_combo.lineEdit())
+        else:
+            self._exit_text_input_mode(restore_game=True)
         if self._expanded and self.isVisible():
             self._reposition_right_edge()
         if show:
@@ -3696,15 +4261,22 @@ class EdgeBuildDrawer(QWidget):
         if not item_id and self._store_ref is not None:
             txt = self.item_add_combo.currentText().strip()
             if txt:
+                clean_it = txt.rsplit(" (", 1)[0].strip() if (" (" in txt and txt.endswith(")")) else txt
                 for iid, info in self._store_ref.static.items.items():
-                    if info.name and (txt == info.name or txt in info.name):
+                    disp_i = self._store_ref.display_item_name(iid, info.name)
+                    if (info.name and (clean_it == info.name or clean_it in info.name)) or (
+                        disp_i and (clean_it == disp_i or clean_it in disp_i)
+                    ):
                         item_id = str(iid)
                         break
-        if item_id and self._on_manual_add_item:
-            self._on_manual_add_item(item_id)
-            self.item_add_combo.setCurrentIndex(-1)
-            if self.item_add_combo.lineEdit():
-                self.item_add_combo.lineEdit().clear()
+        if item_id:
+            if self._on_manual_add_item:
+                self._on_manual_add_item(item_id)
+            self._clear_combo_input(self.item_add_combo)
+            self.item_manual_row.hide()
+            self._exit_text_input_mode(restore_game=True)
+            if self._expanded and self.isVisible():
+                self._reposition_right_edge()
 
     def _handle_plan_b_rescan(self) -> None:
         if self._rescan_cooldown_timer.isActive():
@@ -3737,8 +4309,16 @@ class EdgeBuildDrawer(QWidget):
         self.degraded_sync_frame.setToolTip(hint_txt)
 
         if not active or self._is_full_locked:
+            was_item_open = not self.item_manual_row.isHidden()
             self.degraded_sync_frame.hide()
             self.item_manual_row.hide()
+            if (
+                was_item_open
+                and self._text_input_active
+                and self.aug_manual_row.isHidden()
+                and self.transmute_bar.isHidden()
+            ):
+                self._exit_text_input_mode(restore_game=True)
         else:
             self._render_degraded_item_chips()
             self.degraded_sync_frame.show()
@@ -3786,6 +4366,7 @@ class EdgeBuildDrawer(QWidget):
         dynamic_recs: list[DynamicItemRec],
         next_plan: NextBuyPlan | None = None,
     ) -> None:
+        prev_selected = list(self._selected_augments)
         self._store_ref = store
         self._hero_id = hero_id
         self._selected_augments = list(selected_augments)
@@ -3797,8 +4378,9 @@ class EdgeBuildDrawer(QWidget):
 
         hero = store.get_hero(hero_id) if hero_id else None
         if hero:
-            self.hero_lbl.setText(f"{hero.name} {hero.win_rate * 100:.1f}%")
-            self.pill_hero_lbl.setText(hero.name[:1])
+            h_disp = store.display_hero_name(hero.hero_id, hero.name)
+            self.hero_lbl.setText(f"{h_disp} {hero.win_rate * 100:.1f}%")
+            self.pill_hero_lbl.setText(h_disp[:1])
         else:
             self.hero_lbl.setText("未锁定英雄")
             self.pill_hero_lbl.setText("海")
@@ -3818,12 +4400,20 @@ class EdgeBuildDrawer(QWidget):
         self._render_decision_cards()
         self._render_augment_chips(store)
         self._rebuild_quick_confirm()
+        if (
+            prev_selected != self._selected_augments
+            and self._all_augment_entries
+            and not (self._text_input_active and self.aug_add_combo.currentText().strip())
+        ):
+            le = self.aug_add_combo.lineEdit()
+            cur_q = le.text() if le is not None else ""
+            self._rebuild_aug_combo_items(cur_q)
 
         if hero_id and DESTINY_AUGMENT_ID in selected_augments:
             d_recs = rank_destiny_items(store, hero_id, limit=2)
             if d_recs:
                 d_lines = [
-                    f"{'✓' if item_is_owned(d.item_id, my_items) else ''}{_short_item_name(d.name)} {d.win_rate * 100:.0f}%"
+                    f"{'✓' if item_is_owned(d.item_id, my_items) else ''}{_short_item_name(store.display_item_name(d.item_id, d.name))} {d.win_rate * 100:.0f}%"
                     for d in d_recs
                 ]
                 self.destiny_body_lbl.setText("  |  ".join(d_lines))
@@ -3840,6 +4430,8 @@ class EdgeBuildDrawer(QWidget):
             self._sync_seal_slots()
         if self.isVisible():
             self._reposition_right_edge()
+            if self._expanded and len(prev_selected) != len(self._selected_augments):
+                self._schedule_post_layout_height_sync()
 
     def _find_item_id_by_name(self, name: str) -> str:
         if self._store_ref is None or not name:
@@ -3847,14 +4439,20 @@ class EdgeBuildDrawer(QWidget):
         for iid, info in self._store_ref.static.items.items():
             if info.name == name:
                 return iid
+        if self._store_ref.client_locale != "zh_cn":
+            for iid, info in self._store_ref.static.items.items():
+                if self._store_ref.display_item_name(iid, info.name) == name:
+                    return iid
         return ""
 
     def _render_decision_cards(self) -> None:
         if self._is_full_locked:
             self.radar_card.hide()
             self.opening_brief_card.hide()
+            self.next_aug_goal_lbl.hide()
             self.next_buy_card.hide()
             self.roadmap_card.hide()
+            self.archetype_bar_wrap.hide()
             self.destiny_card.hide()
             self.aug_frame.hide()
             self.pill_item_ring.set_state(load_app_pixmap(28), progress=0.0, ready=False, fallback_text="锁")
@@ -3927,7 +4525,7 @@ class EdgeBuildDrawer(QWidget):
 
                                 coach_primary = CoachAdviceItem(
                                     item_id=locked_norm,
-                                    name=linfo.name,
+                                    name=store.display_item_name(locked_norm, linfo.name),
                                     priority="锁定下件",
                                     reason="延续本局既定路线",
                                 )
@@ -3954,7 +4552,11 @@ class EdgeBuildDrawer(QWidget):
 
         if coach_primary is not None:
             target_id = coach_primary.item_id or self._find_item_id_by_name(coach_primary.name)
-            target_name = coach_primary.name
+            target_name = (
+                store.display_item_name(target_id, coach_primary.name)
+                if (store and target_id)
+                else coach_primary.name
+            )
             target_norm = normalize_item_id(target_id)
             eff_cost, eff_aff, eff_gap, live_hint = (
                 compute_item_buy_now(store, target_id, self._my_items, self._my_gold)
@@ -3982,17 +4584,25 @@ class EdgeBuildDrawer(QWidget):
                 and coach_primary is adv.next_items[0]
             )
             buy_txt = adv.buy_now if use_coach_buy_now else (live_hint or f"目标：{target_name}")
+            if store and store.client_locale != "zh_cn" and coach_primary.name and target_name != coach_primary.name:
+                buy_txt = buy_txt.replace(coach_primary.name, target_name)
             self.buy_now_lbl.setText(f"💰 {_clip_text(buy_txt, buy_chars)}")
             self.buy_now_lbl.setToolTip(buy_txt)
 
             if coach_backup is not None:
-                self.backup_item_lbl.setText(f"备选：{_short_item_name(coach_backup.name)}")
-                self.backup_item_lbl.setToolTip(f"{coach_backup.name}：{coach_backup.reason}")
+                bak_id = coach_backup.item_id or self._find_item_id_by_name(coach_backup.name)
+                bak_disp = (
+                    store.display_item_name(bak_id, coach_backup.name)
+                    if (store and bak_id)
+                    else coach_backup.name
+                )
+                self.backup_item_lbl.setText(f"备选：{_short_item_name(bak_disp)}")
+                self.backup_item_lbl.setToolTip(f"{bak_disp}：{coach_backup.reason}")
             else:
                 self.backup_item_lbl.setText("")
         elif plan is not None:
             target_id = plan.target.item_id
-            target_name = plan.target.name
+            target_name = store.display_item_name(target_id, plan.target.name) if store else plan.target.name
             pill_eff_cost, pill_aff, pill_gap = plan.effective_cost, plan.affordable_now, plan.gold_gap
             if is_full_build and normalize_item_id(target_id) in ELIXIR_IDS:
                 self.next_item_title_lbl.setText(f"✓ 六神满格 · {target_name}")
@@ -4003,12 +4613,20 @@ class EdgeBuildDrawer(QWidget):
             reason_raw = "；".join(plan.target.reasons)
             self.next_reason_lbl.setText(_clip_text(reason_raw, reason_chars))
             self.next_reason_lbl.setToolTip(reason_raw)
-            self.buy_now_lbl.setText(f"💰 {_clip_text(plan.buy_now_hint, buy_chars)}")
-            self.buy_now_lbl.setToolTip(plan.buy_now_hint)
+            buy_hint_disp = plan.buy_now_hint
+            if store and store.client_locale != "zh_cn" and plan.target.name and target_name != plan.target.name:
+                buy_hint_disp = buy_hint_disp.replace(plan.target.name, target_name)
+            self.buy_now_lbl.setText(f"💰 {_clip_text(buy_hint_disp, buy_chars)}")
+            self.buy_now_lbl.setToolTip(buy_hint_disp)
             if plan.backup is not None:
                 lbl_prefix = "卖鞋可换：" if is_full_build else "备选："
-                self.backup_item_lbl.setText(f"{lbl_prefix}{_short_item_name(plan.backup.name)}")
-                self.backup_item_lbl.setToolTip(f"{plan.backup.name}（{plan.backup.price}G）")
+                bak_disp = (
+                    store.display_item_name(plan.backup.item_id, plan.backup.name)
+                    if store
+                    else plan.backup.name
+                )
+                self.backup_item_lbl.setText(f"{lbl_prefix}{_short_item_name(bak_disp)}")
+                self.backup_item_lbl.setToolTip(f"{bak_disp}（{plan.backup.price}G）")
             else:
                 self.backup_item_lbl.setText("")
         else:
@@ -4058,18 +4676,19 @@ class EdgeBuildDrawer(QWidget):
         if store is not None:
             for iid in self._my_items:
                 info = store.get_item_info(iid)
-                if (info.category == "complete_equipment" or info.gold >= 2200) and info.name not in seen_names:
-                    seen_names.add(info.name)
-                    steps_visual.append((normalize_item_id(iid), info.name, "owned"))
-            if inv is not None and inv.is_full_build_with_boots and inv.tier2_boots_id and inv.tier2_boots_name not in seen_names:
-                seen_names.add(inv.tier2_boots_name)
-                steps_visual.append((inv.tier2_boots_id, inv.tier2_boots_name, "owned"))
+                disp_it = store.display_item_name(iid, info.name)
+                if (info.category == "complete_equipment" or info.gold >= 2200) and disp_it not in seen_names:
+                    seen_names.add(disp_it)
+                    steps_visual.append((normalize_item_id(iid), disp_it, "owned"))
+            if inv is not None and inv.is_full_build_with_boots and inv.tier2_boots_id:
+                disp_boot = store.display_item_name(inv.tier2_boots_id, inv.tier2_boots_name)
+                if disp_boot not in seen_names:
+                    seen_names.add(disp_boot)
+                    steps_visual.append((inv.tier2_boots_id, disp_boot, "owned"))
 
         def _append_rem(iid_raw: str, nm_raw: str) -> None:
             nm_clean = (nm_raw or "").strip()
             if not nm_clean or nm_clean.startswith("装备#"):
-                return
-            if nm_clean in seen_names or any(n == nm_clean for _, n in rem_pairs):
                 return
             nid = normalize_item_id(iid_raw) if iid_raw else self._find_item_id_by_name(nm_clean)
             if store is not None and nid:
@@ -4080,9 +4699,9 @@ class EdgeBuildDrawer(QWidget):
                     return
                 if info.category in ("consumable", "boots") or (info.category != "complete_equipment" and info.gold < 2200):
                     return
-                nm_clean = info.name
-                if nm_clean in seen_names or any(n == nm_clean for _, n in rem_pairs):
-                    return
+                nm_clean = store.display_item_name(nid, info.name)
+            if nm_clean in seen_names or any(n == nm_clean for _, n in rem_pairs):
+                return
             rem_pairs.append((nid, nm_clean))
 
         rem_pairs: list[tuple[str, str]] = []
@@ -4090,7 +4709,7 @@ class EdgeBuildDrawer(QWidget):
             if self._committed_plan and store is not None:
                 for iid in self._committed_plan:
                     if not item_is_owned(iid, self._my_items):
-                        _append_rem(iid, store.get_item_info(iid).name)
+                        _append_rem(iid, store.display_item_name(iid, store.get_item_info(iid).name))
             if adv and adv.build_path:
                 for nm in adv.build_path:
                     _append_rem("", nm)
@@ -4146,14 +4765,20 @@ class EdgeBuildDrawer(QWidget):
 
         # Update compact tactical micro-bar (counter Tier-2 boots + top enemy threat KDA/spells or collapsed radar)
         boots_txt = ""
+        boots_disp = ""
         if plan is not None and not is_full_build and plan.recommended_boots_name:
-            short_boot = _short_item_name(plan.recommended_boots_name)
+            boots_disp = (
+                store.display_item_name(plan.recommended_boots_id, plan.recommended_boots_name)
+                if (store and plan.recommended_boots_id)
+                else plan.recommended_boots_name
+            )
+            short_boot = _short_item_name(boots_disp)
             boots_txt = f"鞋:{short_boot}({plan.recommended_boots_reason})" if plan.recommended_boots_reason else f"鞋:{short_boot}"
         if boots_txt:
             clipped_boots = _clip_text(boots_txt, boots_chars)
             if self.boots_hint_lbl.text() != clipped_boots:
                 self.boots_hint_lbl.setText(clipped_boots)
-            boots_tip = f"推荐二级鞋：{plan.recommended_boots_name}（{plan.recommended_boots_reason}）"
+            boots_tip = f"推荐二级鞋：{boots_disp}（{plan.recommended_boots_reason}）"
             if self.boots_hint_lbl.toolTip() != boots_tip:
                 self.boots_hint_lbl.setToolTip(boots_tip)
             if self.boots_hint_lbl.isHidden():
@@ -4178,6 +4803,26 @@ class EdgeBuildDrawer(QWidget):
             txt = "\n".join(lines) if lines else "参谋已同步当前局势"
             self.coach_content_lbl.setText(txt)
             self.coach_content_lbl.setToolTip(adv.tactical_summary or adv.augment_pick_advice or txt)
+
+        # P0-7: 1-line next_augment_goal capsule (shown only when non-empty and < 4 augments)
+        raw_goal = str(getattr(adv, "next_augment_goal", "") or "").strip() if adv is not None else ""
+        if raw_goal and len(self._selected_augments) < 4:
+            goal_cap = max(24, int((norm_w - 36.0) / 8.5))
+            goal_txt = f"下轮海克斯：{_clip_text(raw_goal, goal_cap)}"
+            goal_tip = f"下轮海克斯：{raw_goal}"
+            if self.next_aug_goal_lbl.text() != goal_txt:
+                self.next_aug_goal_lbl.setText(goal_txt)
+            if self.next_aug_goal_lbl.toolTip() != goal_tip:
+                self.next_aug_goal_lbl.setToolTip(goal_tip)
+            if self.next_aug_goal_lbl.isHidden():
+                self.next_aug_goal_lbl.show()
+        else:
+            if self.next_aug_goal_lbl.text():
+                self.next_aug_goal_lbl.setText("")
+            if self.next_aug_goal_lbl.toolTip():
+                self.next_aug_goal_lbl.setToolTip("")
+            if not self.next_aug_goal_lbl.isHidden():
+                self.next_aug_goal_lbl.hide()
 
     def _set_cost_badge(self, eff_cost: int, affordable: bool, gap: int) -> None:
         self._cost_badge_state = (eff_cost, affordable, gap) if eff_cost > 0 else None
@@ -4313,15 +4958,26 @@ class EdgeBuildDrawer(QWidget):
         self.roadmap_icons_lay.addStretch(1)
 
     def _render_augment_chips(self, store: DataStore) -> None:
-        # Sync collapsed pill 4 rarity dots
+        # Sync collapsed pill rarity dots (4 base always shown + 5th/6th shown on demand)
+        aug_cnt = len(self._selected_augments)
+        extra_slots = aug_cnt > 4
+        dot_sz = 5 if extra_slots else 6
+        dot_rad = 2 if extra_slots else 3
+        self._pill_dots_lay.setSpacing(2 if extra_slots else 3)
         for i, dot in enumerate(self._pill_aug_dots):
-            if i < len(self._selected_augments):
+            if dot.width() != dot_sz or dot.height() != dot_sz:
+                dot.setFixedSize(dot_sz, dot_sz)
+            if i < 4 or i < aug_cnt:
+                dot.show()
+            else:
+                dot.hide()
+            if i < aug_cnt:
                 aid_d = self._selected_augments[i]
                 aug_d = store.get_augment(aid_d)
                 dc = "#E879F9" if is_transmute_augment(aid_d) else RARITY_COLORS.get(aug_d.rarity if aug_d else "gold", ("#C89B3C", ""))[0]
-                dot.setStyleSheet(f"background-color: {dc}; border: none; border-radius: 3px;")
+                dot.setStyleSheet(f"background-color: {dc}; border: none; border-radius: {dot_rad}px;")
             else:
-                dot.setStyleSheet("background-color: #334155; border: none; border-radius: 3px;")
+                dot.setStyleSheet(f"background-color: #334155; border: none; border-radius: {dot_rad}px;")
 
         while self.aug_chips_lay.count():
             it = self.aug_chips_lay.takeAt(0)
@@ -4339,6 +4995,10 @@ class EdgeBuildDrawer(QWidget):
             )
             self.aug_chips_lay.addWidget(empty, 0, 0, 1, 2)
             empty.show()
+            self.aug_chips_lay.invalidate()
+            self.aug_chips_lay.activate()
+            self.aug_chips_wrap.updateGeometry()
+            self.aug_frame.updateGeometry()
             return
 
         sp_db = get_special_augment_db()
@@ -4351,11 +5011,12 @@ class EdgeBuildDrawer(QWidget):
             max_chars = 9 if len(self._selected_augments) <= 2 else 7
         for idx, aid in enumerate(self._selected_augments):
             aug = store.get_augment(aid)
-            name = aug.name if aug else aid
+            name = store.display_augment_name(aid, aug.name if aug else aid)
             is_tx = is_transmute_augment(aid)
             sp = sp_db.get_by_id(aid)
             if is_tx:
-                disp_name = f"⚡{_clip_text(name.replace('质变：', '质变'), max_chars)}"
+                tx_short = name.replace("质变：", "质变").replace("質變：", "質變")
+                disp_name = f"⚡{_clip_text(tx_short, max_chars)}"
             elif sp is not None and sp.transformative:
                 disp_name = f"✦{_clip_text(name.replace('，', '').replace('：', ''), max_chars)}"
             else:
@@ -4396,33 +5057,41 @@ class EdgeBuildDrawer(QWidget):
             chip.show()
         for col_i in range(3):
             self.aug_chips_lay.setColumnStretch(col_i, 1 if col_i < cols else 0)
+        self.aug_chips_lay.invalidate()
+        self.aug_chips_lay.activate()
+        self.aug_chips_wrap.updateGeometry()
+        self.aug_frame.updateGeometry()
 
     def _handle_manual_resolve_transmute(self) -> None:
-        idx = self.transmute_combo.currentIndex()
-        aid = self.transmute_combo.itemData(idx) if idx >= 0 else None
-        if not aid:
-            txt = self.transmute_combo.currentText().strip()
-            if txt and self._store_ref is not None:
-                clean = txt.split(" (")[0].strip()
-                for aug in self._store_ref.all_augments():
-                    if aug.name == clean:
-                        aid = aug.augment_id
-                        break
-        if aid and self._on_resolve_transmute:
-            self._on_resolve_transmute(str(aid))
+        target_rar = self._pending_transmute.target_rarity if self._pending_transmute is not None else None
+        aid = self._resolve_augment_id_from_input(
+            self.transmute_combo,
+            self._transmute_candidates,
+            target_rarity=target_rar,
+        )
+        if aid:
+            if self._on_resolve_transmute:
+                self._on_resolve_transmute(str(aid))
+            self._clear_combo_input(self.transmute_combo)
+            self._exit_text_input_mode(restore_game=True)
 
     def _handle_dismiss_transmute(self) -> None:
         self.transmute_bar.hide()
+        if self._text_input_active and self.aug_manual_row.isHidden() and self.item_manual_row.isHidden():
+            self._exit_text_input_mode(restore_game=True)
         if self._on_dismiss_transmute:
             self._on_dismiss_transmute()
 
     def _handle_manual_add_augment(self) -> None:
-        idx = self.aug_add_combo.currentIndex()
-        if idx >= 0:
-            aid = self.aug_add_combo.itemData(idx)
-            if aid and self._on_select_augment:
+        aid = self._resolve_augment_id_from_input(self.aug_add_combo, self._all_augment_entries)
+        if aid:
+            if self._on_select_augment:
                 self._on_select_augment(str(aid))
-                self.aug_manual_row.hide()
+            self._clear_combo_input(self.aug_add_combo)
+            self.aug_manual_row.hide()
+            self._exit_text_input_mode(restore_game=True)
+            if self._expanded and self.isVisible():
+                self._reposition_right_edge()
 
     def _handle_call_coach(self) -> None:
         self._emit_subcard_action("toolbar_coach_btn", "click", {})

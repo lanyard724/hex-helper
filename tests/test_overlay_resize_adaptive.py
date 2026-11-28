@@ -200,12 +200,12 @@ def test_edge_drawer_resize_adapts_columns_header_and_persists(tmp_path: Path, m
         cols = [drawer.aug_chips_lay.getItemPosition(i)[1] for i in range(drawer.aug_chips_lay.count())]
         return (max(cols) + 1) if cols else 0
 
-    # Expand and resize NARROW (296 x 420; commercial edition elastic cushion may add a few px)
+    # Expand and resize NARROW (296 x 420)
     drawer.set_expanded(True)
     drawer._on_live_resize(QRect(drawer.x(), drawer.y(), 296, 420), "bl")
     app.processEvents()
     assert drawer.width() == 296
-    assert 420 <= drawer.height() <= 460
+    assert drawer.height() == 420
     assert not drawer.hdr_icon.isVisible()
     assert drawer.collapse_btn.text() == "收"
     assert _active_aug_cols() == 2
@@ -672,8 +672,8 @@ def test_desktop_version_updated_to_1_4_6() -> None:
     import hex_helper
     from hex_helper.edition import APP_VERSION
 
-    # Keep APP_VERSION aligned with live manifest (1.5.0) across edition, package, and pyproject
-    assert APP_VERSION == "1.5.0"
+    # Keep APP_VERSION aligned with live manifest (1.5.2) across edition, package, and pyproject
+    assert APP_VERSION == "1.5.2"
     assert hex_helper.__version__ == APP_VERSION
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     assert f'version = "{APP_VERSION}"' in pyproject

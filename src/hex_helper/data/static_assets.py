@@ -24,9 +24,51 @@ CDRAGON_V1_BASE = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-gam
 CDRAGON_ASSET_BASE = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/assets"
 CDRAGON_ITEM_ICON_TMPL = "https://cdn.communitydragon.org/latest/item/{item_id}/icon"
 TENCENT_IMG_BASE = "https://game.gtimg.cn/images/lol/act/img"
+TENCENT_HERO_DETAIL_URL_TMPL = "https://game.gtimg.cn/images/lol/act/img/js/hero/{hero_id}.js"
+TENCENT_SKIN_BIG_URL_TMPL = "https://game.gtimg.cn/images/lol/act/img/skin/big{skin_id}.jpg"
+TENCENT_SKIN_LOADING_URL_TMPL = "https://game.gtimg.cn/images/lol/act/img/skinloading/{skin_id}.jpg"
+TENCENT_SKIN_CENTER_URL_TMPL = "https://game.gtimg.cn/images/lol/act/img/center/{skin_id}.jpg"
+DDRAGON_SKIN_SPLASH_URL_TMPL = "https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{alias}_{skin_num}.jpg"
+DDRAGON_SKIN_LOADING_URL_TMPL = "https://ddragon.leagueoflegends.com/cdn/img/champion/loading/{alias}_{skin_num}.jpg"
 
 ICON_404_NEGATIVE_TTL_S = 6.0 * 3600.0
 ICON_TRANSIENT_FAIL_TTL_S = 300.0
+SKIN_SPLASH_MIN_BYTES = 256
+
+
+def _parse_non_neg_int(val: str | int | float | None) -> int:
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, int):
+        return max(0, val)
+    if isinstance(val, float):
+        return max(0, int(val)) if val == val else 0
+    text = str(val).strip()
+    if not text:
+        return 0
+    try:
+        return max(0, int(text))
+    except ValueError:
+        try:
+            fval = float(text)
+            return max(0, int(fval)) if fval == fval else 0
+        except ValueError:
+            return 0
+
+
+def normalize_skin_id(hero_id: str | int, skin_id: int | str) -> tuple[int, int]:
+    """Normalize (hero_id, skin_num_or_full_id) into (full_skin_id, skin_num)."""
+    hero_int = _parse_non_neg_int(hero_id)
+    raw_skin = _parse_non_neg_int(skin_id)
+    if hero_int <= 0:
+        if raw_skin >= 1000:
+            return raw_skin, raw_skin % 1000
+        return raw_skin, raw_skin
+    if raw_skin == 0:
+        return hero_int * 1000, 0
+    if raw_skin >= 1000:
+        return raw_skin, raw_skin % 1000
+    return hero_int * 1000 + raw_skin, raw_skin
 
 
 def _is_http_404(exc: BaseException) -> bool:
@@ -75,7 +117,7 @@ class StaticAssetsManager:
     def __init__(
         self,
         cache_dir: Path,
-        proxy_url: str = "",
+        proxy_url: str = "http://127.0.0.1:7900",
         fetcher: Callable[[str], bytes] | None = None,
         mirror_base_url: str = "",
     ) -> None:
@@ -88,7 +130,9 @@ class StaticAssetsManager:
         self.mirror_base_url = (mirror_base_url or "").strip().rstrip("/")
         self._custom_fetcher = fetcher
         self._pool_lock = threading.Lock()
+        self._skin_lock = threading.Lock()
         self._http_client: httpx.Client | None = None
+        self._direct_client: httpx.Client | None = None
         self._http_proxy_key: str | None = None
         self._icon_fail_until: dict[tuple[str, str], float] = {}
         self._icon_404_until: dict[tuple[str, str], float] = {}
@@ -125,16 +169,32 @@ class StaticAssetsManager:
                 pass
         return self._http_client
 
+    def _get_direct_client(self) -> httpx.Client:
+        with self._pool_lock:
+            if self._direct_client is not None:
+                return self._direct_client
+            self._direct_client = httpx.Client(
+                proxy=None,
+                trust_env=False,
+                timeout=12.0,
+                follow_redirects=True,
+                headers={"User-Agent": "HexHelper/1.1", "Accept-Encoding": "gzip, deflate"},
+            )
+            return self._direct_client
+
     def close(self) -> None:
         with self._pool_lock:
             old = self._http_client
+            old_direct = self._direct_client
             self._http_client = None
+            self._direct_client = None
             self._http_proxy_key = None
-        if old is not None:
-            try:
-                old.close()
-            except Exception:
-                pass
+        for client in (old, old_direct):
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def _pooled_fetch(self, url: str) -> bytes:
         try:
@@ -292,6 +352,14 @@ class StaticAssetsManager:
             has_gw = (iid in GRIEVOUS_ITEM_IDS) or ("重伤" in desc)
             has_sb = (iid in SHIELD_BREAK_ITEM_IDS) or ("护盾" in desc and "削减" in desc)
             comps = tuple(str(c) for c in (entry.get("from") or []))
+            if entry:
+                gold_dict = entry.get("gold") or {}
+                purchasable = bool(gold_dict.get("purchasable", True))
+                maps = entry.get("maps") or {}
+                aram_flag = bool(maps.get("12", True)) if (isinstance(maps, dict) and maps) else True
+                aram_available = bool(aram_flag and purchasable)
+            else:
+                aram_available = True
             parsed[str(iid)] = ItemStaticInfo(
                 item_id=str(iid),
                 name=name,
@@ -304,6 +372,7 @@ class StaticAssetsManager:
                 has_grievous=has_gw,
                 has_shield_break=has_sb,
                 components=comps,
+                aram_available=aram_available,
             )
         if parsed:
             self.items = parsed
@@ -463,3 +532,352 @@ class StaticAssetsManager:
         else:
             self._icon_fail_until[fail_key] = now + ICON_TRANSIENT_FAIL_TTL_S
         return None
+
+    def _fetch_skin_bytes(self, url: str, *, prefer_direct: bool = True) -> bytes:
+        if self._custom_fetcher is not None or self._fetcher != self._pooled_fetch:
+            return self._fetcher(url)
+        if prefer_direct:
+            return http_get_bytes(url, client=self._get_direct_client())
+        return self._fetcher(url)
+
+    def _load_hero_skins_payload(
+        self,
+        hero_id: str,
+        *,
+        allow_network: bool,
+        full_skin_id: int = 0,
+    ) -> dict | None:
+        safe_hid = "".join(ch for ch in str(hero_id or "").strip() if ch.isalnum() or ch in ("_", "-"))
+        if not safe_hid:
+            return None
+        target = self.static_dir / "hero_skins" / f"{safe_hid}.json"
+
+        cached_payload: dict | None = None
+        with self._skin_lock:
+            if target.is_file():
+                try:
+                    parsed = json.loads(target.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        cached_payload = parsed
+                except Exception:
+                    cached_payload = None
+
+        if cached_payload is not None:
+            if not allow_network:
+                return cached_payload
+            skins = cached_payload.get("skins")
+            if isinstance(skins, list):
+                if full_skin_id <= 0:
+                    return cached_payload
+                target_sid_str = str(full_skin_id)
+                for s in skins:
+                    if isinstance(s, dict) and str(_parse_non_neg_int(s.get("skinId"))) == target_sid_str:
+                        return cached_payload
+
+        if not allow_network:
+            return None
+
+        js_url = TENCENT_HERO_DETAIL_URL_TMPL.format(hero_id=safe_hid)
+        fail_key = ("hero_skins", safe_hid)
+        now = time.monotonic()
+        if self._url_404_until.get(js_url, 0.0) > now or self._icon_fail_until.get(fail_key, 0.0) > now:
+            return cached_payload
+
+        try:
+            raw = self._fetch_skin_bytes(js_url, prefer_direct=True)
+            parsed = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed, dict):
+                with self._skin_lock:
+                    atomic_write_bytes(target, raw)
+                self._url_404_until.pop(js_url, None)
+                self._icon_fail_until.pop(fail_key, None)
+                return parsed
+        except Exception as exc:
+            if _is_http_404(exc):
+                self._url_404_until[js_url] = time.monotonic() + ICON_404_NEGATIVE_TTL_S
+            else:
+                self._icon_fail_until[fail_key] = time.monotonic() + ICON_TRANSIENT_FAIL_TTL_S
+            logger.debug("Hero skin metadata fetch failed for %s: %s", safe_hid, exc)
+        return cached_payload
+
+    @staticmethod
+    def _extract_skin_art_urls(
+        payload: dict | None,
+        hero_id: str,
+        skin_id: int | str,
+    ) -> tuple[int, str, str, str, str, str]:
+        """Return (effective_skin_id, skin_name, main_img, loading_img, center_img, hero_alias) with chroma parent backtracking."""
+        full_skin_id, _ = normalize_skin_id(hero_id, skin_id)
+        if not isinstance(payload, dict):
+            return full_skin_id, "", "", "", "", ""
+
+        hero_block = payload.get("hero")
+        json_alias = str(hero_block.get("alias") or "").strip() if isinstance(hero_block, dict) else ""
+
+        skins_raw = payload.get("skins")
+        if not isinstance(skins_raw, list):
+            return full_skin_id, "", "", "", "", json_alias
+
+        skins_by_id: dict[str, dict] = {}
+        for entry in skins_raw:
+            if not isinstance(entry, dict):
+                continue
+            sid_int = _parse_non_neg_int(entry.get("skinId"))
+            if sid_int > 0:
+                skins_by_id[str(sid_int)] = entry
+
+        matched = skins_by_id.get(str(full_skin_id))
+        if not isinstance(matched, dict):
+            return full_skin_id, "", "", "", "", json_alias
+
+        skin_name = str(matched.get("name") or "").strip()
+        effective_skin_id = full_skin_id
+        main_img = str(matched.get("mainImg") or "").strip()
+        loading_img = str(matched.get("loadingImg") or "").strip()
+        center_img = str(matched.get("centerImg") or "").strip()
+
+        if str(matched.get("chromas") or "").strip() == "1":
+            belong_id = _parse_non_neg_int(matched.get("chromasBelongId"))
+            if belong_id > 0 and belong_id != full_skin_id:
+                parent = skins_by_id.get(str(belong_id))
+                if isinstance(parent, dict):
+                    effective_skin_id = _parse_non_neg_int(parent.get("skinId")) or belong_id
+                    parent_img = str(parent.get("mainImg") or "").strip()
+                    if parent_img:
+                        main_img = parent_img
+                    parent_loading = str(parent.get("loadingImg") or "").strip()
+                    if parent_loading:
+                        loading_img = parent_loading
+                    parent_center = str(parent.get("centerImg") or "").strip()
+                    if parent_center:
+                        center_img = parent_center
+                    if not skin_name:
+                        skin_name = str(parent.get("name") or "").strip()
+                else:
+                    effective_skin_id = belong_id
+
+        return effective_skin_id, skin_name, main_img, loading_img, center_img, json_alias
+
+    @staticmethod
+    def _extract_skin_entry(
+        payload: dict | None,
+        hero_id: str,
+        skin_id: int | str,
+    ) -> tuple[int, str, str, str]:
+        """Return (effective_skin_id, skin_name, main_img_url, hero_alias) with chroma parent backtracking."""
+        eff_id, skin_name, main_img, _loading_img, _center_img, json_alias = (
+            StaticAssetsManager._extract_skin_art_urls(payload, hero_id, skin_id)
+        )
+        return eff_id, skin_name, main_img, json_alias
+
+    def resolve_skin_info(self, hero_id: str, skin_id: int = 0) -> tuple[int, str, str]:
+        """Fetch & cache Tencent hero/{hero_id}.js, resolving (effective_skin_id, skin_name, main_img_url).
+
+        Chromas (chromas == "1") automatically backtrack to their parent skin's skinId and mainImg.
+        """
+        safe_hid = "".join(ch for ch in str(hero_id or "").strip() if ch.isalnum() or ch in ("_", "-"))
+        full_skin_id, _ = normalize_skin_id(safe_hid, skin_id)
+        if not safe_hid:
+            return full_skin_id, "", ""
+        payload = self._load_hero_skins_payload(safe_hid, allow_network=True, full_skin_id=full_skin_id)
+        eff_id, skin_name, main_img, _alias = self._extract_skin_entry(payload, safe_hid, skin_id)
+        return eff_id, skin_name, main_img
+
+    def _find_cached_skin_file(self, subdir: str, candidate_ids: tuple[int, ...]) -> str:
+        target_dir = self.icons_dir / subdir
+        seen_ids: set[int] = set()
+        for cand_id in candidate_ids:
+            if cand_id <= 0 or cand_id in seen_ids:
+                continue
+            seen_ids.add(cand_id)
+            local = target_dir / f"{cand_id}.jpg"
+            try:
+                if local.is_file() and local.stat().st_size > SKIN_SPLASH_MIN_BYTES:
+                    return str(local)
+            except OSError:
+                continue
+        return ""
+
+    def resolve_cached_skin_splash(self, hero_id: str, skin_id: int = 0) -> tuple[str, str]:
+        """Zero-network read-only lookup in local icons/skin/*.jpg and static/hero_skins/{hero_id}.json."""
+        safe_hid = "".join(ch for ch in str(hero_id or "").strip() if ch.isalnum() or ch in ("_", "-"))
+        if not safe_hid:
+            return "", ""
+        full_skin_id, _ = normalize_skin_id(safe_hid, skin_id)
+        payload = self._load_hero_skins_payload(safe_hid, allow_network=False, full_skin_id=full_skin_id)
+        eff_id, skin_name, _main_img, _alias = self._extract_skin_entry(payload, safe_hid, skin_id)
+        return self._find_cached_skin_file("skin", (eff_id, full_skin_id)), skin_name
+
+    def resolve_cached_skin_variants(self, hero_id: str, skin_id: int = 0) -> tuple[str, str]:
+        """Zero-network read-only lookup for cached (skin_loading_path, skin_center_path)."""
+        safe_hid = "".join(ch for ch in str(hero_id or "").strip() if ch.isalnum() or ch in ("_", "-"))
+        if not safe_hid:
+            return "", ""
+        full_skin_id, _ = normalize_skin_id(safe_hid, skin_id)
+        payload = self._load_hero_skins_payload(safe_hid, allow_network=False, full_skin_id=full_skin_id)
+        eff_id, _skin_name, _main_img, _alias = self._extract_skin_entry(payload, safe_hid, skin_id)
+        cands = (eff_id, full_skin_id)
+        return (
+            self._find_cached_skin_file("skin_loading", cands),
+            self._find_cached_skin_file("skin_center", cands),
+        )
+
+    def _download_skin_candidates(
+        self,
+        local: Path,
+        fail_key: tuple[str, str],
+        candidate_urls: list[str],
+        *,
+        safe_hid: str,
+        eff_id: int,
+    ) -> bool:
+        now = time.monotonic()
+        if (
+            self._icon_404_until.get(fail_key, 0.0) > now
+            or self._icon_fail_until.get(fail_key, 0.0) > now
+        ):
+            return False
+
+        saw_404 = False
+        saw_non_404 = False
+        for cand_url in candidate_urls:
+            if self._url_404_until.get(cand_url, 0.0) > now:
+                saw_404 = True
+                continue
+            is_tencent = cand_url.startswith(TENCENT_IMG_BASE) or "game.gtimg.cn" in cand_url
+            try:
+                raw = self._fetch_skin_bytes(cand_url, prefer_direct=is_tencent)
+                if len(raw) > SKIN_SPLASH_MIN_BYTES:
+                    with self._skin_lock:
+                        atomic_write_bytes(local, raw)
+                    self._icon_fail_until.pop(fail_key, None)
+                    self._icon_404_until.pop(fail_key, None)
+                    return True
+                saw_non_404 = True
+            except Exception as exc:
+                if _is_http_404(exc):
+                    saw_404 = True
+                    self._url_404_until[cand_url] = now + ICON_404_NEGATIVE_TTL_S
+                else:
+                    saw_non_404 = True
+                logger.debug("Skin asset fetch failed %s/%s (%s): %s", safe_hid, eff_id, cand_url, exc)
+
+        if candidate_urls:
+            if saw_404 and not saw_non_404:
+                self._icon_404_until[fail_key] = now + ICON_404_NEGATIVE_TTL_S
+            else:
+                self._icon_fail_until[fail_key] = now + ICON_TRANSIENT_FAIL_TTL_S
+        return False
+
+    def ensure_skin_splash(self, hero_id: str, skin_id: int = 0) -> tuple[Path | None, str]:
+        """Download and disk-cache champion skin splash JPG (Tencent zero-proxy -> DDragon -> base skin)."""
+        safe_hid = "".join(ch for ch in str(hero_id or "").strip() if ch.isalnum() or ch in ("_", "-"))
+        if not safe_hid:
+            return None, ""
+        hero_int = _parse_non_neg_int(safe_hid)
+        full_skin_id, orig_skin_num = normalize_skin_id(safe_hid, skin_id)
+
+        payload = self._load_hero_skins_payload(safe_hid, allow_network=True, full_skin_id=full_skin_id)
+        eff_id, skin_name, main_img, json_alias = self._extract_skin_entry(payload, safe_hid, skin_id)
+        if eff_id <= 0:
+            return None, skin_name
+
+        if hero_int > 0 and eff_id >= 1000 and eff_id // 1000 == hero_int:
+            eff_skin_num = eff_id % 1000
+        else:
+            _, eff_skin_num = normalize_skin_id(safe_hid, eff_id)
+
+        local = self.icons_dir / "skin" / f"{eff_id}.jpg"
+        if local.is_file() and local.stat().st_size > SKIN_SPLASH_MIN_BYTES:
+            return local, skin_name
+
+        candidate_urls: list[str] = []
+
+        def _add_cand(u: str) -> None:
+            clean = (u or "").strip()
+            if clean and clean not in candidate_urls:
+                candidate_urls.append(clean)
+
+        _add_cand(main_img)
+        _add_cand(TENCENT_SKIN_BIG_URL_TMPL.format(skin_id=eff_id))
+        alias = (self.hero_aliases.get(safe_hid) or json_alias or "").strip()
+        if alias and not alias.isdigit():
+            _add_cand(DDRAGON_SKIN_SPLASH_URL_TMPL.format(alias=alias, skin_num=eff_skin_num))
+
+        if self._download_skin_candidates(
+            local,
+            ("skin", str(eff_id)),
+            candidate_urls,
+            safe_hid=safe_hid,
+            eff_id=eff_id,
+        ):
+            return local, skin_name
+
+        if (orig_skin_num > 0 or eff_skin_num > 0) and hero_int > 0 and eff_id != hero_int * 1000:
+            base_path, base_name = self.ensure_skin_splash(safe_hid, 0)
+            if base_path is not None:
+                return base_path, (skin_name or base_name)
+
+        return None, skin_name
+
+    def _ensure_skin_variant(self, hero_id: str, skin_id: int, *, variant: str) -> Path | None:
+        safe_hid = "".join(ch for ch in str(hero_id or "").strip() if ch.isalnum() or ch in ("_", "-"))
+        if not safe_hid or variant not in ("loading", "center"):
+            return None
+        hero_int = _parse_non_neg_int(safe_hid)
+        full_skin_id, orig_skin_num = normalize_skin_id(safe_hid, skin_id)
+
+        payload = self._load_hero_skins_payload(safe_hid, allow_network=True, full_skin_id=full_skin_id)
+        eff_id, _skin_name, _main_img, loading_img, center_img, json_alias = self._extract_skin_art_urls(
+            payload, safe_hid, skin_id
+        )
+        if eff_id <= 0:
+            return None
+
+        if hero_int > 0 and eff_id >= 1000 and eff_id // 1000 == hero_int:
+            eff_skin_num = eff_id % 1000
+        else:
+            _, eff_skin_num = normalize_skin_id(safe_hid, eff_id)
+
+        subdir = "skin_loading" if variant == "loading" else "skin_center"
+        local = self.icons_dir / subdir / f"{eff_id}.jpg"
+        if local.is_file() and local.stat().st_size > SKIN_SPLASH_MIN_BYTES:
+            return local
+
+        candidate_urls: list[str] = []
+
+        def _add_cand(u: str) -> None:
+            clean = (u or "").strip()
+            if clean and clean not in candidate_urls:
+                candidate_urls.append(clean)
+
+        if variant == "loading":
+            _add_cand(loading_img)
+            _add_cand(TENCENT_SKIN_LOADING_URL_TMPL.format(skin_id=eff_id))
+            alias = (self.hero_aliases.get(safe_hid) or json_alias or "").strip()
+            if alias and not alias.isdigit():
+                _add_cand(DDRAGON_SKIN_LOADING_URL_TMPL.format(alias=alias, skin_num=eff_skin_num))
+        else:
+            _add_cand(center_img)
+            _add_cand(TENCENT_SKIN_CENTER_URL_TMPL.format(skin_id=eff_id))
+
+        if self._download_skin_candidates(
+            local,
+            (subdir, str(eff_id)),
+            candidate_urls,
+            safe_hid=safe_hid,
+            eff_id=eff_id,
+        ):
+            return local
+
+        if (orig_skin_num > 0 or eff_skin_num > 0) and hero_int > 0 and eff_id != hero_int * 1000:
+            return self._ensure_skin_variant(safe_hid, 0, variant=variant)
+        return None
+
+    def ensure_skin_loading(self, hero_id: str, skin_id: int = 0) -> Path | None:
+        """Download and disk-cache official vertical loading portrait JPG (308x560)."""
+        return self._ensure_skin_variant(hero_id, skin_id, variant="loading")
+
+    def ensure_skin_center(self, hero_id: str, skin_id: int = 0) -> Path | None:
+        """Download and disk-cache official centered hero splash JPG (1280x720)."""
+        return self._ensure_skin_variant(hero_id, skin_id, variant="center")

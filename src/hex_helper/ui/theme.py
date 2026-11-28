@@ -130,7 +130,46 @@ RARITY_COLORS: dict[str, tuple[str, str]] = {
     "silver": ("#A8B9CC", "白银"),
 }
 
-BASE_OVERLAY_QSS = """
+HEXTECH_MENU_QSS = """
+QMenu {
+    background-color: #061222;
+    border: 1px solid #785A28;
+    padding: 4px 0px;
+    color: #F0E6D2;
+}
+QMenu::item {
+    padding: 6px 18px 6px 14px;
+    background: transparent;
+    color: #F0E6D2;
+}
+QMenu::item:selected {
+    background-color: #162B40;
+    color: #FFFFFF;
+    border-left: 2px solid #C8AA6E;
+}
+QMenu::item:disabled {
+    color: #5B5A56;
+}
+QMenu::separator {
+    height: 1px;
+    background: #463714;
+    margin: 4px 10px;
+}
+QMenu::indicator {
+    width: 12px;
+    height: 12px;
+    margin-left: 6px;
+    border: 1px solid #785A28;
+    background: #010A13;
+}
+QMenu::indicator:checked {
+    border: 1px solid #0AC8B9;
+    background: #0397AB;
+}
+"""
+
+BASE_OVERLAY_QSS = (
+    """
 QWidget {
     font-family: "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
     color: #F0E6D2;
@@ -326,6 +365,18 @@ QScrollBar:horizontal {
     background: transparent;
 }
 """
+    + HEXTECH_MENU_QSS
+    + """
+QToolTip {
+    background-color: #061222;
+    color: #F0E6D2;
+    border: 1px solid #785A28;
+    padding: 4px 8px;
+    border-radius: 2px;
+    font-size: 11px;
+}
+"""
+)
 
 
 def tier_badge_qss(tier: str) -> str:

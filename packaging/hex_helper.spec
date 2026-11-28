@@ -59,6 +59,8 @@ hiddenimports = [
     "hex_helper.ui.resizable_overlay",
     "hex_helper.vision.augment_icon_matcher",
     "hex_helper.game.lol_locator",
+    "hex_helper.data.locale_pack",
+    "hex_helper.data.locale_catalog_data",
 ]
 
 winrt_datas, winrt_bins, winrt_hidden = collect_all("winrt")

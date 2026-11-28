@@ -33,30 +33,62 @@ class OcrLine:
 
 
 class WinRtOcrEngine:
-    """Zero-model-footprint Windows native zh-Hans-CN OCR engine."""
+    """Zero-model-footprint Windows native OCR engine with zh-Hant-TW -> zh-Hans-CN T2S fallback."""
 
     def __init__(self, language_tag: str = "zh-Hans-CN") -> None:
         from winrt.windows.globalization import Language
         from winrt.windows.media.ocr import OcrEngine
 
-        self.language_tag = language_tag
+        req_tag = str(language_tag or "zh-Hans-CN").strip() or "zh-Hans-CN"
+        self.requested_language_tag = req_tag
+        self.language_tag = req_tag
         self.actual_language_tag: str = ""
+        self.effective_ocr_mode: str = "native_cn"
         self.last_shadowed_pass2: list[dict[str, Any]] = []
         self.last_pass_timings_ms: dict[str, float] = {"ocr_p1_ms": 0.0, "ocr_p2_ms": 0.0}
-        lang = Language(language_tag)
-        self._engine = OcrEngine.try_create_from_language(lang)
-        if self._engine is None:
-            self._engine = OcrEngine.try_create_from_user_profile_languages()
-        if self._engine is None:
-            raise RuntimeError(f"Windows WinRT OCR unavailable for {language_tag}")
+
+        req_low = req_tag.lower()
+        is_req_tw = req_low.startswith("zh-hant") or req_low == "zh-tw"
+        engine = OcrEngine.try_create_from_language(Language(req_tag))
+        if engine is not None:
+            self.effective_ocr_mode = "native_tw" if is_req_tw else "native_cn"
+        else:
+            if is_req_tw:
+                engine = OcrEngine.try_create_from_language(Language("zh-Hans-CN"))
+                if engine is not None:
+                    self.effective_ocr_mode = "sc_t2s_fallback"
+            if engine is None:
+                engine = OcrEngine.try_create_from_user_profile_languages()
+                if engine is not None:
+                    self.effective_ocr_mode = "profile_fallback"
+
+        if engine is None:
+            raise RuntimeError(f"Windows WinRT OCR unavailable for {req_tag}")
+        self._engine = engine
         try:
             rec_lang = getattr(self._engine, "recognizer_language", None)
             tag = getattr(rec_lang, "language_tag", None) if rec_lang is not None else None
             self.actual_language_tag = str(tag or "")
         except Exception:
             self.actual_language_tag = ""
+        if not self.actual_language_tag:
+            if self.effective_ocr_mode == "sc_t2s_fallback":
+                self.actual_language_tag = "zh-Hans-CN"
+            elif self.effective_ocr_mode in ("native_cn", "native_tw"):
+                self.actual_language_tag = req_tag
         self._max_dim = int(OcrEngine.max_image_dimension or 2600)
         self._loop = asyncio.new_event_loop()
+
+    @property
+    def needs_t2s_matching(self) -> bool:
+        """True when zh-Hant-TW was requested but recognizer fell back to non-Traditional (e.g. zh-Hans-CN)."""
+        req_low = self.requested_language_tag.lower()
+        if not (req_low.startswith("zh-hant") or req_low == "zh-tw"):
+            return False
+        act_low = self.actual_language_tag.lower()
+        if act_low.startswith("zh-hant") or act_low == "zh-tw":
+            return False
+        return True
 
     def close(self) -> None:
         try:
@@ -123,13 +155,27 @@ class WinRtOcrEngine:
         image_bgr: np.ndarray,
         *,
         need_inverted: bool = True,
+        skip_clahe: bool = False,
     ) -> tuple[float, np.ndarray, np.ndarray | None]:
         h, w = image_bgr.shape[:2]
-        # Scale small/medium title bands up for crisp Chinese glyphs while respecting max_dim
-        target_h = 340.0
-        scale = max(1.0, min(2.0, target_h / max(1, h)))
-        if max(w, h) * scale > self._max_dim:
-            scale = self._max_dim / max(w, h)
+        if skip_clahe:
+            # Avoid double-upscaling already-2x slot crops or stretching narrow bands toward 2600px+
+            if h >= 60 or w >= 600:
+                scale = 1.0
+            else:
+                target_h = 96.0
+                scale = max(1.0, min(1.5, target_h / max(1, h)))
+                max_clean_dim = min(self._max_dim, 1600)
+                if max(w, h) * scale > max_clean_dim:
+                    scale = max(1.0, max_clean_dim / max(w, h))
+            if max(w, h) * scale > self._max_dim:
+                scale = self._max_dim / max(w, h)
+        else:
+            # Scale small/medium title bands up for crisp Chinese glyphs while respecting max_dim
+            target_h = 340.0
+            scale = max(1.0, min(2.0, target_h / max(1, h)))
+            if max(w, h) * scale > self._max_dim:
+                scale = self._max_dim / max(w, h)
 
         if abs(scale - 1.0) > 0.02:
             resized = cv2.resize(
@@ -141,8 +187,22 @@ class WinRtOcrEngine:
             scale = 1.0
             resized = image_bgr
 
+        if resized.ndim == 2:
+            gray = resized
+        elif resized.ndim == 3 and resized.shape[2] == 4:
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGRA2GRAY)
+        else:
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+        if skip_clahe:
+            v1 = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGRA)
+            if not need_inverted:
+                return scale, v1, None
+            inv = 255 - gray
+            v2 = cv2.cvtColor(inv, cv2.COLOR_GRAY2BGRA)
+            return scale, v1, v2
+
         # Variant 1: CLAHE enhanced grayscale -> BGRA
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         v1 = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGRA)
@@ -160,6 +220,7 @@ class WinRtOcrEngine:
         image_bgr: np.ndarray,
         dual_pass: bool = True,
         force_dual_pass: bool = False,
+        skip_clahe: bool = False,
     ) -> list[OcrLine]:
         """Run WinRT OCR on a BGR crop and return bounding-boxed lines in input pixel coordinates."""
         self.last_shadowed_pass2 = []
@@ -167,7 +228,11 @@ class WinRtOcrEngine:
         if image_bgr is None or image_bgr.size == 0:
             return []
         allow_p2 = bool(dual_pass or force_dual_pass)
-        scale, v1, v2 = self._prepare_variants(image_bgr, need_inverted=allow_p2)
+        scale, v1, v2 = self._prepare_variants(
+            image_bgr,
+            need_inverted=allow_p2,
+            skip_clahe=skip_clahe,
+        )
         t_p1 = time.perf_counter()
         lines1 = self._run_bgra(v1, scale, pass_id=1)
         self.last_pass_timings_ms["ocr_p1_ms"] = round((time.perf_counter() - t_p1) * 1000.0, 3)
@@ -221,6 +286,12 @@ class WinRtOcrEngine:
         image_bgr: np.ndarray,
         dual_pass: bool = True,
         force_dual_pass: bool = False,
+        skip_clahe: bool = False,
     ) -> list[OcrLine]:
         """Alias of `recognize_lines` accepting a BGR image crop."""
-        return self.recognize_lines(image_bgr, dual_pass=dual_pass, force_dual_pass=force_dual_pass)
+        return self.recognize_lines(
+            image_bgr,
+            dual_pass=dual_pass,
+            force_dual_pass=force_dual_pass,
+            skip_clahe=skip_clahe,
+        )

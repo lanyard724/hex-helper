@@ -42,8 +42,8 @@ from hex_helper.ui.resizable_overlay import (
     compute_auto_overlay_scale,
     compute_overlay_scale,
 )
-from hex_helper.ui.theme import BASE_OVERLAY_QSS, RARITY_COLORS, display_font
-from hex_helper.ui.win32_window import show_no_activate
+from hex_helper.ui.theme import BASE_OVERLAY_QSS, HEXTECH_MENU_QSS, RARITY_COLORS, display_font
+from hex_helper.ui.win32_window import apply_capture_exclusion, show_no_activate
 
 _PROFILE_PILL_BADGE: dict[str, tuple[str, str]] = {
     "AP": ("AP", "#38BDF8"),
@@ -102,6 +102,7 @@ class AugmentComboOverlay(QWidget):
         on_closed_by_user: Callable[[], None] | None = None,
         on_geometry_changed: Callable[[dict[str, Any]], None] | None = None,
         on_subcard_action: Callable[[str, str, dict[str, Any]], None] | None = None,
+        on_toggle_screen_recording: Callable[[bool], None] | None = None,
         initial_pos: list[int] | None = None,
         initial_size: list[int] | None = None,
         initial_scale: float | None = None,
@@ -114,6 +115,8 @@ class AugmentComboOverlay(QWidget):
         self._on_closed_by_user = on_closed_by_user
         self._on_geometry_changed = on_geometry_changed
         self._on_subcard_action = on_subcard_action
+        self._on_toggle_screen_recording = on_toggle_screen_recording
+        self._allow_screen_recording: bool = False
         self._gesture_start_norm_rect: list[float] | None = None
         self._y_ratio = y_ratio
         self._target_screen: QScreen | None = None
@@ -148,6 +151,8 @@ class AugmentComboOverlay(QWidget):
         self._pre_picker_expanded: bool | None = None
         self._mode: str = "plan"  # "plan" | "picker"
         self._full_locked: bool = False
+        self._selected_count: int | None = None
+        self._locale_store: Any = None
         self._last_plan: ComboPlan | None = None
         self._last_verdict: PickerComboVerdict | None = None
         self._last_verdict_sig: tuple | None = None
@@ -651,6 +656,33 @@ class AugmentComboOverlay(QWidget):
             lay.invalidate()
             lay.activate()
 
+    def set_locale_store(self, store: Any) -> None:
+        """Bind DataStore for localized hero/augment display names and refresh visible plan/picker."""
+        self._locale_store = store
+        self._last_verdict_sig = None
+        if self._mode == "picker" and self._last_verdict is not None:
+            self._rebuild_picker_rows(self._last_verdict)
+        elif self._last_plan is not None:
+            self.set_plan(self._last_plan, selected_count=self._selected_count)
+
+    def _disp_hero(self, hero_id: str | None, fallback: str) -> str:
+        store = getattr(self, "_locale_store", None)
+        if store is not None and hero_id and hasattr(store, "display_hero_name"):
+            try:
+                return str(store.display_hero_name(hero_id, fallback) or fallback)
+            except Exception:
+                pass
+        return fallback
+
+    def _disp_aug(self, aug_id: str | None, fallback: str) -> str:
+        store = getattr(self, "_locale_store", None)
+        if store is not None and aug_id and hasattr(store, "display_augment_name"):
+            try:
+                return str(store.display_augment_name(aug_id, fallback) or fallback)
+            except Exception:
+                pass
+        return fallback
+
     def _rebuild_dynamic_sections(self) -> None:
         if self._mode == "picker" and self._last_verdict is not None:
             self._rebuild_picker_rows(self._last_verdict)
@@ -1117,17 +1149,35 @@ class AugmentComboOverlay(QWidget):
             finally:
                 self.setUpdatesEnabled(True)
         if was_visible:
-            show_no_activate(self, click_through=False)
+            show_no_activate(
+                self,
+                click_through=False,
+                exclude_from_capture=not self._allow_screen_recording,
+            )
 
     def toggle_expanded(self) -> None:
         self.set_expanded(not self._expanded)
+
+    def set_screen_recording_allowed(self, allowed: bool) -> None:
+        self._allow_screen_recording = bool(allowed)
+        if self.isVisible() or bool(self.internalWinId()):
+            apply_capture_exclusion(self, exclude=not self._allow_screen_recording)
+
+    def _handle_toggle_screen_recording(self, checked: bool) -> None:
+        self.set_screen_recording_allowed(bool(checked))
+        if self._on_toggle_screen_recording is not None:
+            self._on_toggle_screen_recording(bool(checked))
 
     def show_overlay(self) -> None:
         if self._full_locked:
             self.hide()
             return
         self._reposition()
-        show_no_activate(self, click_through=False)
+        show_no_activate(
+            self,
+            click_through=False,
+            exclude_from_capture=not self._allow_screen_recording,
+        )
 
     def set_full_locked(self, locked: bool, reason: str = "") -> None:
         self._full_locked = bool(locked)
@@ -1165,17 +1215,24 @@ class AugmentComboOverlay(QWidget):
                 return
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
+            menu.setStyleSheet(HEXTECH_MENU_QSS)
             a_toggle = QAction("收起成小条" if self._expanded else "展开联动面板", menu)
             a_toggle.triggered.connect(self._user_toggle_expanded)
             a_reset_size = QAction("恢复默认尺寸（适配屏幕）", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_reset = QAction("复位到屏幕左侧", menu)
             a_reset.triggered.connect(self.reset_to_left_edge)
+            a_rec = QAction("录屏/截屏中显示悬浮窗", menu)
+            a_rec.setCheckable(True)
+            a_rec.setChecked(self._allow_screen_recording)
+            a_rec.triggered.connect(self._handle_toggle_screen_recording)
             a_hide = QAction("隐藏海克斯组合悬浮窗", menu)
             a_hide.triggered.connect(self._close_by_user)
             menu.addAction(a_toggle)
             menu.addAction(a_reset_size)
             menu.addAction(a_reset)
+            menu.addSeparator()
+            menu.addAction(a_rec)
             menu.addSeparator()
             menu.addAction(a_hide)
             menu.exec(event.globalPosition().toPoint())
@@ -1256,9 +1313,26 @@ class AugmentComboOverlay(QWidget):
             return
         super().mouseReleaseEvent(event)
 
-    def set_plan(self, plan: ComboPlan) -> None:
+    def _resolved_selected_count(self, plan: ComboPlan | None) -> int:
+        if self._selected_count is not None:
+            return max(0, int(self._selected_count))
+        if plan is None:
+            return 0
+        return max(0, int(getattr(plan, "round_index", 1) or 1))
+
+    def _is_plan_full(self, plan: ComboPlan | None) -> bool:
+        if plan is None:
+            return False
+        if self._selected_count is not None:
+            return self._selected_count >= 4
+        return (not plan.recommended_targets) and int(getattr(plan, "round_index", 1) or 1) >= 4
+
+    def set_plan(self, plan: ComboPlan, *, selected_count: int | None = None) -> None:
         """Update normal in-game combo plan & collapsed pill indicators."""
         self._last_plan = plan
+        raw_cnt = selected_count if selected_count is not None else getattr(plan, "selected_count", None)
+        self._selected_count = int(raw_cnt) if raw_cnt is not None else None
+        is_full = self._is_plan_full(plan)
         prof_short, prof_color = _PROFILE_PILL_BADGE.get(plan.profile.primary_profile, ("联", "#C8AA6E"))
         self.pill_crest_lbl.setText(prof_short)
         self.pill_crest_lbl.setStyleSheet(
@@ -1271,12 +1345,18 @@ class AugmentComboOverlay(QWidget):
             if top_c.completed:
                 self.pill_tag_lbl.setText("已成")
                 self.pill_status_dot.setStyleSheet("border: none; background: transparent; color: #09C269; font-size: 10px;")
+            elif is_full:
+                self.pill_tag_lbl.setText("定型")
+                self.pill_status_dot.setStyleSheet("border: none; background: transparent; color: #0AC8B9; font-size: 10px;")
             elif top_c.gamble:
                 self.pill_tag_lbl.setText("赌核")
                 self.pill_status_dot.setStyleSheet("border: none; background: transparent; color: #F59E0B; font-size: 10px;")
             else:
                 self.pill_tag_lbl.setText("追组")
                 self.pill_status_dot.setStyleSheet("border: none; background: transparent; color: #0AC8B9; font-size: 10px;")
+        elif is_full:
+            self.pill_tag_lbl.setText("定型")
+            self.pill_status_dot.setStyleSheet("border: none; background: transparent; color: #0AC8B9; font-size: 10px;")
         elif plan.opening_combos:
             self.pill_tag_lbl.setText("开局")
             self.pill_status_dot.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-size: 9px;")
@@ -1286,28 +1366,48 @@ class AugmentComboOverlay(QWidget):
 
         self.profile_badge_lbl.setText(_clip(plan.profile.direction_label, 10))
 
+        hero_disp = self._disp_hero(plan.hero_id, plan.hero_name)
+
         # Active / Opening summary card
         if plan.active_combos:
             lines: list[str] = []
             for c in plan.active_combos[:2]:
-                status_tag = "✓已成型" if c.completed else ("🎲追赌" if c.gamble else "追核心")
-                chase = f" → 追{'/'.join(c.missing_core_names[:2])}" if c.missing_core_names else ""
+                status_tag = "✓已成型" if c.completed else ("已锁定" if is_full else ("🎲追赌" if c.gamble else "追核心"))
+                if len(c.missing_core_ids) == len(c.missing_core_names) and c.missing_core_ids:
+                    miss_names = [
+                        self._disp_aug(mid, mnm)
+                        for mid, mnm in zip(c.missing_core_ids[:2], c.missing_core_names[:2])
+                    ]
+                else:
+                    miss_names = list(c.missing_core_names[:2])
+                chase = f" → 追{'/'.join(miss_names)}" if (miss_names and not is_full) else ""
                 lines.append(f"【{c.name}】{status_tag}{chase}")
-            self.active_combo_hdr.setText(f"◈ {plan.hero_name} · 正在联动")
+            self.active_combo_hdr.setText(f"◈ {hero_disp} · 正在联动")
             self.active_combo_body.setText("\n".join(lines))
             pulse_sig = "|".join(f"{c.name}:{int(c.completed)}" for c in plan.active_combos[:2])
             if pulse_sig and pulse_sig != self._last_combo_pulse_sig:
                 self._last_combo_pulse_sig = pulse_sig
                 if hasattr(self, "active_combo_card"):
                     self.active_combo_card.trigger_pulse("#0AC8B9", 520)
-        elif plan.opening_combos:
+        elif plan.opening_combos and not is_full:
             lines = []
             for c in plan.opening_combos[:2]:
                 tag = "🎲赌上限" if c.gamble else "推荐路线"
-                cores = "+".join(c.missing_core_names[:2])
+                if len(c.missing_core_ids) == len(c.missing_core_names) and c.missing_core_ids:
+                    open_names = [
+                        self._disp_aug(mid, mnm)
+                        for mid, mnm in zip(c.missing_core_ids[:2], c.missing_core_names[:2])
+                    ]
+                else:
+                    open_names = list(c.missing_core_names[:2])
+                cores = "+".join(open_names)
                 lines.append(f"【{c.name}】{tag}（{cores}）")
-            self.active_combo_hdr.setText(f"◈ {plan.hero_name} · 开局值得赌的组合")
+            self.active_combo_hdr.setText(f"◈ {hero_disp} · 开局值得赌的组合")
             self.active_combo_body.setText("\n".join(lines))
+        elif is_full:
+            cnt = max(4, self._resolved_selected_count(plan))
+            self.active_combo_hdr.setText(f"◈ {hero_disp} · 已持有 {cnt} 枚海克斯")
+            self.active_combo_body.setText(f"当前 {cnt} 枚海克斯已定型，结合流派与敌方威胁专注出装")
         else:
             self.active_combo_hdr.setText("◈ 当前联动方向")
             self.active_combo_body.setText("进局选定英雄与海克斯后，实时推演后续搭配与降权方向")
@@ -1335,10 +1435,13 @@ class AugmentComboOverlay(QWidget):
         m = self._metrics()
         eff_w = self._custom_w or self._resolved_expanded_width() or self.EXPANDED_W
         reason_cap = max(24, int((eff_w - m.px(36)) / 6.2))
-        if plan.recommended_targets:
+        is_full = self._is_plan_full(plan)
+        if plan.recommended_targets and not is_full:
+            self.targets_hdr.show()
             self.targets_hdr.setText(
                 "◈ 后续最配 / 留骰子追" if plan.active_combos else "◈ 开局核心起手目标"
             )
+            name_cap = 7 if eff_w <= 256 else (10 if eff_w < 340 else 16)
             for t in plan.recommended_targets[:4]:
                 rar_color, _ = RARITY_COLORS.get(t.rarity, ("#C89B3C", ""))
                 row = QFrame()
@@ -1352,12 +1455,24 @@ class AugmentComboOverlay(QWidget):
 
                 top_r = QHBoxLayout()
                 top_r.setSpacing(m.px(4))
-                nm_lbl = QLabel(t.name)
+                t_disp = self._disp_aug(t.augment_id, t.name)
+                nm_lbl = QLabel(_clip(t_disp, name_cap))
+                nm_lbl.setToolTip(t_disp if t_disp == t.name else f"{t_disp}（国服：{t.name}）")
                 nm_lbl.setStyleSheet(
                     f"border: none; background: transparent; color: {rar_color}; "
                     f"font-size: {m.font_px(11)}px; font-weight: bold;"
                 )
                 top_r.addWidget(nm_lbl)
+                comp_tag = str(getattr(t, "comp_tag", "") or "").strip()
+                if comp_tag:
+                    ct = QLabel(comp_tag)
+                    ct.setToolTip(f"阵容适配：{comp_tag}")
+                    ct.setStyleSheet(
+                        "background-color: rgba(6, 48, 56, 225); border: 1px solid #0AC8B9; "
+                        f"border-radius: 2px; padding: 0px {m.px(4)}px; color: #7CF8EE; "
+                        f"font-size: {m.font_px(9)}px; font-weight: bold;"
+                    )
+                    top_r.addWidget(ct)
                 if t.gamble:
                     gb = QLabel("赌上限")
                     gb.setStyleSheet(
@@ -1386,7 +1501,19 @@ class AugmentComboOverlay(QWidget):
                 rl.addWidget(rs_lbl)
                 self.targets_list_lay.addWidget(row)
                 row.show()
+        elif is_full:
+            self.targets_hdr.hide()
+            cnt = max(4, self._resolved_selected_count(plan))
+            full_lbl = QLabel(f"✓ 已持有 {cnt} 枚海克斯 · 专注出装")
+            full_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: #0AC8B9; "
+                f"font-size: {m.font_px(10)}px; font-weight: bold;"
+            )
+            self.targets_list_lay.addWidget(full_lbl)
+            full_lbl.show()
         else:
+            self.targets_hdr.show()
+            self.targets_hdr.setText("◈ 值得追 / 留骰子赌的搭配")
             empty = QLabel("◇ 选定首个海克斯后自动列出最搭配目标")
             empty.setStyleSheet(
                 f"border: none; background: transparent; color: #64748B; font-size: {m.font_px(10)}px;"
@@ -1410,7 +1537,9 @@ class AugmentComboOverlay(QWidget):
 
     def enter_picker_mode(self, verdict: PickerComboVerdict) -> None:
         """Switch to 3/4-card live combo/downgrade diagnosis and auto-expand without stealing focus."""
+        locale_tag = str(getattr(self._locale_store, "client_locale", "zh_cn") or "zh_cn")
         verdict_sig = (
+            locale_tag,
             verdict.profile.direction_label,
             verdict.best_slot_index,
             verdict.reroll_advice,
@@ -1462,7 +1591,11 @@ class AugmentComboOverlay(QWidget):
         finally:
             self.setUpdatesEnabled(True)
         if not self._full_locked and self.isVisible():
-            show_no_activate(self, click_through=False)
+            show_no_activate(
+                self,
+                click_through=False,
+                exclude_from_capture=not self._allow_screen_recording,
+            )
 
     def exit_picker_mode(self) -> None:
         """Return cleanly to plan mode and restore prior collapsed/expanded preference."""
@@ -1501,6 +1634,19 @@ class AugmentComboOverlay(QWidget):
             badge_bg = "rgba(3, 151, 171, 45)"
             badge_fg = "#A5F3FC"
             delta_fg = "#38BDF8"
+        elif card.verdict == "round_decay":
+            if card.combo_delta <= -12.0:
+                bg = "rgba(62, 16, 22, 230)"
+                border = "#DC2626"
+                badge_bg = "rgba(220, 38, 38, 55)"
+                badge_fg = "#FECACA"
+                delta_fg = "#F87171"
+            else:
+                bg = "rgba(48, 34, 10, 232)"
+                border = "#D97706"
+                badge_bg = "rgba(217, 119, 6, 55)"
+                badge_fg = "#FDE68A"
+                delta_fg = "#FBBF24"
         elif card.verdict == "conflict":
             bg = "rgba(62, 16, 22, 230)"
             border = "#DC2626"
@@ -1533,8 +1679,9 @@ class AugmentComboOverlay(QWidget):
         )
         eff_w = self._custom_w or self._resolved_expanded_width() or self.EXPANDED_W
         name_cap = 6 if eff_w <= 256 else (9 if eff_w < 360 else 16)
-        nm_lbl = QLabel(_clip(card.name, name_cap))
-        nm_lbl.setToolTip(card.name)
+        c_disp = self._disp_aug(card.augment_id, card.name)
+        nm_lbl = QLabel(_clip(c_disp, name_cap))
+        nm_lbl.setToolTip(c_disp if c_disp == card.name else f"{c_disp}（国服：{card.name}）")
         nm_lbl.setStyleSheet(
             f"border: none; background: transparent; color: {rar_color}; "
             f"font-size: {m.font_px(11)}px; font-weight: bold;"

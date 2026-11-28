@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from hex_helper.config import NormalizedRect
+from hex_helper.data.locale_pack import get_stat_anvil_cues, normalize_client_locale, t2s_normalize
 from hex_helper.data.provider import AugmentInfo
 from hex_helper.vision.capture import WindowRect
 from hex_helper.vision.matcher import AugmentMatcher, MatchResult, normalize_ocr_text
@@ -140,15 +141,23 @@ def estimate_slot_rarity(
     return rarity
 
 
-def _is_stat_anvil_lines(lines: Sequence[OcrLine]) -> bool:
-    """Detect ARAM Mayhem Stat Anvil popup ('属性锻造器' or >=2 lines ending with '碎片')."""
+def _is_stat_anvil_lines(lines: Sequence[OcrLine], client_locale: str = "zh_cn") -> bool:
+    """Detect ARAM Mayhem Stat Anvil popup across CN/MY/TW locales or >=2 '*碎片' lines."""
+    cues = get_stat_anvil_cues(client_locale)
     shard_count = 0
     for line in lines:
         compact = "".join(str(line.text or "").split())
         norm = normalize_ocr_text(compact)
-        if "属性锻造器" in compact or "属性锻造器" in norm:
-            return True
-        if compact.endswith("碎片") or norm.endswith("碎片"):
+        compact_t2s = t2s_normalize(compact)
+        for cue in cues.title_cues:
+            cue_t2s = t2s_normalize(cue)
+            if cue in compact or cue in norm or cue in compact_t2s or cue_t2s in compact_t2s:
+                return True
+        if (
+            compact.endswith(cues.shard_suffix)
+            or norm.endswith(cues.shard_suffix)
+            or compact_t2s.endswith(cues.shard_suffix)
+        ):
             shard_count += 1
             if shard_count >= 2:
                 return True
@@ -257,11 +266,13 @@ class AugmentPickerDetector:
         matcher: AugmentMatcher,
         card_band_roi: NormalizedRect,
         title_band_roi: NormalizedRect,
+        client_locale: str = "zh_cn",
     ) -> None:
         self.ocr = ocr_engine
         self.matcher = matcher
         self.card_band_roi = card_band_roi
         self.title_band_roi = title_band_roi
+        self.client_locale: str = normalize_client_locale(client_locale)
 
         self._last_title_thumb: np.ndarray | None = None
         self._pending_ids: tuple[str, ...] = ()
@@ -274,6 +285,9 @@ class AugmentPickerDetector:
         self.recovered_slot_count: int = 0
         self.recovery_failed_slot_count: int = 0
         self.false_reroll_suppressed_count: int = 0
+
+    def set_client_locale(self, locale: str) -> None:
+        self.client_locale = normalize_client_locale(locale)
 
     def reset(self) -> None:
         self._last_title_thumb = None
@@ -320,13 +334,17 @@ class AugmentPickerDetector:
         *,
         dual_pass: bool = True,
         force_dual_pass: bool = False,
+        skip_clahe: bool = False,
     ) -> list[OcrLine]:
         fn = self.ocr.recognize_lines
-        if self._ocr_accepts_kwarg("force_dual_pass"):
-            return fn(crop, dual_pass=dual_pass, force_dual_pass=force_dual_pass)
+        kwargs: dict[str, Any] = {}
         if self._ocr_accepts_kwarg("dual_pass"):
-            return fn(crop, dual_pass=dual_pass)
-        return fn(crop)
+            kwargs["dual_pass"] = dual_pass
+        if self._ocr_accepts_kwarg("force_dual_pass"):
+            kwargs["force_dual_pass"] = force_dual_pass
+        if skip_clahe and self._ocr_accepts_kwarg("skip_clahe"):
+            kwargs["skip_clahe"] = True
+        return fn(crop, **kwargs)
 
     @staticmethod
     def _estimate_line_rarity(
@@ -720,91 +738,26 @@ class AugmentPickerDetector:
         _record_layout(3)
         return {slot: _with_slot(card, slot)}, 3, ()
 
-    def _recover_missing_slot(
+    def _match_slot_lines(
         self,
+        filtered: Sequence[OcrLine],
+        *,
         missing_slot: int,
-        title_crop: np.ndarray,
-        card_crop: np.ndarray,
+        title_w: int,
+        title_h: int,
         band_w: int,
         band_origin_x: int,
         band_origin_y: int,
+        card_crop: np.ndarray,
         tl: int,
         cl: int,
         tt: int,
         ct: int,
         fh: int,
-        exclude_rects: list[tuple[int, int, int, int]],
+        exclude_rects: Sequence[tuple[int, int, int, int]],
         existing_matches: dict[int, DetectedCard],
-        total_slots: int = 3,
-        diag_out: dict[str, Any] | None = None,
-    ) -> tuple[DetectedCard | None, int]:
-        """Run targeted 2x contrast-enhanced OCR retry on a single missing slot sub-crop."""
-        slice_map = self._SLOT_SLICE_RATIOS_4 if total_slots >= 4 else self._SLOT_SLICE_RATIOS_3
-        r0, r1 = slice_map[missing_slot]
-        title_h, title_w = title_crop.shape[:2]
-        sx_start = max(0, int(band_w * r0))
-        sx_end = min(title_w, int(round(band_w * r1)))
-        if sx_end - sx_start < 4 or title_h < 4:
-            return None, 0
-
-        # Crop tight to neighbor card title Y-band when OCR engine supports modern dual-pass flags
-        # (strips badges & card description lines while preserving full-height compatibility for legacy 1-arg test stubs)
-        sy_start = 0
-        sy_end = title_h
-        if existing_matches and self._ocr_accepts_kwarg("force_dual_pass"):
-            ny0s = [c.screen_box[1] - band_origin_y for c in existing_matches.values()]
-            ny1s = [c.screen_box[3] - band_origin_y for c in existing_matches.values()]
-            min_ny0 = min(ny0s)
-            max_ny1 = max(ny1s)
-            line_span = max(24, int(max_ny1 - min_ny0))
-            pad_y = max(18, int(round(line_span * 0.75)))
-            cand_y0 = max(0, int(min_ny0) - pad_y)
-            cand_y1 = min(title_h, int(max_ny1) + pad_y)
-            if cand_y1 - cand_y0 >= 16:
-                sy_start, sy_end = cand_y0, cand_y1
-
-        slot_crop = title_crop[sy_start:sy_end, sx_start:sx_end]
-        masked_slot_crop = _mask_excluded_regions(
-            slot_crop,
-            band_origin_x + sx_start,
-            band_origin_y + sy_start,
-            exclude_rects,
-        )
-        enhanced_crop = self._enhance_slot_crop(masked_slot_crop)
-        t_ocr0 = time.perf_counter()
-        raw_retry_lines = self._call_ocr(enhanced_crop, dual_pass=True, force_dual_pass=True)
-        ocr_ms = (time.perf_counter() - t_ocr0) * 1000.0
-        raw_retry_shadowed = list(getattr(self.ocr, "last_shadowed_pass2", []) or [])
-        retry_shadowed = _filter_excluded_shadowed_pass2(
-            raw_retry_shadowed,
-            band_origin_x + sx_start,
-            band_origin_y + sy_start,
-            exclude_rects,
-            coord_scale=0.5,
-        )
-
-        mapped_lines = [
-            OcrLine(
-                text=rline.text,
-                x=sx_start + rline.x * 0.5,
-                y=sy_start + rline.y * 0.5,
-                w=rline.w * 0.5,
-                h=rline.h * 0.5,
-                pass_id=int(getattr(rline, "pass_id", 1)),
-            )
-            for rline in raw_retry_lines
-        ]
-        filtered = filter_excluded_lines(mapped_lines, band_origin_x, band_origin_y, exclude_rects)
-        if diag_out is not None:
-            diag_out["ocr_ms"] = ocr_ms
-            diag_out["match_ms"] = 0.0
-            diag_out["shadowed_pass2"] = retry_shadowed
-            diag_out["slot_slice_bbox"] = (sx_start, sy_start, sx_end, sy_end)
-            diag_out["matched_meta"] = None
-            diag_out["near_miss"] = None
-        if not filtered:
-            return None, 0
-
+        total_slots: int,
+    ) -> tuple[DetectedCard | None, dict[str, Any] | None, dict[str, Any] | None]:
         existing_ids = {c.augment.augment_id for c in existing_matches.values()}
         existing_x_spans = [(c.screen_box[0], c.screen_box[2]) for c in existing_matches.values()]
         game_left = band_origin_x - tl
@@ -812,7 +765,6 @@ class AugmentPickerDetector:
         best_card: DetectedCard | None = None
         best_meta: dict[str, Any] | None = None
         best_near_miss: dict[str, Any] | None = None
-        t_match0 = time.perf_counter()
 
         for mline in filtered:
             screen_cx = band_origin_x + mline.cx
@@ -906,12 +858,341 @@ class AugmentPickerDetector:
                     "title_crop_bbox": crop_bbox,
                     "recovered": True,
                 }
+        return best_card, best_meta, best_near_miss
+
+    def _recover_slot_trimmed_fallback(
+        self,
+        masked_slot_crop: np.ndarray,
+        *,
+        missing_slot: int,
+        sx_start: int,
+        sy_start: int,
+        title_w: int,
+        title_h: int,
+        band_w: int,
+        band_origin_x: int,
+        band_origin_y: int,
+        card_crop: np.ndarray,
+        tl: int,
+        cl: int,
+        tt: int,
+        ct: int,
+        fh: int,
+        exclude_rects: Sequence[tuple[int, int, int, int]],
+        existing_matches: dict[int, DetectedCard],
+        total_slots: int,
+    ) -> tuple[DetectedCard | None, dict[str, Any] | None, float, int]:
+        """Trim left/right 12% metal borders + top 15% distracting edge and run clean skip_clahe OCR."""
+        sh, sw = masked_slot_crop.shape[:2]
+        trim_x0 = int(round(sw * 0.12))
+        trim_x1 = int(round(sw * 0.88))
+        trim_y0 = int(round(sh * 0.15))
+        if trim_x1 - trim_x0 < 12 or sh - trim_y0 < 12:
+            return None, None, 0.0, 0
+
+        trimmed = masked_slot_crop[trim_y0:sh, trim_x0:trim_x1]
+        achrom = np.min(trimmed, axis=2) if trimmed.ndim == 3 else trimmed
+        trimmed_b15_y1 = max(trim_y0 + 12, int(round(sh * 0.85)))
+        trimmed_b15 = masked_slot_crop[trim_y0:trimmed_b15_y1, trim_x0:trim_x1]
+
+        candidates: list[tuple[int, int, float, np.ndarray]] = [
+            (0, 0, 1.0, achrom),
+            (8, 8, 1.0, cv2.copyMakeBorder(achrom, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=14)),
+            (0, 0, 0.5, self._enhance_slot_crop(achrom)),
+            (
+                8,
+                8,
+                1.0,
+                cv2.copyMakeBorder(trimmed_b15, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=(16, 14, 12)),
+            ),
+        ]
+
+        extra_ocr_ms = 0.0
+        extra_lines = 0
+        excl_list = list(exclude_rects)
+        for pad_x, pad_y, coord_scale, buf in candidates:
+            t0 = time.perf_counter()
+            raw_lines = self._call_ocr(buf, dual_pass=True, force_dual_pass=True, skip_clahe=True)
+            extra_ocr_ms += (time.perf_counter() - t0) * 1000.0
+            if not raw_lines:
+                continue
+            mapped = [
+                OcrLine(
+                    text=rline.text,
+                    x=sx_start + trim_x0 + rline.x * coord_scale - pad_x,
+                    y=sy_start + trim_y0 + rline.y * coord_scale - pad_y,
+                    w=rline.w * coord_scale,
+                    h=rline.h * coord_scale,
+                    pass_id=int(getattr(rline, "pass_id", 1)),
+                )
+                for rline in raw_lines
+            ]
+            filtered = filter_excluded_lines(mapped, band_origin_x, band_origin_y, excl_list)
+            extra_lines += len(filtered)
+            if not filtered:
+                continue
+            cand_card, cand_meta, _ = self._match_slot_lines(
+                filtered,
+                missing_slot=missing_slot,
+                title_w=title_w,
+                title_h=title_h,
+                band_w=band_w,
+                band_origin_x=band_origin_x,
+                band_origin_y=band_origin_y,
+                card_crop=card_crop,
+                tl=tl,
+                cl=cl,
+                tt=tt,
+                ct=ct,
+                fh=fh,
+                exclude_rects=exclude_rects,
+                existing_matches=existing_matches,
+                total_slots=total_slots,
+            )
+            if cand_card is not None:
+                return cand_card, cand_meta, extra_ocr_ms, extra_lines
+        return None, None, extra_ocr_ms, extra_lines
+
+    def _recover_slot_subcrop(
+        self,
+        masked_slot_crop: np.ndarray,
+        *,
+        missing_slot: int,
+        sx_start: int,
+        sy_start: int,
+        sx_end: int,
+        sy_end: int,
+        title_w: int,
+        title_h: int,
+        band_w: int,
+        band_origin_x: int,
+        band_origin_y: int,
+        card_crop: np.ndarray,
+        tl: int,
+        cl: int,
+        tt: int,
+        ct: int,
+        fh: int,
+        exclude_rects: Sequence[tuple[int, int, int, int]],
+        existing_matches: dict[int, DetectedCard],
+        total_slots: int = 3,
+        diag_out: dict[str, Any] | None = None,
+    ) -> tuple[DetectedCard | None, int]:
+        """Run primary 2x-CLAHE (skip_clahe in WinRT) then clean trimmed fallback on a slot crop."""
+        enhanced_crop = self._enhance_slot_crop(masked_slot_crop)
+        t_ocr0 = time.perf_counter()
+        raw_retry_lines = self._call_ocr(
+            enhanced_crop,
+            dual_pass=True,
+            force_dual_pass=True,
+            skip_clahe=True,
+        )
+        ocr_ms = (time.perf_counter() - t_ocr0) * 1000.0
+        raw_retry_shadowed = list(getattr(self.ocr, "last_shadowed_pass2", []) or [])
+        retry_shadowed = _filter_excluded_shadowed_pass2(
+            raw_retry_shadowed,
+            band_origin_x + sx_start,
+            band_origin_y + sy_start,
+            exclude_rects,
+            coord_scale=0.5,
+        )
+
+        mapped_lines = [
+            OcrLine(
+                text=rline.text,
+                x=sx_start + rline.x * 0.5,
+                y=sy_start + rline.y * 0.5,
+                w=rline.w * 0.5,
+                h=rline.h * 0.5,
+                pass_id=int(getattr(rline, "pass_id", 1)),
+            )
+            for rline in raw_retry_lines
+        ]
+        excl_list = list(exclude_rects)
+        filtered = filter_excluded_lines(mapped_lines, band_origin_x, band_origin_y, excl_list)
+        if diag_out is not None:
+            diag_out["ocr_ms"] = ocr_ms
+            diag_out["match_ms"] = 0.0
+            diag_out["shadowed_pass2"] = retry_shadowed
+            diag_out["slot_slice_bbox"] = (sx_start, sy_start, sx_end, sy_end)
+            diag_out["matched_meta"] = None
+            diag_out["near_miss"] = None
+
+        best_card: DetectedCard | None = None
+        best_meta: dict[str, Any] | None = None
+        best_near_miss: dict[str, Any] | None = None
+        t_match0 = time.perf_counter()
+        if filtered:
+            best_card, best_meta, best_near_miss = self._match_slot_lines(
+                filtered,
+                missing_slot=missing_slot,
+                title_w=title_w,
+                title_h=title_h,
+                band_w=band_w,
+                band_origin_x=band_origin_x,
+                band_origin_y=band_origin_y,
+                card_crop=card_crop,
+                tl=tl,
+                cl=cl,
+                tt=tt,
+                ct=ct,
+                fh=fh,
+                exclude_rects=exclude_rects,
+                existing_matches=existing_matches,
+                total_slots=total_slots,
+            )
+
+        total_lines = len(filtered)
+        if best_card is None and self._ocr_accepts_kwarg("skip_clahe"):
+            fb_card, fb_meta, fb_ocr_ms, fb_lines = self._recover_slot_trimmed_fallback(
+                masked_slot_crop,
+                missing_slot=missing_slot,
+                sx_start=sx_start,
+                sy_start=sy_start,
+                title_w=title_w,
+                title_h=title_h,
+                band_w=band_w,
+                band_origin_x=band_origin_x,
+                band_origin_y=band_origin_y,
+                card_crop=card_crop,
+                tl=tl,
+                cl=cl,
+                tt=tt,
+                ct=ct,
+                fh=fh,
+                exclude_rects=exclude_rects,
+                existing_matches=existing_matches,
+                total_slots=total_slots,
+            )
+            ocr_ms += fb_ocr_ms
+            total_lines += fb_lines
+            if fb_card is not None:
+                best_card = fb_card
+                best_meta = fb_meta
 
         if diag_out is not None:
+            diag_out["ocr_ms"] = ocr_ms
             diag_out["match_ms"] = (time.perf_counter() - t_match0) * 1000.0
             diag_out["matched_meta"] = best_meta
             diag_out["near_miss"] = best_near_miss
-        return best_card, len(filtered)
+        return best_card, total_lines
+
+    def recover_slot_from_crop(
+        self,
+        slot_crop: np.ndarray,
+        *,
+        slot_index: int = 0,
+        exclude_rects: Sequence[tuple[int, int, int, int]] | None = None,
+        existing_matches: dict[int, DetectedCard] | None = None,
+        total_slots: int = 3,
+        diag_out: dict[str, Any] | None = None,
+    ) -> DetectedCard | None:
+        """Recover a card directly from a standalone single-slot BGR crop (primary + clean fallback)."""
+        if slot_crop is None or slot_crop.size == 0:
+            return None
+        sh, sw = slot_crop.shape[:2]
+        if sh < 4 or sw < 4:
+            return None
+        excl = list(exclude_rects or ())
+        masked = _mask_excluded_regions(slot_crop, 0, 0, excl)
+        card, _ = self._recover_slot_subcrop(
+            masked,
+            missing_slot=slot_index,
+            sx_start=0,
+            sy_start=0,
+            sx_end=sw,
+            sy_end=sh,
+            title_w=sw,
+            title_h=sh,
+            band_w=sw,
+            band_origin_x=0,
+            band_origin_y=0,
+            card_crop=slot_crop,
+            tl=0,
+            cl=0,
+            tt=0,
+            ct=0,
+            fh=max(sh * 19, 1080),
+            exclude_rects=excl,
+            existing_matches=existing_matches or {},
+            total_slots=total_slots,
+            diag_out=diag_out,
+        )
+        return card
+
+    def _recover_missing_slot(
+        self,
+        missing_slot: int,
+        title_crop: np.ndarray,
+        card_crop: np.ndarray,
+        band_w: int,
+        band_origin_x: int,
+        band_origin_y: int,
+        tl: int,
+        cl: int,
+        tt: int,
+        ct: int,
+        fh: int,
+        exclude_rects: list[tuple[int, int, int, int]],
+        existing_matches: dict[int, DetectedCard],
+        total_slots: int = 3,
+        diag_out: dict[str, Any] | None = None,
+    ) -> tuple[DetectedCard | None, int]:
+        """Run targeted 2x contrast-enhanced OCR retry on a single missing slot sub-crop."""
+        slice_map = self._SLOT_SLICE_RATIOS_4 if total_slots >= 4 else self._SLOT_SLICE_RATIOS_3
+        r0, r1 = slice_map[missing_slot]
+        title_h, title_w = title_crop.shape[:2]
+        sx_start = max(0, int(band_w * r0))
+        sx_end = min(title_w, int(round(band_w * r1)))
+        if sx_end - sx_start < 4 or title_h < 4:
+            return None, 0
+
+        # Crop tight to neighbor card title Y-band when OCR engine supports modern dual-pass flags
+        # (strips badges & card description lines while preserving full-height compatibility for legacy 1-arg test stubs)
+        sy_start = 0
+        sy_end = title_h
+        if existing_matches and self._ocr_accepts_kwarg("force_dual_pass"):
+            ny0s = [c.screen_box[1] - band_origin_y for c in existing_matches.values()]
+            ny1s = [c.screen_box[3] - band_origin_y for c in existing_matches.values()]
+            min_ny0 = min(ny0s)
+            max_ny1 = max(ny1s)
+            line_span = max(24, int(max_ny1 - min_ny0))
+            pad_y = max(18, int(round(line_span * 0.75)))
+            cand_y0 = max(0, int(min_ny0) - pad_y)
+            cand_y1 = min(title_h, int(max_ny1) + pad_y)
+            if cand_y1 - cand_y0 >= 16:
+                sy_start, sy_end = cand_y0, cand_y1
+
+        slot_crop = title_crop[sy_start:sy_end, sx_start:sx_end]
+        masked_slot_crop = _mask_excluded_regions(
+            slot_crop,
+            band_origin_x + sx_start,
+            band_origin_y + sy_start,
+            exclude_rects,
+        )
+        return self._recover_slot_subcrop(
+            masked_slot_crop,
+            missing_slot=missing_slot,
+            sx_start=sx_start,
+            sy_start=sy_start,
+            sx_end=sx_end,
+            sy_end=sy_end,
+            title_w=title_w,
+            title_h=title_h,
+            band_w=band_w,
+            band_origin_x=band_origin_x,
+            band_origin_y=band_origin_y,
+            card_crop=card_crop,
+            tl=tl,
+            cl=cl,
+            tt=tt,
+            ct=ct,
+            fh=fh,
+            exclude_rects=exclude_rects,
+            existing_matches=existing_matches,
+            total_slots=total_slots,
+            diag_out=diag_out,
+        )
 
     @staticmethod
     def _passes_idle_card_structure_gate(card_crop: np.ndarray, title_crop: np.ndarray) -> bool:
@@ -1082,8 +1363,8 @@ class AugmentPickerDetector:
             coord_scale=1.0,
         )
 
-        # Reject ARAM Mayhem Stat Anvil popup ('属性锻造器' or >=2 '*碎片' lines) immediately
-        if _is_stat_anvil_lines(raw_lines):
+        # Reject ARAM Mayhem Stat Anvil popup ('属性锻造器'/'属性铁砧'/'能力值鐵砧' or >=2 '*碎片' lines) immediately
+        if _is_stat_anvil_lines(raw_lines, client_locale=self.client_locale):
             self._pending_ids = ()
             self._stable_count = 0
             self._locked_cards = ()
@@ -1512,7 +1793,7 @@ class AugmentPickerDetector:
             if s not in prev_slot_map and aid not in prev_locked_ids
         ]
 
-        # 1-frame grace when a single slot momentarily drops out from already-locked cards
+        # 2-frame grace when a single slot momentarily drops out from already-locked cards
         is_strict_subset_dropout = bool(
             prev_locked_cards
             and not any_shared_slot_changed
@@ -1522,7 +1803,12 @@ class AugmentPickerDetector:
         )
         if is_strict_subset_dropout:
             self._subset_drop_frames += 1
-            if not force and self._subset_drop_frames == 1:
+            if not force and self._subset_drop_frames <= 2:
+                if cur_ids == self._pending_ids:
+                    self._stable_count += 1
+                else:
+                    self._pending_ids = cur_ids
+                    self._stable_count = 1
                 self.false_reroll_suppressed_count += 1
                 return PickerDetectionResult(
                     picker_visible=True,

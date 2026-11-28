@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 
 from hex_helper.bridge.protocol import CoachAdvicePayload
 from hex_helper.config import (
+    DATA_BAND_MODES,
     GEMINI_MODELS,
     GEMINI_THINKING_LEVELS,
     AppConfig,
@@ -62,11 +63,18 @@ from hex_helper.config import (
     mask_api_key,
 )
 from hex_helper.data.hero_signatures import get_hero_signature_db
+from hex_helper.data.locale_pack import (
+    CLIENT_LOCALES,
+    CLIENT_LOCALE_LABELS,
+    normalize_client_locale,
+    t2s_normalize,
+)
 from hex_helper.data.provider import DatasetDescriptor
 from hex_helper.data.special_builds import SpecialAugmentBuild, get_special_augment_db
 from hex_helper.data.store import DataStore
 from hex_helper.edition import APP_VERSION, is_commercial_edition
 from hex_helper.game.lol_locator import clear_locator_cache, detect_primary_lol_install, validate_lol_install_dir
+from hex_helper.setup.preflight import check_locale_ocr_readiness, trigger_install_ocr_pack
 from hex_helper.scoring.build_synergy import normalize_item_id
 from hex_helper.scoring.destiny import rank_destiny_items
 from hex_helper.scoring.tier import score_hero_augment, score_hero_tier
@@ -405,6 +413,7 @@ class LookupWindow(QWidget):
         self._item_icon_cache: dict[tuple[str, int], QPixmap] = {}
         self._fetching_item_icons: set[str] = set()
         self._fade_anim: QPropertyAnimation | None = None
+        self._fade_target: QWidget | None = None
         self._normal_patch: str = "latest"
         self._prism_patch: str = "latest"
         self._high_band_patch: str = "16.22"
@@ -614,14 +623,14 @@ class LookupWindow(QWidget):
 
         # === 4. Bottom LoL Client Footer Bar with Double-Bevel Metallic Buttons ===
         footer = QFrame()
-        footer.setFixedHeight(54)
+        footer.setFixedHeight(48)
         footer.setStyleSheet(
             "QFrame { background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
             "stop:0 rgba(2, 10, 20, 236), stop:1 rgba(1, 7, 14, 245)); "
             "border-top: 1px solid rgba(120, 90, 40, 155); }"
         )
         fl = QHBoxLayout(footer)
-        fl.setContentsMargins(16, 8, 12, 8)
+        fl.setContentsMargins(16, 6, 12, 6)
         fl.setSpacing(10)
 
         self.cal_btn = HextechActionButton("校准三选一 F8", variant="gold", height=34)
@@ -631,7 +640,7 @@ class LookupWindow(QWidget):
         self.feedback_btn = HextechActionButton("问题反馈", variant="gold", height=34)
         self.feedback_btn.setToolTip("遇到识别异常或报错？点击一键反馈并附带最近 20 局脱敏运行日志")
         self.feedback_btn.clicked.connect(lambda: self._on_open_feedback and self._on_open_feedback())
-        self.footer_coach_btn = HextechActionButton("呼叫参谋推演 F6", variant="cyan", pointed_right=True, height=36)
+        self.footer_coach_btn = HextechActionButton("呼叫参谋推演 F6", variant="cyan", pointed_right=True, height=34)
         self.footer_coach_btn.setMinimumWidth(172)
         self.footer_coach_btn.clicked.connect(lambda: self._on_test_coach and self._on_test_coach())
 
@@ -650,6 +659,26 @@ class LookupWindow(QWidget):
         fl.addWidget(self.version_lbl)
         fl.addWidget(grip)
         root.addWidget(footer)
+
+        self.footer_disclaimer_bar = QFrame()
+        self.footer_disclaimer_bar.setFixedHeight(20)
+        self.footer_disclaimer_bar.setStyleSheet(
+            "QFrame { background-color: #020810; border-top: 1px solid rgba(120, 90, 40, 85); }"
+        )
+        fdl = QHBoxLayout(self.footer_disclaimer_bar)
+        fdl.setContentsMargins(16, 0, 16, 0)
+        fdl.setSpacing(0)
+        self.footer_disclaimer_lbl = QLabel(
+            "提示：本助手基于对局数据库与 AI 能力开发，所有建议均源于大数据统计与 AI 推演，可能与个人游戏经验存在差异，仅供对局参考与娱乐体验。"
+        )
+        self.footer_disclaimer_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #7C8594; font-size: 10px;"
+        )
+        self.footer_disclaimer_lbl.setToolTip(
+            "本助手基于对局统计数据库与 AI 能力开发，所有海克斯选卡、出装与战术建议均源于大数据统计及 AI 结合大数据的实时推演，可能与个人游戏经验或临场手感存在差异，仅供对局参考与娱乐体验（情绪价值），不构成胜率承诺。"
+        )
+        fdl.addWidget(self.footer_disclaimer_lbl, 1)
+        root.addWidget(self.footer_disclaimer_bar)
         self.update_hotkeys_display(self._cfg.hotkeys)
         self._ui_ready = True
 
@@ -703,6 +732,9 @@ class LookupWindow(QWidget):
             "auto_first_prismatic_mode": bool(self._cfg.auto_first_prismatic_mode),
             "smart_picker_ai_gate": bool(self._cfg.smart_picker_ai_gate),
             "telemetry_enabled": bool(self._cfg.telemetry_enabled),
+            "allow_screen_recording_overlays": bool(getattr(self._cfg, "allow_screen_recording_overlays", False)),
+            "data_band_mode": str(getattr(self._cfg, "data_band_mode", "all") or "all"),
+            "client_locale": normalize_client_locale(getattr(self._cfg, "client_locale", "zh_cn")),
             "coach_mode": str(self._cfg.coach_mode or ""),
             "coach_tier": str(self._cfg.coach_tier or ""),
         }
@@ -988,14 +1020,39 @@ class LookupWindow(QWidget):
 
     def _filter_special_list(self, text: str) -> None:
         db = get_special_augment_db()
-        base = db.search(text)
+        clean_q = (text or "").strip()
+        if not clean_q or self._store is None or self._store.client_locale == "zh_cn":
+            base = db.search(clean_q)
+        else:
+            q_low = clean_q.lower()
+            q_fold = t2s_normalize(q_low).lower()
+            base_cn = {e.augment_id: e for e in db.search(clean_q)}
+            base_fold = {e.augment_id: e for e in db.search(t2s_normalize(clean_q))}
+            matched: list[SpecialAugmentBuild] = []
+            seen_ids: set[str] = set()
+            for e in db.all_entries():
+                disp_nm = self._store.display_augment_name(e.augment_id, e.name)
+                disp_low = disp_nm.lower()
+                disp_fold = t2s_normalize(disp_nm).lower()
+                if (
+                    e.augment_id in base_cn
+                    or e.augment_id in base_fold
+                    or q_low in disp_low
+                    or (q_fold and q_fold in disp_fold)
+                ) and e.augment_id not in seen_ids:
+                    seen_ids.add(e.augment_id)
+                    matched.append(e)
+            base = matched
         self._special_entries = [e for e in base if self._matches_special_category(e, self._special_category_filter)]
         self.special_list.clear()
         for e in self._special_entries:
             r_label = RARITY_COLORS.get(e.rarity, ("#C8AA6E", ""))[1]
+            disp_nm = self._store.display_augment_name(e.augment_id, e.name) if self._store is not None else e.name
             alias_s = f" ({'/'.join(e.aliases[:2])})" if e.aliases else ""
-            item = QListWidgetItem(f"[{r_label}] {e.name}{alias_s}")
+            item = QListWidgetItem(f"[{r_label}] {disp_nm}{alias_s}")
             item.setData(Qt.ItemDataRole.UserRole, e.augment_id)
+            if disp_nm != e.name:
+                item.setToolTip(f"{disp_nm}（国服：{e.name}）")
             self.special_list.addItem(item)
         if self._special_entries:
             self.special_list.setCurrentRow(0)
@@ -1012,8 +1069,9 @@ class LookupWindow(QWidget):
             return
         e = self._special_entries[row]
         r_label = RARITY_COLORS.get(e.rarity, ("#C8AA6E", ""))[1]
+        disp_nm = self._store.display_augment_name(e.augment_id, e.name) if self._store is not None else e.name
         aliases = f"  ·  俗称：{' / '.join(e.aliases)}" if e.aliases else ""
-        self.sp_title_lbl.setText(f"{e.name}  [{r_label}]")
+        self.sp_title_lbl.setText(f"{disp_nm}  [{r_label}]")
         tags = []
         if e.transformative:
             tags.append("⚡ 触发自动允许变阵")
@@ -1027,7 +1085,8 @@ class LookupWindow(QWidget):
         def _fmt_item(iid: str) -> str:
             if self._store is not None:
                 info = self._store.get_item_info(iid)
-                return f"{info.name}({info.gold}G)" if info.gold > 0 else info.name
+                d_name = self._store.display_item_name(iid, info.name)
+                return f"{d_name}({info.gold}G)" if info.gold > 0 else d_name
             return iid
 
         # Render real DDragon item icon strip for force_items + core_items
@@ -1056,7 +1115,11 @@ class LookupWindow(QWidget):
             ico.setFixedSize(26, 26)
             ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
             pm = self._get_item_pixmap(iid, 24)
-            nm_short = self._store.get_item_info(iid).name if self._store else iid
+            nm_short = (
+                self._store.display_item_name(iid, self._store.get_item_info(iid).name)
+                if self._store
+                else iid
+            )
             if pm is not None:
                 ico.setPixmap(pm)
             else:
@@ -1090,7 +1153,139 @@ class LookupWindow(QWidget):
         self.sp_tip_lbl.setText(f"打法思路：{e.playstyle_tip}")
 
     def _build_coach_page(self) -> None:
-        self._build_commercial_coach_page()
+        if self._commercial:
+            self._build_commercial_coach_page()
+            return
+
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(20, 14, 20, 14)
+        lay.setSpacing(10)
+
+        # Compact Top Status Banner with 1-click Collapse/Expand Config Toggle
+        banner = HextechInteractiveCard("#0AC8B9")
+        bl = QHBoxLayout(banner)
+        bl.setContentsMargins(16, 10, 16, 10)
+        left = QVBoxLayout()
+        left.setSpacing(3)
+        self.coach_page_status = QLabel("GEMINI 4 HYDROGEN · 独立 AI 参谋")
+        self.coach_page_status.setFont(display_font(12, bold=True, letter_spacing=1.0))
+        self.coach_page_status.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+        self.gemini_conn_status_lbl = QLabel(self._format_initial_key_hint())
+        self.gemini_conn_status_lbl.setWordWrap(True)
+        self.gemini_conn_status_lbl.setStyleSheet("border: none; background: transparent; color: #0AC8B9; font-size: 11px;")
+        left.addWidget(self.coach_page_status)
+        left.addWidget(self.gemini_conn_status_lbl)
+        bl.addLayout(left, 1)
+
+        self.toggle_gemini_form_btn = HextechActionButton("修改配置", variant="gold", height=32)
+        self.toggle_gemini_form_btn.setMinimumWidth(86)
+        self.toggle_gemini_form_btn.clicked.connect(lambda: self.set_gemini_form_collapsed(not self._gemini_form_collapsed))
+        bl.addWidget(self.toggle_gemini_form_btn)
+
+        push_btn = HextechActionButton("立即推演 F6", variant="cyan", pointed_right=True, height=34)
+        push_btn.clicked.connect(lambda: self._on_test_coach and self._on_test_coach())
+        self.tab2_push_btn = push_btn
+        bl.addWidget(push_btn)
+        lay.addWidget(banner)
+
+        # Collapsible Direct Gemini API Configuration Card (auto-collapsed once Key is saved!)
+        self.gemini_config_card = HextechInteractiveCard("#C8AA6E")
+        gl = QVBoxLayout(self.gemini_config_card)
+        gl.setContentsMargins(16, 12, 16, 12)
+        gl.setSpacing(9)
+
+        g_hdr = QLabel("◈ Gemini API 直连参谋配置（脱离 Antigravity 独立运行，仍兼容 18421 桥接）")
+        g_hdr.setFont(display_font(10, bold=True, letter_spacing=0.8))
+        g_hdr.setStyleSheet("border: none; background: transparent; color: #C8AA6E;")
+        gl.addWidget(g_hdr)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+
+        m_lbl = QLabel("参谋模式：")
+        m_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+        self.coach_mode_combo = QComboBox()
+        for code, label in (
+            ("auto", "自动（有 Key 直连 Gemini，否则外部桥接）"),
+            ("gemini", "仅 Gemini API 直连（完全独立）"),
+            ("antigravity", "仅外部 Antigravity 桥接 (18421)"),
+            ("off", "关闭 AI（仅本地 5ms 大数据引擎）"),
+        ):
+            self.coach_mode_combo.addItem(label, code)
+        idx_mode = self.coach_mode_combo.findData(self._cfg.coach_mode)
+        self.coach_mode_combo.setCurrentIndex(idx_mode if idx_mode >= 0 else 0)
+
+        mod_lbl = QLabel("模型：")
+        mod_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+        self.gemini_model_combo = QComboBox()
+        self.gemini_model_combo.setEditable(True)
+        for m in GEMINI_MODELS:
+            self.gemini_model_combo.addItem(m)
+        if self._cfg.gemini_model not in GEMINI_MODELS:
+            self.gemini_model_combo.addItem(self._cfg.gemini_model)
+        self.gemini_model_combo.setCurrentText(self._cfg.gemini_model)
+        self.gemini_model_combo.setMinimumWidth(185)
+
+        th_lbl = QLabel("思考深度：")
+        th_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+        self.gemini_thinking_combo = QComboBox()
+        thinking_labels = {
+            "medium": "medium（均衡 · 推荐）",
+            "low": "low（低延迟）",
+            "minimal": "minimal（极简 · 仅Flash）",
+            "high": "high（高思考 · 运行时封顶medium）",
+            "xhigh": "xhigh（已废弃 · 运行时封顶medium）",
+        }
+        for lvl in GEMINI_THINKING_LEVELS:
+            self.gemini_thinking_combo.addItem(thinking_labels.get(lvl, lvl), lvl)
+        idx_th = self.gemini_thinking_combo.findData(self._cfg.gemini_thinking_level)
+        self.gemini_thinking_combo.setCurrentIndex(idx_th if idx_th >= 0 else 0)
+
+        row1.addWidget(m_lbl)
+        row1.addWidget(self.coach_mode_combo, 1)
+        row1.addWidget(mod_lbl)
+        row1.addWidget(self.gemini_model_combo)
+        row1.addWidget(th_lbl)
+        row1.addWidget(self.gemini_thinking_combo)
+        gl.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        k_lbl = QLabel("Gemini API Key：")
+        k_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+        self.gemini_key_edit = QLineEdit(self._cfg.gemini_api_key)
+        self.gemini_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_key_edit.setPlaceholderText("粘贴 AIza... Key（留空时自动尝试读取环境变量 GEMINI_API_KEY）")
+
+        self.toggle_key_btn = HextechActionButton("显示", variant="gold", height=30)
+        self.toggle_key_btn.setFixedWidth(56)
+        self.toggle_key_btn.clicked.connect(self._toggle_api_key_visibility)
+
+        save_gemini_btn = HextechActionButton("保存配置", variant="gold", height=30)
+        save_gemini_btn.clicked.connect(self._save_clicked)
+
+        self.test_gemini_btn = HextechActionButton("测试 API 连通性", variant="cyan", pointed_right=True, height=30)
+        self.test_gemini_btn.clicked.connect(self._test_gemini_clicked)
+
+        row2.addWidget(k_lbl)
+        row2.addWidget(self.gemini_key_edit, 1)
+        row2.addWidget(self.toggle_key_btn)
+        row2.addWidget(save_gemini_btn)
+        row2.addWidget(self.test_gemini_btn)
+        gl.addLayout(row2)
+
+        self.gemini_adaptive_chk = QCheckBox(
+            "分场景自适应思考提速（三选一 low 极速 · 阵亡/选牌 medium 均衡 · 按 F6 用上方设定档位，并复用长连接）"
+        )
+        self.gemini_adaptive_chk.setChecked(self._cfg.gemini_adaptive_thinking)
+        gl.addWidget(self.gemini_adaptive_chk)
+
+        lay.addWidget(self.gemini_config_card)
+        self.set_gemini_form_collapsed(self._gemini_form_collapsed)
+
+        lay.addWidget(self._build_coach_output_card(), 1)
+        self.pages.addWidget(page)
 
     def _build_commercial_coach_page(self) -> None:
         page = QWidget()
@@ -1339,6 +1534,18 @@ class LookupWindow(QWidget):
         self.coach_history_lay.addStretch(1)
         self.coach_history_scroll.setWidget(self.coach_history_container)
         cl.addWidget(self.coach_history_scroll, 1)
+
+        self.coach_disclaimer_lbl = QLabel(
+            "免责声明：本助手基于对局统计数据库与 AI 能力开发，所有选卡与出装建议均源于大数据统计及 AI 推演，可能与个人游戏经验存在差异，仅供对局参考与娱乐体验。"
+        )
+        self.coach_disclaimer_lbl.setWordWrap(True)
+        self.coach_disclaimer_lbl.setStyleSheet(
+            "border: none; background: transparent; color: #7C8594; font-size: 10px;"
+        )
+        self.coach_disclaimer_lbl.setToolTip(
+            "本助手基于对局统计数据库与 AI 能力开发，所有海克斯选卡、出装与战术建议均源于大数据统计及 AI 结合大数据的实时推演，可能与个人游戏经验或临场手感存在差异，仅供对局参考与娱乐体验（情绪价值），不构成胜率承诺。"
+        )
+        cl.addWidget(self.coach_disclaimer_lbl)
 
         return self.coach_output_card
 
@@ -2029,13 +2236,13 @@ class LookupWindow(QWidget):
     def _build_settings_page(self) -> None:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(22, 14, 22, 14)
-        lay.setSpacing(10)
+        lay.setContentsMargins(22, 10, 22, 10)
+        lay.setSpacing(8)
 
         form_card = HextechInteractiveCard("#C8AA6E")
         fl = QVBoxLayout(form_card)
-        fl.setContentsMargins(16, 12, 16, 12)
-        fl.setSpacing(8)
+        fl.setContentsMargins(16, 10, 16, 10)
+        fl.setSpacing(6)
 
         if not self._commercial:
             p_row = QHBoxLayout()
@@ -2073,9 +2280,9 @@ class LookupWindow(QWidget):
             fl.addWidget(self.lol_detect_status_lbl)
 
         chk_grid = QGridLayout()
-        chk_grid.setContentsMargins(0, 2, 0, 2)
+        chk_grid.setContentsMargins(0, 0, 0, 0)
         chk_grid.setHorizontalSpacing(16)
-        chk_grid.setVerticalSpacing(6)
+        chk_grid.setVerticalSpacing(4)
 
         self.peek_chk = QCheckBox("阵亡逛商店自动微展抽屉，复活后自动收起")
         self.peek_chk.setChecked(self._cfg.auto_peek_on_death)
@@ -2100,6 +2307,11 @@ class LookupWindow(QWidget):
             "赛后匿名上报英雄、海克斯组合与推荐采纳率统计（不含任何账号隐私或聊天记录），帮助持续优化推荐准确度"
         )
         self.telemetry_chk.setChecked(self._cfg.telemetry_enabled)
+        self.screen_recording_chk = QCheckBox("录屏/截屏中显示游戏内悬浮窗")
+        self.screen_recording_chk.setToolTip(
+            "默认关闭以防止自身浮窗遮挡海克斯识别；开启后 OBS/录屏可采集悬浮窗（也可在浮窗右键菜单随时切换）"
+        )
+        self.screen_recording_chk.setChecked(bool(getattr(self._cfg, "allow_screen_recording_overlays", False)))
 
         chk_grid.addWidget(self.peek_chk, 0, 0)
         chk_grid.addWidget(self.combo_overlay_chk, 0, 1)
@@ -2108,19 +2320,88 @@ class LookupWindow(QWidget):
         chk_grid.addWidget(self.auto_first_prismatic_chk, 2, 0)
         chk_grid.addWidget(self.smart_picker_gate_chk, 2, 1)
         chk_grid.addWidget(self.telemetry_chk, 3, 0)
+        chk_grid.addWidget(self.screen_recording_chk, 4, 0)
+
+        # P0-3: Compact Data Band Mode Selector in unused chk_grid cell (3, 1) to preserve 940x610 vertical budget
+        band_row = QHBoxLayout()
+        band_row.setContentsMargins(0, 0, 0, 0)
+        band_row.setSpacing(6)
+        band_lbl = QLabel("胜率分段：")
+        band_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-weight: bold;")
+        self.data_band_combo = QComboBox()
+        self.data_band_combo.setMinimumWidth(136)
+        self.data_band_combo.setFixedHeight(24)
+        for band_code, band_text in (
+            ("all", "全分段全量 (all)"),
+            ("blended", "高分均衡 (blended)"),
+            ("high", "高分 Top5% (high)"),
+        ):
+            self.data_band_combo.addItem(band_text, band_code)
+        cur_band = str(getattr(self._cfg, "data_band_mode", "all") or "all").strip().lower()
+        band_idx = self.data_band_combo.findData(cur_band)
+        self.data_band_combo.setCurrentIndex(band_idx if band_idx >= 0 else 0)
+        self.data_band_combo.setToolTip(
+            "选择本地出装/核心件引擎采信的分段数据：全分段全量 / 高分均衡（50% 融合）/ 高分 Top5%（低样本平滑回退）"
+        )
+        self.data_band_hint_lbl = QLabel("")
+        self.data_band_hint_lbl.setStyleSheet("border: none; background: transparent; color: #A09B8C; font-size: 10px;")
+        band_row.addWidget(band_lbl)
+        band_row.addWidget(self.data_band_combo)
+        band_row.addWidget(self.data_band_hint_lbl, 1)
+        chk_grid.addLayout(band_row, 3, 1)
+
+        # Compact LoL Client Locale Selector in unused chk_grid cell (4, 1) preserving 940x610 height
+        locale_row = QHBoxLayout()
+        locale_row.setContentsMargins(0, 0, 0, 0)
+        locale_row.setSpacing(4)
+        locale_lbl = QLabel("客户端语言：")
+        locale_lbl.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-weight: bold;")
+        self.client_locale_combo = QComboBox()
+        self.client_locale_combo.setMinimumWidth(134)
+        self.client_locale_combo.setFixedHeight(24)
+        for loc_code in CLIENT_LOCALES:
+            self.client_locale_combo.addItem(CLIENT_LOCALE_LABELS[loc_code], loc_code)
+        cur_loc = normalize_client_locale(getattr(self._cfg, "client_locale", "zh_cn"))
+        loc_idx = self.client_locale_combo.findData(cur_loc)
+        self.client_locale_combo.setCurrentIndex(loc_idx if loc_idx >= 0 else 0)
+        self.client_locale_combo.setToolTip(
+            "选择英雄联盟客户端语言（国服简体 / 新加坡服简体 / 台服繁体），无需重新安装，保存后实时生效"
+        )
+        self.locale_ocr_hint_lbl = QLabel("")
+        self.locale_ocr_hint_lbl.setStyleSheet("border: none; background: transparent; color: #A09B8C; font-size: 10px;")
+        self.install_tw_ocr_btn = QPushButton("装繁体包")
+        self.install_tw_ocr_btn.setFixedHeight(22)
+        self.install_tw_ocr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.install_tw_ocr_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(6, 40, 50, 210); border: 1px solid #0397AB; "
+            "border-radius: 2px; padding: 0px 6px; color: #0AC8B9; font-size: 10px; font-weight: bold; }"
+            "QPushButton:hover { border-color: #0AC8B9; color: #F0E6D2; background-color: rgba(10, 62, 76, 230); }"
+        )
+        self.install_tw_ocr_btn.setToolTip("可选：尝试安装 Windows 繁体中文 OCR 识别包（不装也可直接用简转繁兼容模式）")
+        self.install_tw_ocr_btn.clicked.connect(self._install_tw_ocr_clicked)
+        self.install_tw_ocr_btn.hide()
+        locale_row.addWidget(locale_lbl)
+        locale_row.addWidget(self.client_locale_combo)
+        locale_row.addWidget(self.locale_ocr_hint_lbl, 1)
+        locale_row.addWidget(self.install_tw_ocr_btn)
+        chk_grid.addLayout(locale_row, 4, 1)
+
         chk_grid.setColumnStretch(0, 1)
         chk_grid.setColumnStretch(1, 1)
         fl.addLayout(chk_grid)
+        self._refresh_data_band_hint()
+        self.client_locale_combo.currentIndexChanged.connect(lambda _idx: self._refresh_locale_ocr_hint())
+        self._refresh_locale_ocr_hint()
 
         # Compact Hextech Custom Hotkey Strip (launches full game-style keybind editor)
         hk_bar = QFrame()
-        hk_bar.setFixedHeight(36)
+        hk_bar.setFixedHeight(32)
         hk_bar.setStyleSheet(
             "QFrame { background-color: rgba(5, 16, 30, 220); border: 1px solid rgba(10, 200, 185, 110); "
             "border-left: 3px solid #C8AA6E; border-radius: 2px; }"
         )
         hk_row = QHBoxLayout(hk_bar)
-        hk_row.setContentsMargins(10, 4, 8, 4)
+        hk_row.setContentsMargins(10, 3, 8, 3)
         hk_row.setSpacing(8)
         hk_ttl = QLabel("◈ 游戏快捷键：")
         hk_ttl.setStyleSheet("border: none; background: transparent; color: #C8AA6E; font-size: 11px; font-weight: bold;")
@@ -2136,11 +2417,11 @@ class LookupWindow(QWidget):
         fl.addWidget(hk_bar)
 
         save_row = QHBoxLayout()
-        save_btn = HextechActionButton("确认并保存设置", variant="cyan", pointed_right=True, height=34)
+        save_btn = HextechActionButton("确认并保存设置", variant="cyan", pointed_right=True, height=30)
         save_btn.clicked.connect(self._save_clicked)
-        self.toggle_combo_btn = HextechActionButton("预览/切换海克斯联动浮窗 (F7)", variant="gold", height=34)
+        self.toggle_combo_btn = HextechActionButton("预览/切换海克斯联动浮窗 (F7)", variant="gold", height=30)
         self.toggle_combo_btn.clicked.connect(lambda: self._on_toggle_combo and self._on_toggle_combo())
-        self.reset_overlay_sizes_btn = HextechActionButton("重置左右悬浮窗尺寸", variant="gold", height=34)
+        self.reset_overlay_sizes_btn = HextechActionButton("重置左右悬浮窗尺寸", variant="gold", height=30)
         self.reset_overlay_sizes_btn.setToolTip(
             "将左右两侧推荐悬浮窗恢复至当前屏幕（含 4K）自适应默认尺寸与字号；也可双击浮窗边角缩放把手一键恢复"
         )
@@ -2151,7 +2432,7 @@ class LookupWindow(QWidget):
         save_row.addWidget(self.toggle_combo_btn)
         save_row.addWidget(self.reset_overlay_sizes_btn)
         if not self._commercial:
-            self.seal_sandbox_btn = HextechActionButton("预览海克斯封印与 720ms 破封沙盒", variant="gold", height=34)
+            self.seal_sandbox_btn = HextechActionButton("预览海克斯封印与 720ms 破封沙盒", variant="gold", height=30)
             self.seal_sandbox_btn.clicked.connect(self.open_seal_sandbox)
             save_row.addWidget(self.seal_sandbox_btn)
         save_row.addStretch(1)
@@ -2160,8 +2441,8 @@ class LookupWindow(QWidget):
 
         diag_card = HextechInteractiveCard("#0397AB")
         dl = QVBoxLayout(diag_card)
-        dl.setContentsMargins(16, 12, 16, 12)
-        dl.setSpacing(6)
+        dl.setContentsMargins(16, 10, 16, 10)
+        dl.setSpacing(4)
         diag_hdr_row = QHBoxLayout()
         diag_hdr_row.setContentsMargins(0, 0, 0, 0)
         diag_hdr_row.setSpacing(8)
@@ -2232,9 +2513,10 @@ class LookupWindow(QWidget):
         if self._on_tab_changed is not None:
             tab_name = self._TAB_NAMES[idx] if 0 <= idx < len(self._TAB_NAMES) else str(idx)
             self._on_tab_changed(idx, tab_name)
-        # Smooth OutCubic fade-in transition on page change
+        # Smooth OutCubic fade-in transition on page change (stop prior anim first to prevent dangling Qt C++ pointers)
+        self._stop_page_fade_anim()
         w = self.pages.currentWidget()
-        if w is not None:
+        if w is not None and not self._closed:
             eff = QGraphicsOpacityEffect(w)
             w.setGraphicsEffect(eff)
             anim = QPropertyAnimation(eff, b"opacity", self)
@@ -2242,9 +2524,48 @@ class LookupWindow(QWidget):
             anim.setStartValue(0.25)
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.finished.connect(lambda: w.setGraphicsEffect(None))
-            anim.start()
+            self._fade_target = w
             self._fade_anim = anim
+            anim.finished.connect(lambda target=w, finished_anim=anim: self._finish_page_fade_anim(target, finished_anim))
+            anim.start()
+
+    def _finish_page_fade_anim(self, target: QWidget, anim: QPropertyAnimation) -> None:
+        if self._fade_anim is anim:
+            self._fade_anim = None
+        if self._fade_target is target:
+            self._fade_target = None
+        if self._closed:
+            return
+        try:
+            from shiboken6 import isValid as _qt_is_valid
+
+            if not _qt_is_valid(self) or not _qt_is_valid(target):
+                return
+        except ImportError:
+            pass
+        try:
+            target.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+
+    def _stop_page_fade_anim(self) -> None:
+        anim = getattr(self, "_fade_anim", None)
+        target = getattr(self, "_fade_target", None)
+        self._fade_anim = None
+        self._fade_target = None
+        if anim is not None:
+            try:
+                anim.stop()
+            except RuntimeError:
+                pass
+        if target is not None:
+            try:
+                from shiboken6 import isValid as _qt_is_valid
+
+                if _qt_is_valid(target):
+                    target.setGraphicsEffect(None)
+            except (ImportError, RuntimeError):
+                pass
 
     def _trigger_mode_switch(self, patch: str, mode: str, band: str) -> None:
         self.mode_normal_btn.set_active(mode == "normal" and not band)
@@ -2283,6 +2604,12 @@ class LookupWindow(QWidget):
         self._cfg.auto_first_prismatic_mode = self.auto_first_prismatic_chk.isChecked()
         self._cfg.smart_picker_ai_gate = self.smart_picker_gate_chk.isChecked()
         self._cfg.telemetry_enabled = self.telemetry_chk.isChecked()
+        self._cfg.allow_screen_recording_overlays = self.screen_recording_chk.isChecked()
+        if hasattr(self, "data_band_combo") and self.data_band_combo is not None:
+            band_val = str(self.data_band_combo.currentData() or "all").strip().lower()
+            self._cfg.data_band_mode = band_val if band_val in DATA_BAND_MODES else "all"
+        if hasattr(self, "client_locale_combo") and self.client_locale_combo is not None:
+            self._cfg.client_locale = normalize_client_locale(self.client_locale_combo.currentData())
         if self._commercial:
             self._cfg.proxy_url = ""
             self._cfg.bridge_enabled = False
@@ -2412,8 +2739,83 @@ class LookupWindow(QWidget):
         elif self.pages.currentIndex() == 1 and self.special_list.currentRow() >= 0:
             self._on_special_selected(self.special_list.currentRow())
 
+    def _refresh_locale_ocr_hint(self) -> None:
+        if not hasattr(self, "client_locale_combo") or self.client_locale_combo is None:
+            return
+        loc = normalize_client_locale(self.client_locale_combo.currentData())
+        try:
+            info = check_locale_ocr_readiness(loc)
+        except Exception:
+            info = {
+                "ok": True,
+                "mode": "sc_t2s_fallback" if loc == "zh_tw" else "native_cn",
+                "can_install_tw": loc == "zh_tw",
+                "summary": "已就绪",
+            }
+        mode = str(info.get("mode") or "")
+        summary = str(info.get("summary") or "")
+        if mode == "native_cn":
+            short_txt, color = "简体就绪", "#0AC8B9"
+        elif mode == "native_tw":
+            short_txt, color = "繁中就绪", "#0AC8B9"
+        elif mode == "sc_t2s_fallback":
+            short_txt, color = "免装简转繁", "#C8AA6E"
+        else:
+            short_txt, color = "缺OCR包", "#FCA5A5"
+        if hasattr(self, "locale_ocr_hint_lbl") and self.locale_ocr_hint_lbl is not None:
+            self.locale_ocr_hint_lbl.setText(short_txt)
+            self.locale_ocr_hint_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: {color}; font-size: 10px;"
+            )
+            self.locale_ocr_hint_lbl.setToolTip(summary or short_txt)
+        if hasattr(self, "install_tw_ocr_btn") and self.install_tw_ocr_btn is not None:
+            self.install_tw_ocr_btn.setVisible(bool(loc == "zh_tw" and info.get("can_install_tw")))
+
+    def _install_tw_ocr_clicked(self) -> None:
+        ok, msg = trigger_install_ocr_pack("zh-TW")
+        if hasattr(self, "locale_ocr_hint_lbl") and self.locale_ocr_hint_lbl is not None:
+            short = "已发起安装" if ok else "请手动安装"
+            color = "#0AC8B9" if ok else "#FBBF24"
+            self.locale_ocr_hint_lbl.setText(short)
+            self.locale_ocr_hint_lbl.setStyleSheet(
+                f"border: none; background: transparent; color: {color}; font-size: 10px;"
+            )
+            self.locale_ocr_hint_lbl.setToolTip(msg)
+
+    def _refresh_data_band_hint(self) -> None:
+        if not hasattr(self, "data_band_hint_lbl") or self.data_band_hint_lbl is None:
+            return
+        has_high = False
+        if self._store is not None:
+            has_fn = getattr(self._store, "has_high_band", None)
+            if callable(has_fn):
+                has_high = bool(has_fn())
+            elif self._store.descriptor is not None:
+                has_high = bool(self._store.descriptor.bands)
+        if has_high:
+            self.data_band_hint_lbl.setText("✓ 支持高分 Top5%")
+            self.data_band_hint_lbl.setStyleSheet(
+                "border: none; background: transparent; color: #0AC8B9; font-size: 10px;"
+            )
+            self.data_band_hint_lbl.setToolTip("当前数据集已载入 bands/high 高分样本，可按需切换均衡或高分模式")
+        else:
+            self.data_band_hint_lbl.setText("当前版本全量数据")
+            self.data_band_hint_lbl.setStyleSheet(
+                "border: none; background: transparent; color: #A09B8C; font-size: 10px;"
+            )
+            self.data_band_hint_lbl.setToolTip("当前数据集未提供 bands/high 高分分段，计算时自动使用全量数据")
+
     def bind_store(self, store: DataStore) -> None:
         self._store = store
+        self._refresh_data_band_hint()
+        if hasattr(self, "client_locale_combo") and self.client_locale_combo is not None:
+            target_loc = normalize_client_locale(getattr(store, "client_locale", getattr(self._cfg, "client_locale", "zh_cn")))
+            idx_l = self.client_locale_combo.findData(target_loc)
+            if idx_l >= 0 and self.client_locale_combo.currentIndex() != idx_l:
+                self.client_locale_combo.blockSignals(True)
+                self.client_locale_combo.setCurrentIndex(idx_l)
+                self.client_locale_combo.blockSignals(False)
+            self._refresh_locale_ocr_hint()
         if store.descriptor:
             disp = format_display_patch(store.descriptor.patch)
             short_ver = disp.split("（")[0]
@@ -2425,8 +2827,11 @@ class LookupWindow(QWidget):
             )
             self.version_lbl.setText(f"v{APP_VERSION} · {short_ver}")
         self._filter_heroes(self.search_edit.text())
+        if self._selected_hero_id:
+            self._render_hero_detail(self._selected_hero_id)
         if self.hero_list.count() > 0 and self.hero_list.currentRow() < 0:
             self.hero_list.setCurrentRow(0)
+        self._filter_special_list(self.special_search.text())
         if self.special_list.currentRow() >= 0:
             self._on_special_selected(self.special_list.currentRow())
 
@@ -2438,12 +2843,23 @@ class LookupWindow(QWidget):
         if self._store is None:
             return
         q = query.strip().lower()
+        q_fold = t2s_normalize(q).lower()
         for h in self._store.all_heroes():
-            if q and q not in h.name.lower() and q not in h.title.lower():
+            disp_name = self._store.display_hero_name(h.hero_id, h.name)
+            disp_low = disp_name.lower()
+            disp_fold = t2s_normalize(disp_name).lower()
+            if q and (
+                q not in disp_low
+                and q not in h.name.lower()
+                and q not in h.title.lower()
+                and (not q_fold or q_fold not in disp_fold)
+            ):
                 continue
             tier = score_hero_tier(h.win_rate)
-            item = QListWidgetItem(f"[{tier:<2}]  #{h.rank:<3}  {h.name}    {h.win_rate * 100:.2f}%")
+            item = QListWidgetItem(f"[{tier:<2}]  #{h.rank:<3}  {disp_name}    {h.win_rate * 100:.2f}%")
             item.setData(Qt.ItemDataRole.UserRole, h.hero_id)
+            if disp_name != h.name:
+                item.setToolTip(f"{disp_name}（国服：{h.name}）")
             cached_pm = self._icon_cache.get(h.hero_id)
             if cached_pm is not None:
                 item.setIcon(QIcon(cached_pm))
@@ -2530,9 +2946,12 @@ class LookupWindow(QWidget):
         t_badge = QLabel(tier)
         t_badge.setFont(latin_serif_font(10, bold=True, letter_spacing=0.8))
         t_badge.setStyleSheet(tier_badge_qss(tier))
-        name_lbl = QLabel(hero.name)
+        hero_disp = self._store.display_hero_name(hid, hero.name)
+        name_lbl = QLabel(hero_disp)
         name_lbl.setFont(display_font(16, bold=True, letter_spacing=1.0))
         name_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+        if hero_disp != hero.name:
+            name_lbl.setToolTip(f"{hero_disp}（国服：{hero.name}）")
         sub_lbl = QLabel(f"·  {hero.title}")
         sub_lbl.setMinimumWidth(0)
         sub_lbl.setFont(display_font(10, bold=False, letter_spacing=0.4))
@@ -2633,10 +3052,13 @@ class LookupWindow(QWidget):
 
             mid = QVBoxLayout()
             mid.setSpacing(1)
-            nm = QLabel(s.name)
+            aug_disp = self._store.display_augment_name(s.augment_id, s.name)
+            nm = QLabel(aug_disp)
             nm.setMinimumWidth(0)
             nm.setFont(display_font(10, bold=True, letter_spacing=0.4))
             nm.setStyleSheet("border: none; background: transparent; color: #F0E6D2;")
+            if aug_disp != s.name:
+                nm.setToolTip(f"{aug_disp}（国服：{s.name}）")
             meta = QLabel(f"{r_label} · {s.sample_label}")
             meta.setMinimumWidth(0)
             meta.setStyleSheet("border: none; background: transparent; color: #A09B8C; font-size: 10px;")
@@ -2676,8 +3098,11 @@ class LookupWindow(QWidget):
             d_grid = QGridLayout()
             d_grid.setSpacing(6)
             for d_idx, d in enumerate(destiny):
-                pill = QLabel(f"◇ {d.name}  {d.win_rate * 100:.1f}% ({d.delta * 100:+.1f}%)")
+                d_disp = self._store.display_item_name(d.item_id, d.name)
+                pill = QLabel(f"◇ {d_disp}  {d.win_rate * 100:.1f}% ({d.delta * 100:+.1f}%)")
                 pill.setMinimumWidth(0)
+                if d_disp != d.name:
+                    pill.setToolTip(f"{d_disp}（国服：{d.name}）")
                 pill.setStyleSheet(
                     "background-color: rgba(1, 10, 19, 195); border: 1px solid #C89B3C; "
                     "border-radius: 2px; padding: 4px 8px; color: #F0E6D2; font-weight: bold; font-size: 11px;"
@@ -2692,7 +3117,7 @@ class LookupWindow(QWidget):
         builds = self._store.get_core_builds(hid)[:3]
         sig = get_hero_signature_db().get(hid, hero.name)
         if sig is not None:
-            sig_names = " › ".join(self._store.get_item_info(i).name for i in sig.signature_items[:5])
+            sig_names = " › ".join(self._store.display_item_name(i) for i in sig.signature_items[:5])
             sig_lbl = QLabel(f"◈ 海克斯招牌定位（低权重参考，以大数据为准）：【{sig.archetype}】{sig_names} — {sig.note}")
             sig_lbl.setWordWrap(True)
             sig_lbl.setStyleSheet(
@@ -2717,6 +3142,7 @@ class LookupWindow(QWidget):
                         sep.setStyleSheet("border: none; background: transparent; color: #785A28; font-weight: bold; font-size: 13px;")
                         bl.addWidget(sep)
                     info = self._store.get_item_info(iid)
+                    it_disp = self._store.display_item_name(iid, info.name)
                     ico = QLabel()
                     ico.setFixedSize(26, 26)
                     ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2725,10 +3151,12 @@ class LookupWindow(QWidget):
                     if ipm is not None:
                         ico.setPixmap(ipm)
                     else:
-                        ico.setText(info.name[:1])
-                    ico.setToolTip(f"{info.name} ({info.gold}G)")
-                    nm_lbl = QLabel(info.name)
+                        ico.setText(it_disp[:1])
+                    ico.setToolTip(f"{it_disp} ({info.gold}G)" if it_disp == info.name else f"{it_disp}（国服：{info.name} · {info.gold}G）")
+                    nm_lbl = QLabel(it_disp)
                     nm_lbl.setStyleSheet("border: none; background: transparent; color: #F0E6D2; font-weight: bold; font-size: 12px;")
+                    if it_disp != info.name:
+                        nm_lbl.setToolTip(f"{it_disp}（国服：{info.name}）")
                     bl.addWidget(ico)
                     bl.addWidget(nm_lbl)
                 ml = QLabel(f"胜率 {b.win_rate * 100:.2f}%  ·  选用 {b.pick_rate * 100:.1f}%  ·  {b.games:,}场")
@@ -2739,7 +3167,10 @@ class LookupWindow(QWidget):
 
         # 5. Bottom 4 Traps
         if len(scored) >= 4:
-            trap_names = "   |   ".join(f"{s.name} ({s.delta * 100:+.1f}%)" for s in scored[-4:])
+            trap_names = "   |   ".join(
+                f"{self._store.display_augment_name(s.augment_id, s.name)} ({s.delta * 100:+.1f}%)"
+                for s in scored[-4:]
+            )
             trap_lbl = QLabel(f"◇ 避坑海克斯：{trap_names}")
             trap_lbl.setWordWrap(True)
             trap_lbl.setStyleSheet(
@@ -2816,6 +3247,18 @@ class LookupWindow(QWidget):
         if path:
             self.lockfile_edit.setText(path)
 
+    def sync_screen_recording_checkbox(self, allowed: bool) -> None:
+        """Synchronize the screen-recording checkbox and backing config with overlay menu toggles."""
+        flag = bool(allowed)
+        self._cfg.allow_screen_recording_overlays = flag
+        chk = getattr(self, "screen_recording_chk", None)
+        if chk is not None:
+            was_blocked = chk.blockSignals(True)
+            try:
+                chk.setChecked(flag)
+            finally:
+                chk.blockSignals(was_blocked)
+
     def _save_clicked(self) -> None:
         before = self._safe_settings_snapshot() if self._on_settings_changed is not None else None
         cfg = self._collect_cfg_from_ui()
@@ -2833,6 +3276,7 @@ class LookupWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._closed = True
+        self._stop_page_fade_anim()
         if self._search_settle_timer is not None and self._search_settle_timer.isActive():
             self._search_settle_timer.stop()
         super().closeEvent(event)

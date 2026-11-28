@@ -15,6 +15,7 @@ from hex_helper.cloud.session_store import DpapiSessionStore
 from hex_helper.coach.gemini_coach import (
     COACH_RESPONSE_SCHEMA,
     COACH_SYSTEM_INSTRUCTION,
+    GeminiCoachClient,
     build_coach_prompt_payload,
     ground_coach_advice,
 )
@@ -257,11 +258,58 @@ def test_allies_self_dedup_fallback_without_store_by_items_and_kda() -> None:
     assert payload["enemies"][0]["items"] == ["三相之力"]
 
 
+def test_gemini_client_prompt_excludes_request_id_timestamp_and_caps_xhigh(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    captured: list[dict[str, Any]] = []
+
+    class _FakeInteractions:
+        def create(self, **kwargs: Any):
+            captured.append(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                output_text=json.dumps(
+                    {
+                        "augment_pick_advice": "",
+                        "buy_now": "先买耀光",
+                        "build_path": ["三相之力", "死亡之舞"],
+                        "next_items": [
+                            {"item_id": "3078", "name": "三相之力", "priority": "下件必出", "reason": "卡蜜尔核心"}
+                        ],
+                        "tactical_summary": "E闪留后排打二段Q真伤",
+                    },
+                    ensure_ascii=False,
+                ),
+                usage=SimpleNamespace(total_tokens=400, total_thought_tokens=120, total_output_tokens=100),
+            )
+
+    fake_client = SimpleNamespace(interactions=_FakeInteractions(), close=lambda: None)
+    coach = GeminiCoachClient(client_factory=lambda _k, _p, _t: fake_client)
+
+    req = CoachRequestPayload(
+        request_id="req-secret-volatile-id",
+        trigger_reason="manual_f6",
+        timestamp="2026-11-22T20:22:33+08:00",
+        dataset_patch="26.23",
+        my_hero={"hero_id": "164", "name": "卡蜜尔", "gold": 1500, "items": ["魄罗佳肴"]},
+    )
+    try:
+        advice, stats = coach.advise(req, store, api_key="AIzaDummyKey", thinking_level="xhigh", adaptive_thinking=False)
+    finally:
+        coach.close()
+
+    assert stats.thinking_level == "medium"
+    assert captured[0]["generation_config"] == {"thinking_level": "medium"}
+    assert "req-secret-volatile-id" not in captured[0]["input"]
+    assert "2026-11-22T20:22:33+08:00" not in captured[0]["input"]
+    assert advice.request_id == "req-secret-volatile-id"
+    assert "medium" in advice.source
+
+
 def test_config_evolution_defaults_auto_tier_and_no_xhigh_default(tmp_path: Path) -> None:
     assert "auto" in COACH_TIERS
 
     default_cfg = AppConfig()
-    assert default_cfg.coach_tier == "auto"
+    assert default_cfg.coach_tier == "a"
     assert default_cfg.gemini_thinking_level == "medium"
     assert default_cfg.telemetry_enabled is True
     assert default_cfg.auto_first_prismatic_mode is True
@@ -304,7 +352,7 @@ def test_config_evolution_defaults_auto_tier_and_no_xhigh_default(tmp_path: Path
 
     # Invalid coach_tier falls back to "a"
     bad_tier_cfg = AppConfig.from_dict({"coach_tier": "turbo_s_plus"})
-    assert bad_tier_cfg.coach_tier == "auto"
+    assert bad_tier_cfg.coach_tier == "a"
 
 
 def test_cloud_client_auto_tier_and_routed_tier_parsing(tmp_path: Path) -> None:
@@ -695,8 +743,10 @@ def test_opening_brief_protocol_schema_and_grounding(tmp_path: Path) -> None:
 
 def test_commercial_default_coach_tier_auto_and_explicit_overrides(monkeypatch) -> None:
     monkeypatch.setenv("HEX_EDITION", "dev")
-    assert _default_coach_tier() == "auto"
-    assert AppConfig().coach_tier == "auto"
+    assert _default_coach_tier() == "a"
+    assert AppConfig().coach_tier == "a"
+    assert AppConfig.from_dict({}).coach_tier == "a"
+    assert AppConfig.from_dict({"coach_tier": "auto"}).coach_tier == "auto"
 
     monkeypatch.setenv("HEX_EDITION", "commercial")
     assert _default_coach_tier() == "auto"

@@ -15,7 +15,7 @@ import httpx
 
 from hex_helper.bridge.protocol import CoachAdvicePayload, CoachRequestPayload
 from hex_helper.cloud.session_store import DpapiSessionStore
-from hex_helper.coach.gemini_coach import build_coach_prompt_payload, ground_coach_advice
+from hex_helper.coach.gemini_coach import build_high_snr_prompt_payload, ground_coach_advice
 from hex_helper.data.store import DataStore
 from hex_helper.edition import APP_VERSION
 
@@ -456,7 +456,7 @@ class CloudGatewayClient:
         if norm_tier not in ("a", "b", "auto"):
             norm_tier = "a"
 
-        prompt_obj = build_coach_prompt_payload(req, store)
+        prompt_obj = build_high_snr_prompt_payload(req, store)
         hero_name = str((req.my_hero or {}).get("name") or "").strip()
         payload = {
             "request_id": req.request_id,
@@ -775,6 +775,7 @@ class CloudCoachWorker:
         self._cond = threading.Condition()
         self._pending: _PendingCloudJob | None = None
         self._latest_submitted_id: str = ""
+        self._in_flight_trigger: str = ""
         self._stopped = False
         self._in_flight = False
         self.last_stats: CloudAdviseStats | None = None
@@ -787,6 +788,25 @@ class CloudCoachWorker:
     def is_busy(self) -> bool:
         with self._cond:
             return self._in_flight or (self._pending is not None)
+
+    def has_inflight_trigger(self, trigger_reason: str) -> bool:
+        """Return True iff a queued or non-cancelled in-flight cloud call matches trigger_reason."""
+        target = (trigger_reason or "").strip().lower()
+        if not target:
+            return False
+        with self._cond:
+            if (
+                self._in_flight
+                and bool(self._latest_submitted_id)
+                and self._in_flight_trigger.strip().lower() == target
+            ):
+                return True
+            if (
+                self._pending is not None
+                and (self._pending.req.trigger_reason or "").strip().lower() == target
+            ):
+                return True
+            return False
 
     def submit(
         self,
@@ -803,10 +823,26 @@ class CloudCoachWorker:
             self._pending = _PendingCloudJob(req=req, store=store, tier=norm_tier)
             self._cond.notify_all()
 
+    def cancel_pending(self, trigger_reasons: set[str] | frozenset[str] | None = None) -> int:
+        """Drop queued/in-flight cloud requests matching trigger_reasons so late replies cannot overwrite live advice."""
+        cancelled = 0
+        with self._cond:
+            if self._pending is not None:
+                if trigger_reasons is None or self._pending.req.trigger_reason in trigger_reasons:
+                    self._pending = None
+                    self._latest_submitted_id = ""
+                    cancelled += 1
+            if self._in_flight and (trigger_reasons is None or self._in_flight_trigger in trigger_reasons):
+                self._latest_submitted_id = ""
+                cancelled += 1
+        return cancelled
+
     def stop(self) -> None:
         with self._cond:
             self._stopped = True
             self._pending = None
+            self._latest_submitted_id = ""
+            self._in_flight_trigger = ""
             self._cond.notify_all()
         if self._thread.is_alive():
             self._thread.join(timeout=1.5)
@@ -821,8 +857,12 @@ class CloudCoachWorker:
                 job = self._pending
                 self._pending = None
                 self._in_flight = True
+                self._in_flight_trigger = str(getattr(job.req, "trigger_reason", "") or "") if job else ""
 
             if job is None:
+                with self._cond:
+                    self._in_flight = False
+                    self._in_flight_trigger = ""
                 continue
 
             try:
@@ -830,6 +870,7 @@ class CloudCoachWorker:
                 with self._cond:
                     superseded = job.req.request_id != self._latest_submitted_id
                     self._in_flight = False
+                    self._in_flight_trigger = ""
                 self.last_stats = stats
                 self.last_error = ""
                 if superseded:
@@ -852,6 +893,7 @@ class CloudCoachWorker:
                                 with self._cond:
                                     superseded = job.req.request_id != self._latest_submitted_id
                                     self._in_flight = False
+                                    self._in_flight_trigger = ""
                                 self.last_stats = stats
                                 self.last_error = ""
                                 if not superseded and self._on_advice:
@@ -863,6 +905,7 @@ class CloudCoachWorker:
                                 with self._cond:
                                     superseded = job.req.request_id != self._latest_submitted_id
                                     self._in_flight = False
+                                    self._in_flight_trigger = ""
                                 err_msg = f"{type(retry_err).__name__}: {retry_err}"
                                 self.last_error = err_msg
                                 if not superseded and self._on_error:
@@ -871,6 +914,7 @@ class CloudCoachWorker:
                 with self._cond:
                     superseded = job.req.request_id != self._latest_submitted_id
                     self._in_flight = False
+                    self._in_flight_trigger = ""
                 self.last_error = exc.message
                 if exc.code in (
                     "INSUFFICIENT_CREDITS",

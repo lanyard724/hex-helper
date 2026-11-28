@@ -118,32 +118,37 @@ def test_item_global_debiasing_and_hierarchical_role_priors(tmp_path: Path) -> N
         "103": {"name": "阿狸", "title": "九尾妖狐", "games": 100000, "wins": 50000, "win_rate": 0.50, "pick_rate": 0.04, "rank": 50},
     }
     core = {hid: [{"items": ["6655", "4645", "3089"], "ordered": True, "games": 30000, "wins": 15300, "win": 0.51, "pick": 0.3}] for hid in heroes}
-    # Simulate reverse-causality bias: Morello (3165) has -7pp delta across all AP mages; 2517 has +3pp snowball bias;
-    # 3157 Zhonya has strong +1.5pp class delta on 3 AP mages but cold sample (80 games) on Ahri (103).
+    # Simulate Rev 2 P0-2 mainstream (g >= 1000 & PR >= 8%) global bias + low-PR (<8%) exclusion:
+    # - Morello (3165) has -7pp raw delta at >=8.5% PR -> clamped to -0.06;
+    # - Thornmail (3075) has -5.5pp at 8.5% PR -> -0.055;
+    # - Endless Hunger (2517) has +3pp at 9% PR -> +0.03; Hubris (126697) has +2pp at 8.5% PR -> +0.02;
+    # - Shadowflame (4645) has 4% PR (< 8% Rev 2 gate) -> global bias excluded (0.0);
+    # - 3157 Zhonya has strong +2.5pp AP class delta on 3 AP mages but cold sample (80 games) on Ahri (103).
     item_recs = {
         "99": {
             "6655": {"games": 20000, "wins": 10200, "win_rate": 0.51, "low_sample": False},
-            "4645": {"games": 18000, "wins": 9360, "win_rate": 0.52, "low_sample": False},
+            "4645": {"games": 4000, "wins": 2200, "win_rate": 0.55, "low_sample": False},
             "3089": {"games": 15000, "wins": 7800, "win_rate": 0.52, "low_sample": False},
-            "3165": {"games": 5000, "wins": 2150, "win_rate": 0.43, "low_sample": False},
-            "3075": {"games": 2000, "wins": 890, "win_rate": 0.445, "low_sample": False},
-            "2517": {"games": 2000, "wins": 1060, "win_rate": 0.53, "low_sample": False},
-            "126697": {"games": 2000, "wins": 1040, "win_rate": 0.52, "low_sample": False},
+            "3165": {"games": 9000, "wins": 3870, "win_rate": 0.43, "low_sample": False},
+            "3075": {"games": 8500, "wins": 3783, "win_rate": 0.445, "low_sample": False},
+            "2517": {"games": 9000, "wins": 4770, "win_rate": 0.53, "low_sample": False},
+            "126697": {"games": 8500, "wins": 4420, "win_rate": 0.52, "low_sample": False},
             "3157": {"games": 4000, "wins": 2100, "win_rate": 0.525, "low_sample": False},
         },
         "101": {
             "6655": {"games": 20000, "wins": 10200, "win_rate": 0.51, "low_sample": False},
+            "4645": {"games": 4000, "wins": 2200, "win_rate": 0.55, "low_sample": False},
             "3089": {"games": 15000, "wins": 7800, "win_rate": 0.52, "low_sample": False},
-            "3165": {"games": 4000, "wins": 1720, "win_rate": 0.43, "low_sample": False},
-            "3075": {"games": 2000, "wins": 890, "win_rate": 0.445, "low_sample": False},
-            "2517": {"games": 2000, "wins": 1060, "win_rate": 0.53, "low_sample": False},
-            "126697": {"games": 2000, "wins": 1040, "win_rate": 0.52, "low_sample": False},
+            "3165": {"games": 8500, "wins": 3655, "win_rate": 0.43, "low_sample": False},
+            "3075": {"games": 8500, "wins": 3783, "win_rate": 0.445, "low_sample": False},
+            "2517": {"games": 9000, "wins": 4770, "win_rate": 0.53, "low_sample": False},
+            "126697": {"games": 8500, "wins": 4420, "win_rate": 0.52, "low_sample": False},
             "3157": {"games": 4000, "wins": 2100, "win_rate": 0.525, "low_sample": False},
         },
         "63": {
             "6655": {"games": 20000, "wins": 10200, "win_rate": 0.51, "low_sample": False},
             "3089": {"games": 15000, "wins": 7800, "win_rate": 0.52, "low_sample": False},
-            "3165": {"games": 4000, "wins": 1720, "win_rate": 0.43, "low_sample": False},
+            "3165": {"games": 8500, "wins": 3655, "win_rate": 0.43, "low_sample": False},
             "3157": {"games": 4000, "wins": 2100, "win_rate": 0.525, "low_sample": False},
         },
         "103": {
@@ -157,9 +162,11 @@ def test_item_global_debiasing_and_hierarchical_role_priors(tmp_path: Path) -> N
     store = DataStore(static)
     store.load_from_dir(DatasetDescriptor("16.23", "normal", "常规", "patches/16.23/normal", "", False), ds_dir)
 
-    assert abs(store.get_item_global_bias("3165") - (-0.07)) < 1e-4
-    assert abs(store.get_item_global_bias("3075") - (-0.055)) < 1e-4
+    # P0-2 Rev 2: mainstream items (PR >= 8%) get sample-weighted bias clamped to [-0.06, 0.06]; low-PR (<8%) excluded
+    assert abs(store.get_item_global_bias("3165") - (-0.06)) < 1e-4
+    assert abs(store.get_item_global_bias("3075") - (-0.055)) < 2e-4
     assert abs(store.get_item_global_bias("2517") - 0.03) < 1e-4
+    assert store.get_item_global_bias("4645") == 0.0
     # 6-digit Mayhem IDs normalize to 4-digit canonical bias
     assert abs(store.get_item_global_bias("6697") - 0.02) < 1e-4
     assert abs(store.get_item_global_bias("126697") - 0.02) < 1e-4

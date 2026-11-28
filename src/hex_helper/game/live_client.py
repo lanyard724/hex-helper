@@ -321,6 +321,8 @@ def parse_allgamedata(payload: dict[str, Any]) -> LiveMatchSnapshot | None:
 
         riot_id = str(p.get("riotId") or p.get("summonerName") or "")
         respawn_timer = max(0.0, round(_safe_float(p.get("respawnTimer"), 0.0), 1))
+        skin_id = max(0, _safe_int(p.get("skinID"), 0))
+        skin_name = str(p.get("skinName") or "").strip()
 
         info = PlayerLiveInfo(
             riot_id=riot_id,
@@ -340,6 +342,8 @@ def parse_allgamedata(payload: dict[str, Any]) -> LiveMatchSnapshot | None:
             primary_tree_id=max(0, _safe_int(p_pt.get("id"), 0)),
             secondary_tree_id=max(0, _safe_int(p_st.get("id"), 0)),
             item_details=item_details,
+            skin_id=skin_id,
+            skin_name=skin_name,
         )
         players.append(info)
 

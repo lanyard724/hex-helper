@@ -12,7 +12,7 @@ from hex_helper.scoring.destiny import DestinyItemRec
 from hex_helper.scoring.tier import AugmentScore, UnifiedAugmentDecision
 from hex_helper.ui.hextech_widgets import HextechShimmerBar
 from hex_helper.ui.theme import BASE_OVERLAY_QSS, RARITY_COLORS, tier_badge_qss
-from hex_helper.ui.win32_window import physical_rect_to_logical, show_no_activate
+from hex_helper.ui.win32_window import apply_capture_exclusion, physical_rect_to_logical, show_no_activate
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,8 @@ class AugmentBadgeRenderItem:
     archetype_hint: str = ""
     is_transmute: bool = False
     unified: UnifiedAugmentDecision | None = None
+    destiny_hint: str = ""
+    destiny_warning: str = ""
 
 
 def _compact_sample_text(score: AugmentScore) -> str:
@@ -144,6 +146,8 @@ class _SingleBadgeCard(QFrame):
                 pill_bg, pill_fg = "rgba(56, 36, 8, 215)", "#F59E0B"
             elif u.shift_kind == "conflict":
                 pill_bg, pill_fg = "rgba(68, 16, 22, 215)", "#FCA5A5"
+            elif u.shift_kind == "decay":
+                pill_bg, pill_fg = "rgba(58, 40, 10, 215)", "#F59E0B"
             else:
                 pill_bg, pill_fg = "rgba(20, 32, 48, 215)", "#C8AA6E"
             p_pad = "1px 2px" if ultra_compact else ("1px 3px" if compact else ("1px 4px" if narrow_top else "1px 5px"))
@@ -196,8 +200,39 @@ class _SingleBadgeCard(QFrame):
         mid.addWidget(g_lbl)
         lay.addLayout(mid)
 
-        # Single prioritized footer line: destiny_items > is_transmute > shift_reason > archetype_hint > uncertain
-        if item.destiny_items:
+        # Single prioritized footer line: destiny_hint/warning > destiny_items > is_transmute > shift_reason > archetype_hint > uncertain
+        raw_d_hint = getattr(item, "destiny_hint", "")
+        if hasattr(raw_d_hint, "hint_line"):
+            d_hint_txt = str(getattr(raw_d_hint, "hint_line", "") or "").strip()
+            d_warn_txt = str(
+                getattr(item, "destiny_warning", "") or getattr(raw_d_hint, "warning_line", "") or ""
+            ).strip()
+        else:
+            d_hint_txt = str(raw_d_hint or "").strip()
+            d_warn_txt = str(getattr(item, "destiny_warning", "") or "").strip()
+
+        if d_hint_txt or d_warn_txt:
+            d_fs = "10px" if compact else "11px"
+            if d_hint_txt:
+                d_color = "#0AC8B9" if ("(+" in d_hint_txt and not d_warn_txt) else "#C8AA6E"
+                d_hint = QLabel(d_hint_txt)
+                d_hint.setWordWrap(True)
+                d_hint.setToolTip(d_hint_txt)
+                d_hint.setStyleSheet(
+                    f"border: none; background: transparent; color: {d_color}; "
+                    f"font-size: {d_fs}; font-weight: bold;"
+                )
+                lay.addWidget(d_hint)
+            if d_warn_txt:
+                dw_lbl = QLabel(d_warn_txt)
+                dw_lbl.setWordWrap(True)
+                dw_lbl.setToolTip(d_warn_txt)
+                dw_lbl.setStyleSheet(
+                    "background-color: rgba(68, 16, 22, 210); border: 1px solid #DC2626; "
+                    "border-radius: 2px; padding: 2px 6px; color: #FECACA; font-size: 10px; font-weight: bold;"
+                )
+                lay.addWidget(dw_lbl)
+        elif item.destiny_items:
             top_d = " / ".join(f"{d.name}({d.delta * 100:+.1f}%)" for d in item.destiny_items[:2])
             d_hint = QLabel(f"◈ 命运绑定：{top_d}")
             d_hint.setWordWrap(True)
@@ -213,6 +248,8 @@ class _SingleBadgeCard(QFrame):
         elif u is not None and u.shift_reason:
             if u.shift_kind == "conflict":
                 sr_prefix, sr_bg, sr_bd, sr_fg = "▽ ", "rgba(68, 16, 22, 210)", "#DC2626", "#FECACA"
+            elif u.shift_kind == "decay":
+                sr_prefix, sr_bg, sr_bd, sr_fg = "▽ ", "rgba(58, 40, 10, 210)", "#D97706", "#FDE68A"
             elif u.shift_kind == "gamble":
                 sr_prefix, sr_bg, sr_bd, sr_fg = "◈ ", "rgba(56, 36, 8, 210)", "#F59E0B", "#FDE68A"
             else:
@@ -294,6 +331,12 @@ class AugmentBadgesOverlay(QWidget):
         self._exclude_rects: list[tuple[int, int, int, int]] = []
         self._last_card_sig: tuple[tuple[int, str, bool], ...] = ()
         self._last_render_sig: tuple | None = None
+        self._allow_screen_recording: bool = False
+
+    def set_screen_recording_allowed(self, allowed: bool) -> None:
+        self._allow_screen_recording = bool(allowed)
+        if self.isVisible() or bool(self.internalWinId()):
+            apply_capture_exclusion(self, exclude=not self._allow_screen_recording)
 
     def get_exclude_rects(self) -> list[tuple[int, int, int, int]]:
         if not self.isVisible():
@@ -362,6 +405,10 @@ class AugmentBadgesOverlay(QWidget):
                     it.screen_box,
                     it.is_best,
                     tuple((d.item_id, round(d.delta, 4)) for d in it.destiny_items),
+                    (
+                        str(getattr(getattr(it, "destiny_hint", ""), "hint_line", getattr(it, "destiny_hint", "")) or ""),
+                        str(getattr(it, "destiny_warning", "") or getattr(getattr(it, "destiny_hint", ""), "warning_line", "") or ""),
+                    ),
                     it.uncertain,
                     it.archetype_hint,
                     it.is_transmute,
@@ -414,7 +461,7 @@ class AugmentBadgesOverlay(QWidget):
             center_x_phys = (box_l + box_r) * 0.5 - sl
             top_y_phys = box_t - st
             cx_log = int(round(center_x_phys / dpr))
-            y_log = max(12, int(round(top_y_phys / dpr)) - card.height() - 18)
+            y_log = max(12, int(round(top_y_phys / dpr)) - card.height() - 28)
             x_log = max(8, min(log_w - card.width() - 8, cx_log - card.width() // 2))
 
             placed.append((card, x_log, y_log, card.width(), card.height()))
@@ -538,4 +585,8 @@ class AugmentBadgesOverlay(QWidget):
             widget.move(px - min_x, py - min_y)
             widget.show()
 
-        show_no_activate(self, click_through=True)
+        show_no_activate(
+            self,
+            click_through=True,
+            exclude_from_capture=not self._allow_screen_recording,
+        )

@@ -13,11 +13,12 @@ from hex_helper.config import (
 def test_config_roundtrip(tmp_path: Path):
     cfg_path = tmp_path / "config.json"
     cfg = AppConfig(
-        proxy_url="",
+        proxy_url="http://127.0.0.1:7900",
         dataset_patch="16.23",
         dataset_mode="first-prismatic",
         lockfile_path=r"D:\WeGameApps\英雄联盟\LeagueClient\lockfile",
-        coach_mode="cloud",
+        coach_mode="gemini",
+        gemini_api_key="AIzaTest1234567890",
         gemini_model="gemini-4-hydrogen",
         gemini_thinking_level="xhigh",
         drawer_y_ratio=0.45,
@@ -28,7 +29,8 @@ def test_config_roundtrip(tmp_path: Path):
     assert loaded.dataset_patch == "16.23"
     assert loaded.dataset_mode == "first-prismatic"
     assert loaded.lockfile_path.endswith("lockfile")
-    assert loaded.coach_mode == "cloud"
+    assert loaded.coach_mode == "gemini"
+    assert loaded.gemini_api_key == "AIzaTest1234567890"
     assert loaded.gemini_model == "gemini-4-hydrogen"
     assert loaded.gemini_thinking_level == "xhigh"
     assert loaded.drawer_y_ratio == 0.45
@@ -44,7 +46,7 @@ def test_config_clamping():
             "card_band_roi": {"x": -0.5, "y": 0.99, "w": 2.0, "h": 0.01},
         }
     )
-    assert cfg.coach_mode == "cloud"
+    assert cfg.coach_mode == "auto"
     assert cfg.gemini_thinking_level == "medium"
     assert cfg.gemini_model == "gemini-4-hydrogen"
     assert cfg.drawer_y_ratio == 0.82

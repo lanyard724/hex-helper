@@ -34,6 +34,22 @@ REQUIRED_DATASET_FILES = (
     "item_metadata.json",
 )
 
+OPTIONAL_DATASET_FILES = (
+    "hero_items_raw.json",
+)
+
+HIGH_BAND_DATASET_FILES = (
+    "bands/high/heroes.json",
+    "bands/high/hero_augments.json",
+    "bands/high/hero_item_recommendations.json",
+    "bands/high/core_builds.json",
+    "bands/high/hero_augment_items.json",
+)
+
+OPTIONAL_HIGH_BAND_FILES = (
+    "bands/high/hero_items_raw.json",
+)
+
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -161,7 +177,7 @@ class AramHexSyncer:
     def __init__(
         self,
         cache_dir: Path,
-        proxy_url: str = "",
+        proxy_url: str = "http://127.0.0.1:7900",
         base_url: str = ARAMHEX_RAW_BASE,
         fetcher: Callable[[str], bytes] | None = None,
     ) -> None:
@@ -314,10 +330,34 @@ class AramHexSyncer:
         files_manifest: dict[str, dict] = meta.get("files") or {}
 
         rel_targets: list[str] = [f for f in REQUIRED_DATASET_FILES if f != "meta.json"]
-        if band and desc.bands:
+        optional_targets: set[str] = set()
+
+        for opt_file in OPTIONAL_DATASET_FILES:
+            if (not files_manifest) or (opt_file in files_manifest):
+                if opt_file not in rel_targets:
+                    rel_targets.append(opt_file)
+                optional_targets.add(opt_file)
+
+        meta_bands = meta.get("bands")
+        has_bands = bool(meta_bands) if meta_bands is not None else bool(desc.bands)
+        if has_bands:
+            manifest_has_high = any(str(k).startswith("bands/high/") for k in files_manifest)
+            for bf in HIGH_BAND_DATASET_FILES:
+                if (not files_manifest) or (not manifest_has_high) or (bf in files_manifest):
+                    if bf not in rel_targets:
+                        rel_targets.append(bf)
+                    optional_targets.add(bf)
+            for opt_bf in OPTIONAL_HIGH_BAND_FILES:
+                if (not files_manifest) or (not manifest_has_high) or (opt_bf in files_manifest):
+                    if opt_bf not in rel_targets:
+                        rel_targets.append(opt_bf)
+                    optional_targets.add(opt_bf)
+
+        if band and has_bands:
             for bf in (f"bands/{band}/heroes.json", f"bands/{band}/hero_augments.json"):
-                if bf in files_manifest:
+                if bf in files_manifest and bf not in rel_targets:
                     rel_targets.append(bf)
+                    optional_targets.add(bf)
 
         for rel_file in rel_targets:
             manifest_entry = files_manifest.get(rel_file)
@@ -335,6 +375,7 @@ class AramHexSyncer:
             if progress_cb:
                 progress_cb(f"同步 {desc.patch}/{desc.mode}/{rel_file}...")
             url = f"{self.base_url}/{desc.path}/{rel_file}"
+            is_optional = rel_file in optional_targets
             try:
                 raw = self._fetcher(url)
                 if expected_sha:
@@ -346,13 +387,18 @@ class AramHexSyncer:
                 # Ensure valid JSON before persisting
                 json.loads(raw.decode("utf-8"))
                 atomic_write_bytes(target_path, raw)
-            except ValueError:
-                raise
+            except ValueError as exc:
+                if is_optional:
+                    logger.warning("Optional file %s failed validation (skipped): %s", rel_file, exc)
+                else:
+                    raise
             except Exception as exc:
                 if target_path.exists():
                     logger.warning("Keeping existing cached %s after error: %s", rel_file, exc)
                 elif rel_file in ("heroes.json", "augments.json", "hero_augments.json"):
                     raise
+                elif is_optional:
+                    logger.debug("Optional file %s unavailable (skipped): %s", rel_file, exc)
                 else:
                     logger.warning("Optional file %s unavailable: %s", rel_file, exc)
 
@@ -383,7 +429,16 @@ class AramHexSyncer:
             try:
                 m = json.loads(meta_path.read_text(encoding="utf-8"))
                 snap = str(m.get("snapshot_at", ""))
-                bands = (d / "bands" / "high" / "heroes.json").exists()
+                high_dir = d / "bands" / "high"
+                bands = any(
+                    (high_dir / fname).exists()
+                    for fname in (
+                        "heroes.json",
+                        "hero_augments.json",
+                        "hero_item_recommendations.json",
+                        "core_builds.json",
+                    )
+                )
             except Exception:
                 pass
         return (

@@ -168,6 +168,7 @@ def parse_champ_select_session(
     team_ids: list[str] = []
     spell1_id = 0
     spell2_id = 0
+    my_skin_id = 0
 
     for member in cs_payload.get("myTeam") or []:
         if not isinstance(member, dict):
@@ -176,6 +177,7 @@ def parse_champ_select_session(
         if is_local:
             spell1_id = max(0, _safe_int(member.get("spell1Id"), 0))
             spell2_id = max(0, _safe_int(member.get("spell2Id"), 0))
+            my_skin_id = max(0, _safe_int(member.get("selectedSkinId"), 0))
         cid = _safe_int(member.get("championId"), 0)
         if cid <= 0:
             cid = _safe_int(member.get("championPickIntent"), 0)
@@ -230,6 +232,7 @@ def parse_champ_select_session(
         timer_remaining_ms=timer_remaining_ms,
         game_id=resolved_game_id,
         trade_states=trade_states,
+        my_skin_id=my_skin_id,
     )
 
 
@@ -242,6 +245,7 @@ class LcuClient:
         self.creds: LcuCredentials | None = None
         self.last_error: str = ""
         self._client: httpx.Client | None = None
+        self._last_eog_game_id: int = 0
 
     def close(self) -> None:
         if self._client is not None:
@@ -384,10 +388,15 @@ class LcuClient:
         )
         game_data = session_dict.get("gameData")
         game_id = max(0, _safe_int(game_data.get("gameId"), 0)) if isinstance(game_data, dict) else 0
+        if game_id > 0 and game_id == getattr(self, "_last_eog_game_id", 0):
+            game_id = 0
         cs = self._get_json("/lol-champ-select/v1/session")
         if not isinstance(cs, dict):
             return phase_raw, None
-        return phase_raw, parse_champ_select_session(cs, queue_id, game_mode, is_mayhem, game_id=game_id)
+        parsed_cs = parse_champ_select_session(cs, queue_id, game_mode, is_mayhem, game_id=game_id)
+        if parsed_cs.game_id > 0 and parsed_cs.game_id == getattr(self, "_last_eog_game_id", 0):
+            parsed_cs.game_id = 0
+        return phase_raw, parsed_cs
 
     def get_eog_snapshot(self) -> dict[str, Any]:
         """Read-only lookup of End-Of-Game outcome, authoritative 6-slot items, KDA, damage, and 10-player summary."""
@@ -401,6 +410,8 @@ class LcuClient:
         if dur > 0:
             result["duration_s"] = dur
         result["game_id"] = max(0, _safe_int(eog.get("gameId"), 0))
+        if result["game_id"] > 0:
+            self._last_eog_game_id = result["game_id"]
         result["queue_id"] = max(0, _safe_int(eog.get("queueId"), 0))
 
         early_surrender = bool(

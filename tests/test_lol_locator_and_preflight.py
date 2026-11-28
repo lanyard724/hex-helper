@@ -23,13 +23,13 @@ def test_edition_constants_and_dynamic_env_toggle(monkeypatch: pytest.MonkeyPatc
 
     assert re.fullmatch(r"\d+\.\d+\.\d+", edition.APP_VERSION)
     assert edition.APP_NAME == "HexHelper"
-    assert edition._COMPILED_EDITION == "commercial"
+    assert edition._COMPILED_EDITION == "dev"
     assert isinstance(edition.EDITION, str)
     assert isinstance(edition.IS_COMMERCIAL, bool)
     assert edition.DEFAULT_CLOUD_API_BASE.startswith("https://")
 
     monkeypatch.delenv("HEX_EDITION", raising=False)
-    assert edition.is_commercial_edition() is True
+    assert edition.is_commercial_edition() is False
 
     monkeypatch.setenv("HEX_EDITION", "commercial")
     assert edition.is_commercial_edition() is True
@@ -38,7 +38,7 @@ def test_edition_constants_and_dynamic_env_toggle(monkeypatch: pytest.MonkeyPatc
     assert edition.is_commercial_edition() is True
 
     monkeypatch.setenv("HEX_EDITION", "dev")
-    assert edition.is_commercial_edition() is True
+    assert edition.is_commercial_edition() is False
 
 
 def test_validate_lol_install_dir_cn_wegame_suffix_and_variants(tmp_path: Path) -> None:
@@ -196,7 +196,12 @@ def test_bounded_disk_scan_finds_rail_apps_and_skips_excluded(
     results = lol_locator.detect_lol_installations(allow_disk_scan=True)
     found_dirs = {r.install_dir for r in results}
     assert target_root in found_dirs
-    assert all("99" not in str(d) and "98" not in str(d) and "97" not in str(d) for d in found_dirs)
+    assert all(
+        "99" not in str(d.relative_to(tmp_path))
+        and "98" not in str(d.relative_to(tmp_path))
+        and "97" not in str(d.relative_to(tmp_path))
+        for d in found_dirs
+    )
 
     primary = lol_locator.detect_primary_lol_install(allow_disk_scan=True)
     assert primary is not None

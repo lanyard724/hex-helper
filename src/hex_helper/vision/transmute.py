@@ -18,6 +18,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from hex_helper.data.locale_pack import get_transmute_cues, normalize_client_locale, t2s_normalize
 from hex_helper.data.provider import AugmentInfo
 from hex_helper.vision.capture import WindowRect
 from hex_helper.vision.detector import filter_excluded_lines
@@ -171,8 +172,18 @@ class TransmuteRevealWatcher:
     FADING_PICKER_GRACE_S = 1.8
     HOVER_POLL_INTERVAL_S = 0.55
 
-    def __init__(self, ocr_engine: WinRtOcrEngine, augments: list[AugmentInfo]) -> None:
+    def __init__(
+        self,
+        ocr_engine: WinRtOcrEngine,
+        augments: list[AugmentInfo],
+        *,
+        client_locale: str = "zh_cn",
+        use_t2s: bool = False,
+    ) -> None:
         self.ocr = ocr_engine
+        self._client_locale = normalize_client_locale(client_locale)
+        self._use_t2s = bool(use_t2s)
+        self._cues = get_transmute_cues(self._client_locale)
         self._all_augments: list[AugmentInfo] = []
         self._votes: dict[str, list[float]] = {}
         self._last_hover_thumb: np.ndarray | None = None
@@ -186,6 +197,14 @@ class TransmuteRevealWatcher:
         self._passive_tab_pending_mono: float = 0.0
         self._last_trace_diagnostics: dict[str, Any] = {}
         self.update_catalog(augments)
+
+    def set_locale(self, client_locale: str, *, use_t2s: bool | None = None) -> None:
+        self._client_locale = normalize_client_locale(client_locale)
+        self._cues = get_transmute_cues(self._client_locale)
+        if use_t2s is not None:
+            self._use_t2s = bool(use_t2s)
+        self._votes.clear()
+        self._passive_tab_pending_id = ""
 
     def update_catalog(self, augments: list[AugmentInfo]) -> None:
         self._all_augments = list(augments)
@@ -235,15 +254,19 @@ class TransmuteRevealWatcher:
         self._votes[aug_id] = hist
         return len(hist) >= needed
 
-    @staticmethod
-    def _infer_rarity_hint(lines: list[OcrLine]) -> str | None:
+    def _infer_rarity_hint(self, lines: list[OcrLine]) -> str | None:
         joined = "".join(_compact_ws(l.text) for l in lines)
-        if "棱彩" in joined:
-            return "prismatic"
-        if "黄金" in joined:
-            return "gold"
-        if "白银" in joined:
-            return "silver"
+        joined_t2s = t2s_normalize(joined)
+        cues = getattr(self, "_cues", None) or get_transmute_cues("zh_cn")
+        for cue in cues.prismatic_cues:
+            if cue in joined or t2s_normalize(cue) in joined_t2s:
+                return "prismatic"
+        for cue in cues.gold_cues:
+            if cue in joined or t2s_normalize(cue) in joined_t2s:
+                return "gold"
+        for cue in cues.silver_cues:
+            if cue in joined or t2s_normalize(cue) in joined_t2s:
+                return "silver"
         return None
 
     @staticmethod
@@ -255,14 +278,15 @@ class TransmuteRevealWatcher:
         allow_fuzzy_3plus: bool = True,
         has_strong_context: bool = False,
     ) -> tuple[AugmentInfo, float] | None:
-        norm = normalize_ocr_text(text)
+        use_t2s = bool(getattr(matcher, "use_t2s", False))
+        norm = normalize_ocr_text(text, use_t2s=use_t2s)
         if len(norm) < 2:
             return None
         query_min = 0.67 if (allow_fuzzy_3plus and has_strong_context) else 0.86
         res = matcher.match_line(text, rarity_hint=rarity_hint, min_score=query_min)
         if res is None:
             return None
-        cand_norm = normalize_ocr_text(res.augment.name)
+        cand_norm = normalize_ocr_text(res.augment.name, use_t2s=use_t2s)
         if len(cand_norm) <= 2:
             # Short 2-char names (e.g. 残忍/冰寒/大腕/力量) require exact match to prevent false positives
             if norm == cand_norm:
@@ -284,17 +308,21 @@ class TransmuteRevealWatcher:
             return res.augment, res.score
         return None
 
-    @staticmethod
-    def _has_supporting_desc_below(title_line: OcrLine, all_lines: list[OcrLine]) -> bool:
+    def _has_supporting_desc_below(self, title_line: OcrLine, all_lines: list[OcrLine]) -> bool:
         """Check whether a multi-character description or rarity line sits directly below a title line."""
+        cues = getattr(self, "_cues", None) or get_transmute_cues("zh_cn")
+        use_t2s = bool(getattr(self, "_use_t2s", False))
         for other in all_lines:
             if other is title_line:
                 continue
             dy = other.y - title_line.y
             if 10.0 <= dy <= 190.0 and abs(other.cx - title_line.cx) <= 240.0:
                 compact_o = _compact_ws(other.text)
-                norm_o = normalize_ocr_text(compact_o)
-                if len(norm_o) >= 6 or any(rl in compact_o for rl in _RARITY_LABELS):
+                compact_o_t2s = t2s_normalize(compact_o)
+                norm_o = normalize_ocr_text(compact_o, use_t2s=use_t2s)
+                if len(norm_o) >= 6 or any(
+                    rl in compact_o or t2s_normalize(rl) in compact_o_t2s for rl in cues.rarity_labels
+                ):
                     return True
         return False
 
@@ -308,9 +336,11 @@ class TransmuteRevealWatcher:
     ) -> list[ResolvedTransmuteHit]:
         hits: list[ResolvedTransmuteHit] = []
         found_ids: set[str] = set()
+        use_t2s = bool(getattr(self, "_use_t2s", False))
+        cues = getattr(self, "_cues", None) or get_transmute_cues("zh_cn")
         # Sort longest candidate names first so substring extraction prefers exact full names (e.g. 珠光护手 vs 护手)
         cand_by_len = sorted(
-            ((aug, normalize_ocr_text(aug.name)) for aug in candidates),
+            ((aug, normalize_ocr_text(aug.name, use_t2s=use_t2s)) for aug in candidates),
             key=lambda x: len(x[1]),
             reverse=True,
         )
@@ -319,7 +349,8 @@ class TransmuteRevealWatcher:
             raw = _compact_ws(line.text)
             if len(raw) < 2:
                 continue
-            has_strong_cue = any(c in raw for c in _CHAT_STRONG_CUES)
+            raw_t2s = t2s_normalize(raw)
+            has_strong_cue = any(c in raw or t2s_normalize(c) in raw_t2s for c in cues.chat_strong_cues)
             bracket_tokens = _BRACKET_RE.findall(raw)
 
             # 1) Explicit bracketed tokens (e.g. "获得了 【死亡之环】" or "[珠光护手] & [炼狱导管]")
@@ -339,10 +370,10 @@ class TransmuteRevealWatcher:
 
             # 2) Strong chat notification sentence without brackets (e.g. "你获得了 死亡之环", "质变：混沌 获得 珠光护手 炼狱导管")
             if has_strong_cue:
-                tail_m = _AFTER_CUE_RE.search(raw)
-                search_segment = normalize_ocr_text(tail_m.group(1) if tail_m else raw)
+                tail_m = cues.after_cue_re.search(raw) or cues.after_cue_re.search(raw_t2s)
+                search_segment = normalize_ocr_text(tail_m.group(1) if tail_m else raw, use_t2s=use_t2s)
                 # Strip source transmute name so we don't match fragments of it
-                src_norm = normalize_ocr_text(pending.source_name)
+                src_norm = normalize_ocr_text(pending.source_name, use_t2s=use_t2s)
                 if src_norm:
                     search_segment = search_segment.replace(src_norm, "")
                 # Direct substring check for exact candidate names inside the grant message
@@ -383,11 +414,16 @@ class TransmuteRevealWatcher:
     ) -> list[ResolvedTransmuteHit]:
         if not lines:
             return []
+        use_t2s = bool(getattr(self, "_use_t2s", False))
+        cues = getattr(self, "_cues", None) or get_transmute_cues("zh_cn")
         joined_all = "".join(_compact_ws(l.text) for l in lines)
-        if channel == "hover_tooltip" and any(bad in joined_all for bad in _NON_AUGMENT_TOOLTIP_CUES):
+        joined_t2s = t2s_normalize(joined_all)
+        if channel == "hover_tooltip" and any(
+            bad in joined_all or t2s_normalize(bad) in joined_t2s for bad in cues.non_augment_tooltip_cues
+        ):
             return []
 
-        has_banner_cue = any(c in joined_all for c in _CHAT_STRONG_CUES)
+        has_banner_cue = any(c in joined_all or t2s_normalize(c) in joined_t2s for c in cues.chat_strong_cues)
         inferred_rarity = pending.target_rarity or self._infer_rarity_hint(lines)
         hits: list[ResolvedTransmuteHit] = []
         found_ids: set[str] = set()
@@ -407,11 +443,12 @@ class TransmuteRevealWatcher:
             if aug.augment_id in found_ids:
                 continue
 
+            norm_len = len(normalize_ocr_text(aug.name, use_t2s=use_t2s))
             if channel == "hover_tooltip":
                 # Hover tooltips ALWAYS carry description / rarity lines beneath the augment title
-                needed = 1 if (has_desc and len(normalize_ocr_text(aug.name)) >= 3) else 2
+                needed = 1 if (has_desc and norm_len >= 3) else 2
             else:
-                needed = 1 if (has_banner_cue or (has_desc and len(normalize_ocr_text(aug.name)) >= 3)) else 2
+                needed = 1 if (has_banner_cue or (has_desc and norm_len >= 3)) else 2
 
             if self._record_vote(aug.augment_id, now_mono, needed=needed):
                 found_ids.add(aug.augment_id)
@@ -460,7 +497,7 @@ class TransmuteRevealWatcher:
         if not candidates:
             return []
 
-        matcher = AugmentMatcher(candidates)
+        matcher = AugmentMatcher(candidates, use_t2s=bool(getattr(self, "_use_t2s", False)))
         excl = exclude_rects or []
         fh, fw = frame_bgr.shape[:2]
         elapsed = now_mono - pending.started_mono
@@ -733,8 +770,10 @@ class TransmuteRevealWatcher:
             self._passive_tab_pending_id = ""
             _record_passive_trace(ocr_ran=True, ocr_ms=ocr_ms, lines_count=0, rejected_reason="no_ocr_lines")
             return None
+        cues = getattr(self, "_cues", None) or get_transmute_cues("zh_cn")
         joined_all = "".join(_compact_ws(l.text) for l in lines)
-        if any(bad in joined_all for bad in _NON_AUGMENT_TOOLTIP_CUES):
+        joined_t2s = t2s_normalize(joined_all)
+        if any(bad in joined_all or t2s_normalize(bad) in joined_t2s for bad in cues.non_augment_tooltip_cues):
             self._passive_tab_pending_id = ""
             _record_passive_trace(
                 ocr_ran=True, ocr_ms=ocr_ms, lines_count=len(lines), rejected_reason="non_augment_tooltip"
@@ -742,7 +781,10 @@ class TransmuteRevealWatcher:
             return None
 
         inferred_rarity = self._infer_rarity_hint(lines)
-        if inferred_rarity is None and "强化符文" not in joined_all:
+        has_augment_noun = any(
+            noun in joined_all or t2s_normalize(noun) in joined_t2s for noun in cues.augment_nouns
+        )
+        if inferred_rarity is None and not has_augment_noun:
             self._passive_tab_pending_id = ""
             _record_passive_trace(
                 ocr_ran=True,
@@ -765,7 +807,7 @@ class TransmuteRevealWatcher:
                 rejected_reason="no_candidates",
             )
             return None
-        matcher = AugmentMatcher(candidates)
+        matcher = AugmentMatcher(candidates, use_t2s=bool(getattr(self, "_use_t2s", False)))
         saw_rarity_mismatch = False
         for line in lines:
             has_desc = self._has_supporting_desc_below(line, lines)
@@ -784,10 +826,14 @@ class TransmuteRevealWatcher:
             if require_rarity_match and inferred_rarity is not None and aug.rarity and aug.rarity != inferred_rarity:
                 saw_rarity_mismatch = True
                 continue
-            # Single-frame auto-commit restricted to bottom_hud; tab_zone needs header "强化符文" or 2 consecutive frames
+            # Single-frame auto-commit restricted to bottom_hud; tab_zone needs header augment noun or 2 consecutive frames
             if in_tab_zone:
                 has_header_cue = any(
-                    "强化符文" in _compact_ws(ol.text) and (ol.y <= line.y + 90.0)
+                    any(
+                        noun in _compact_ws(ol.text) or t2s_normalize(noun) in t2s_normalize(_compact_ws(ol.text))
+                        for noun in cues.augment_nouns
+                    )
+                    and (ol.y <= line.y + 90.0)
                     for ol in lines
                 )
                 if not has_header_cue:

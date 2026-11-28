@@ -8,9 +8,29 @@ from typing import Any, Sequence
 
 DEFAULT_PRIOR_K = 100.0
 LATE_STACKER_AUGMENT_DISCOUNTS: dict[str, float] = {
-    "1353": -4.2,  # 坦克引擎：第4轮/12分钟后叠层周期不足
-    "1152": -4.6,  # 钢化你心：第4轮/12分钟后心之钢任务难叠满
+    "1353": -8.5,  # 坦克引擎：第4轮/11.5分钟后叠层周期不足
+    "1373": -7.5,  # 缩小引擎：第4轮/11.5分钟后参战叠层周期不足
+    "1154": -13.5,  # 海牛阿福的勇士：末轮从零十助过慢
+    "2102": -8.5,  # 高压锅：末轮灼烧任务周期不足
+    "3048": -7.5,  # 弹跳蜜蜂：末轮任务周期不足
+    "2100": -7.5,  # 急速之追求：末轮任务周期不足
+    "2103": -7.5,  # 狙神飞星：末轮任务周期不足
+    "2116": -7.0,  # 威能之追求：末轮任务周期不足
+    "2055": -7.0,  # 多重射击：末轮任务周期不足
+    "2083": -5.5,  # 牙仙子：末轮叠双穿波次减半
+    "1389": -5.5,  # 男爵之手：末轮推线红利减弱
+    "1061": -5.0,  # 回力OK镖：后期固定基础伤害贬值
 }
+STAT_OVERFLOW_LABELS: frozenset[str] = frozenset(
+    {
+        "满暴递减",
+        "满暴溢转·偏弱",
+        "暴击溢转·低效",
+        "暴击溢出·废卡",
+        "暴击半溢·折价",
+    }
+)
+HARD_WASTED_OVERFLOW_LABEL = "暴击溢出·废卡"
 
 
 @dataclass(frozen=True)
@@ -216,7 +236,7 @@ def rank_picker_cards(
     """Compute unified scores, apply live synergy/conflict/late-stacker re-ranking, and preserve all-weak reroll guard."""
     combo_map = combo_by_slot or {}
     pair_map = pair_deltas or {}
-    is_late_stacker_window = (int(round_index or 0) >= 4) or (float(game_time_s or 0.0) >= 720.0)
+    is_late_stacker_window = (int(round_index or 0) >= 4) or (float(game_time_s or 0.0) >= 690.0)
 
     prelim: list[dict[str, Any]] = []
     base_best_slot: int | None = None
@@ -239,7 +259,9 @@ def rank_picker_cards(
         verdict_name = getattr(vc, "verdict", "") if vc is not None else ""
         verdict_label = str(getattr(vc, "verdict_label", "") or "") if vc is not None else ""
         raw_cd = float(getattr(vc, "combo_delta", 0.0) or 0.0) if vc is not None else 0.0
-        late_stacker_applied = verdict_label == "末轮叠层折价"
+        late_stacker_applied = verdict_name == "round_decay" or verdict_label == "末轮叠层折价"
+        is_stat_overflow = verdict_label in STAT_OVERFLOW_LABELS
+        is_hard_wasted_overflow = verdict_label == HARD_WASTED_OVERFLOW_LABEL
 
         if verdict_name == "jackpot":
             combo_shift = min(11.5, max(5.5, raw_cd * 0.85))
@@ -253,23 +275,32 @@ def rank_picker_cards(
             combo_shift = min(5.5, max(2.2, raw_cd * 0.65))
             shift_kind = "gamble"
             shift_reason = str(getattr(vc, "reason", "") or "")
+        elif verdict_name == "round_decay":
+            combo_shift = max(-30.0, min(-1.5, raw_cd))
+            shift_kind = "conflict" if combo_shift <= -12.0 else "decay"
+            shift_reason = str(getattr(vc, "reason", "") or "")
+            late_stacker_applied = True
         elif verdict_name == "conflict":
             if late_stacker_applied:
-                combo_shift = max(-5.0, min(-3.8, raw_cd))
+                combo_shift = max(-30.0, min(-1.5, raw_cd))
+            elif is_stat_overflow:
+                combo_shift = max(-38.0, min(-3.5, raw_cd))
             else:
                 combo_shift = max(-10.0, min(-3.5, raw_cd * 1.15))
             shift_kind = "conflict"
             shift_reason = str(getattr(vc, "reason", "") or "")
 
-        if is_late_stacker_window and sc.augment_id in LATE_STACKER_AUGMENT_DISCOUNTS and not late_stacker_applied:
+        # Pure static R4/late fallback ONLY when combo_by_slot is omitted (no inventory context available)
+        if combo_by_slot is None and is_late_stacker_window and sc.augment_id in LATE_STACKER_AUGMENT_DISCOUNTS and not late_stacker_applied:
             late_disc = LATE_STACKER_AUGMENT_DISCOUNTS[sc.augment_id]
-            combo_shift = combo_shift + late_disc
+            combo_shift = max(-30.0, min(-1.5, combo_shift + late_disc))
             late_stacker_applied = True
+            verdict_label = verdict_label or "末轮叠层折价"
             if combo_shift < 0:
-                shift_kind = "conflict"
+                shift_kind = "conflict" if combo_shift <= -12.0 else "decay"
                 shift_reason = (
                     f"局末({int(game_time_s)}s)叠层周期不足 · 优先即时战力"
-                    if float(game_time_s or 0.0) >= 720.0
+                    if float(game_time_s or 0.0) >= 690.0
                     else "第4轮收官叠层周期不足 · 叠层卡大幅折价，优先即时战力"
                 )
 
@@ -295,11 +326,13 @@ def rank_picker_cards(
         elif total_shift >= 1.5:
             shift_label = f"联动 ↑{total_shift:.1f}"
         elif total_shift <= -1.5:
-            shift_label = (
-                f"折价 ↓{abs(total_shift):.1f}"
-                if late_stacker_applied
-                else f"互斥 ↓{abs(total_shift):.1f}"
-            )
+            if late_stacker_applied:
+                d_short = verdict_label or "折价"
+                shift_label = f"{d_short} ↓{abs(total_shift):.1f}"
+            elif is_stat_overflow:
+                shift_label = f"溢出 ↓{abs(total_shift):.1f}"
+            else:
+                shift_label = f"互斥 ↓{abs(total_shift):.1f}"
         else:
             shift_label = ""
 
@@ -317,26 +350,50 @@ def rank_picker_cards(
                 "shift_label": shift_label,
                 "shift_reason": shift_reason,
                 "verdict_name": verdict_name,
+                "is_stat_overflow": is_stat_overflow,
+                "is_hard_wasted_overflow": is_hard_wasted_overflow,
             }
         )
 
-    all_below_par = bool(valid_scores) and all(
-        (bool(sc.is_below_rarity_par) if sc.percentile is not None else (sc.delta < 0.0))
-        for sc in valid_scores
-    )
-    has_combo_upside = any(
-        (p["verdict_name"] in ("jackpot", "gamble", "synergy") and p["combo_shift"] > 0)
-        or p["pair_shift"] >= 1.5
-        for p in prelim
-    )
+    def _is_card_below_par(sc: AugmentScore) -> bool:
+        return bool(sc.is_below_rarity_par) if sc.percentile is not None else (sc.delta < 0.0)
+
+    def _is_effective_below_par(p: dict[str, Any]) -> bool:
+        if (p["is_stat_overflow"] and p["combo_shift"] <= -20.0) or (
+            p["verdict_name"] == "round_decay" and p["combo_shift"] <= -18.0
+        ):
+            return True
+        return _is_card_below_par(p["base_score"])
+
+    def _has_upside(p: dict[str, Any]) -> bool:
+        if (p["is_stat_overflow"] and p["combo_shift"] <= -20.0) or (
+            p["verdict_name"] == "round_decay" and p["combo_shift"] <= -18.0
+        ):
+            return False
+        if p["verdict_name"] in ("jackpot", "gamble") and p["combo_shift"] > 0:
+            return True
+        if not _is_card_below_par(p["base_score"]) and (
+            (p["verdict_name"] == "synergy" and p["combo_shift"] > 0)
+            or p["pair_shift"] >= 1.5
+        ):
+            return True
+        return False
+
+    valid_prelim = [p for p in prelim if p["base_score"].games >= 30]
+    all_below_par = bool(valid_prelim) and all(_is_effective_below_par(p) for p in valid_prelim)
+    has_combo_upside = any(_has_upside(p) for p in prelim)
 
     best_slot: int | None = None
     reroll_banner = ""
     if valid_scores or has_combo_upside:
         if all_below_par and not has_combo_upside:
             top_valid = max(
-                (p for p in prelim if p["base_score"].games >= 30),
-                key=lambda p: (p["base_hex_score"], p["base_score"].delta),
+                valid_prelim,
+                key=lambda p: (
+                    0 if (p["is_stat_overflow"] and p["combo_shift"] <= -20.0) else 1,
+                    p["final_hex_score"],
+                    p["base_score"].delta,
+                ),
             )
             top_tier = top_valid["base_score"].tier
             reroll_banner = f"本轮三卡均低于同阶均线（最高仅 {top_tier} 级）· 建议用骰子刷新"
@@ -347,7 +404,14 @@ def rank_picker_cards(
                 if p["base_score"].games >= 30 or p["combo_shift"] > 0 or p["pair_shift"] >= 1.5
             ]
             if eligible:
-                winner = max(eligible, key=lambda p: (p["final_hex_score"], p["effective_delta"]))
+                winner = max(
+                    eligible,
+                    key=lambda p: (
+                        0 if p["is_hard_wasted_overflow"] else 1,
+                        p["final_hex_score"],
+                        p["effective_delta"],
+                    ),
+                )
                 best_slot = int(winner["slot_index"])
 
     out: list[UnifiedAugmentDecision] = []

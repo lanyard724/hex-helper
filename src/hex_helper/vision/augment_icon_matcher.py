@@ -253,6 +253,23 @@ def build_hud_icon_strip_crop(
     return strip if placed else None
 
 
+def build_hud_wide_diag_crop(
+    frame_bgr: np.ndarray,
+    game_rect: WindowRect | None = None,
+) -> np.ndarray | None:
+    """Slice wide bottom-left HUD diagnostic region (x=0.05..0.38, y=0.84..1.00) on demand."""
+    if not is_valid_frame(frame_bgr):
+        return None
+    view = AugmentIconMatcher._resolve_game_view(frame_bgr, game_rect)
+    vh, vw = view.shape[:2]
+    if vh < 16 or vw < 16:
+        return None
+    x0 = max(0, min(vw - 1, int(round(vw * 0.05))))
+    x1 = max(x0 + 1, min(vw, int(round(vw * 0.38))))
+    y0 = max(0, min(vh - 1, int(round(vh * 0.84))))
+    return view[y0:vh, x0:x1].copy()
+
+
 class AugmentIconMatcher:
     """Pure read-only visual icon template matcher for the 237-augment catalog & HUD verification."""
 
@@ -366,6 +383,14 @@ class AugmentIconMatcher:
         if not patches:
             return None
         return build_hud_icon_strip_crop(patches, tile_size=tile_size)
+
+    def build_hud_wide_diag_crop(
+        self,
+        frame_bgr: np.ndarray,
+        game_rect: WindowRect | None = None,
+    ) -> np.ndarray | None:
+        """Slice wide bottom-left HUD region (x=0.05..0.38, y=0.84..1.00) for blind-scan diagnostics."""
+        return build_hud_wide_diag_crop(frame_bgr, game_rect)
 
     def _load_cdragon_metadata(self, explicit_path: Path | str | None) -> None:
         candidates: list[Path] = []
@@ -798,6 +823,7 @@ class AugmentIconMatcher:
             "min_score": float(min_score),
             "hud_scale": round(float(hud_scale), 3),
             "slot_index_hint": slot_index_hint,
+            "hud_strip_blind": False,
             "outcome": "invalid_frame",
         }
         if not self.is_valid_frame(frame_bgr):
@@ -922,6 +948,18 @@ class AugmentIconMatcher:
             diag["outcome"] = "skipped_empty_bank"
         else:
             diag["outcome"] = "flat_patches"
+
+        # Lazy/on-demand wide HUD diagnostic crop only when all scanned slots score <= 0.0 (blind scan)
+        if (
+            best_hit is None
+            and self.template_count > 0
+            and not saw_empty_bank
+            and float(diag.get("best_score", 0.0)) <= 0.0
+        ):
+            diag["hud_strip_blind"] = True
+            wide_crop = self.build_hud_wide_diag_crop(frame_bgr, game_rect)
+            if wide_crop is not None:
+                diag["hud_wide_diag_crop"] = wide_crop
         self._last_verify_diagnostics = diag
         return best_hit
 

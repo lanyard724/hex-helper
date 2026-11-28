@@ -322,6 +322,15 @@ class LoginRegisterDialog(QDialog):
         self.status_lbl.setStyleSheet("color: #A09B8C; font-size: 11px; background: transparent; border: none;")
         lay.addWidget(self.status_lbl)
 
+        self.disclaimer_lbl = QLabel(
+            "说明：本助手基于对局数据库与 AI 推演，建议可能与个人经验存在差异，仅供对局参考与娱乐体验。"
+        )
+        self.disclaimer_lbl.setWordWrap(True)
+        self.disclaimer_lbl.setStyleSheet(
+            "color: #7C8594; font-size: 10px; background: transparent; border: none;"
+        )
+        lay.addWidget(self.disclaimer_lbl)
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         self.cancel_btn = HextechActionButton("取消", variant="gold", height=34)

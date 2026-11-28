@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from hex_helper.data.locale_pack import CLIENT_LOCALES, normalize_client_locale
 from hex_helper.edition import DEFAULT_CLOUD_API_BASE, is_commercial_edition
 
 
@@ -50,8 +51,11 @@ class HotkeyConfig:
     open_recap: str = ""
 
 
-COACH_MODES = ("cloud", "off")
+COACH_MODES = ("auto", "gemini", "antigravity", "cloud", "off")
 COACH_TIERS = ("a", "b", "auto")
+DATA_BAND_MODES = ("all", "blended", "high")
+RECAP_TEMPLATES = ("endfield_split", "cinematic_banner", "diagonal_hologram", "editorial_glass")
+DEFAULT_RECAP_TEMPLATE = "editorial_glass"
 GEMINI_MODELS = (
     "gemini-4-hydrogen",
     "gemini-4-argon",
@@ -112,7 +116,7 @@ def resolve_thinking_level(
       (gemini-3.8-flash and all gemini-4* models reject THINKING_LEVEL_MINIMAL with HTTP 400).
     - When adaptive=True, caps level by real-time latency budget without ever exceeding configured_level:
       * augment_picking -> <= 'minimal' (clamped to 'low' on non-minimal models such as gemini-3.8-flash & Gemini 4)
-      * connection_test / pre_death_warmup -> <= 'low'
+      * connection_test / pre_death_warmup / archetype_switched -> <= 'low'
       * death_enemy_build_changed -> <= 'low' when fast_death=True (or non-Gemini-4 model); <= 'medium' otherwise
       * augment_selected -> <= 'low' when is_transformative is False; <= 'medium' for transformative pivots or unspecified
       * game_start -> <= 'medium'
@@ -130,7 +134,7 @@ def resolve_thinking_level(
         reason = (trigger_reason or "").strip().lower()
         if reason == "augment_picking":
             rank = min(rank, max(min_rank, _THINKING_RANK["minimal"]))
-        elif reason in ("connection_test", "pre_death_warmup"):
+        elif reason in ("connection_test", "pre_death_warmup", "archetype_switched"):
             rank = min(rank, max(min_rank, _THINKING_RANK["low"]))
         elif reason == "death_enemy_build_changed":
             target = "low" if (fast_death or not is_gemini4) else "medium"
@@ -154,7 +158,7 @@ def mask_api_key(key: str) -> str:
 
 
 def _default_proxy_url() -> str:
-    return ""
+    return "" if is_commercial_edition() else "http://127.0.0.1:7900"
 
 
 def _default_bridge_enabled() -> bool:
@@ -182,6 +186,8 @@ class AppConfig:
     dataset_patch: str = "latest"
     dataset_mode: str = "normal"
     dataset_band: str = ""
+    data_band_mode: str = "all"  # "all" | "blended" | "high"
+    client_locale: str = "zh_cn"  # "zh_cn" | "zh_my" | "zh_tw"
     lockfile_path: str = ""
     lol_install_dir: str = ""
     first_run_completed: bool = False
@@ -222,8 +228,10 @@ class AppConfig:
     combo_drawer_scale: float | None = None
     combo_overlay_enabled: bool = True
     combo_auto_popup_on_picker: bool = False
+    allow_screen_recording_overlays: bool = False
     champ_select_goal_mode: str = "climb"  # "climb" | "fun"
     lobby_scout_enabled: bool = True
+    recap_template: str = DEFAULT_RECAP_TEMPLATE
     unsealed_user_ids: list[str] = field(default_factory=list)
     seal_snooze_until: int = 0
     newbie_banner_dismissed: bool = False
@@ -260,6 +268,8 @@ class AppConfig:
             "dataset_patch",
             "dataset_mode",
             "dataset_band",
+            "data_band_mode",
+            "client_locale",
             "lockfile_path",
             "lol_install_dir",
             "first_run_completed",
@@ -294,8 +304,10 @@ class AppConfig:
             "combo_drawer_scale",
             "combo_overlay_enabled",
             "combo_auto_popup_on_picker",
+            "allow_screen_recording_overlays",
             "champ_select_goal_mode",
             "lobby_scout_enabled",
+            "recap_template",
             "unsealed_user_ids",
             "seal_snooze_until",
             "newbie_banner_dismissed",
@@ -306,9 +318,15 @@ class AppConfig:
 
         cfg.combo_overlay_enabled = bool(cfg.combo_overlay_enabled)
         cfg.combo_auto_popup_on_picker = bool(cfg.combo_auto_popup_on_picker)
+        cfg.allow_screen_recording_overlays = bool(cfg.allow_screen_recording_overlays)
+        band_mode = str(cfg.data_band_mode or "all").strip().lower()
+        cfg.data_band_mode = band_mode if band_mode in DATA_BAND_MODES else "all"
+        cfg.client_locale = normalize_client_locale(getattr(cfg, "client_locale", "zh_cn"))
         goal_mode = str(cfg.champ_select_goal_mode or "climb").strip().lower()
         cfg.champ_select_goal_mode = goal_mode if goal_mode in ("climb", "fun") else "climb"
         cfg.lobby_scout_enabled = bool(cfg.lobby_scout_enabled)
+        recap_tpl = str(cfg.recap_template or DEFAULT_RECAP_TEMPLATE).strip().lower()
+        cfg.recap_template = recap_tpl if recap_tpl in RECAP_TEMPLATES else DEFAULT_RECAP_TEMPLATE
         cfg.telemetry_enabled = bool(cfg.telemetry_enabled)
         cfg.devlab_enabled = bool(cfg.devlab_enabled)
         cfg.devlab_roi_snapshots = bool(cfg.devlab_roi_snapshots)

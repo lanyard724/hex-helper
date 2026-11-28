@@ -137,11 +137,12 @@ def test_lookup_window_v09_collapsible_key_strip_history_and_special_filters():
     from hex_helper.ui.lookup_window import LookupWindow
 
     app = _qt_app()
-    cfg = AppConfig()
+    cfg = AppConfig(gemini_api_key="AIzaDummyTestKey1234567890")
     lw = LookupWindow(cfg=cfg)
 
-    assert lw.gemini_key_edit is None
-    assert lw.coach_mode_combo is None
+    assert lw._gemini_form_collapsed is True
+    lw.set_gemini_form_collapsed(False)
+    assert lw._gemini_form_collapsed is False
 
     total_all = lw.special_list.count()
     lw._set_special_category("质变")

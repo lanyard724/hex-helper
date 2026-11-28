@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 from hex_helper.config import NormalizedRect
+from hex_helper.data.locale_pack import desired_ocr_language_tag, normalize_client_locale
 from hex_helper.data.provider import AugmentInfo
 from hex_helper.vision.augment_icon_matcher import AugmentIconMatcher
 from hex_helper.vision.capture import (
@@ -191,7 +192,7 @@ class HexVisionWorker:
     IDLE_WAIT_INTERVAL_S = 0.25
 
     _COALESCE_CMDS: frozenset[str] = frozenset(
-        {"force_rescan", "plan_b_rescan", "update_rois", "update_catalog", "reload_icons", "reset_match", "capture_picker_refs", "stop"}
+        {"force_rescan", "plan_b_rescan", "update_rois", "update_catalog", "set_locale", "reload_icons", "reset_match", "capture_picker_refs", "stop"}
     )
 
     def __init__(
@@ -205,7 +206,8 @@ class HexVisionWorker:
         item_icon_matcher: ItemIconMatcher | None = None,
         augment_icon_matcher: AugmentIconMatcher | None = None,
         prefer_dxcam: bool = True,
-        language_tag: str = "zh-Hans-CN",
+        client_locale: str = "zh_cn",
+        language_tag: str | None = None,
         cache_dir: Path | str | None = None,
         card_band_roi: NormalizedRect | None = None,
         title_band_roi: NormalizedRect | None = None,
@@ -230,7 +232,8 @@ class HexVisionWorker:
         self._augment_icon_matcher = augment_icon_matcher
 
         self._prefer_dxcam = bool(prefer_dxcam)
-        self._language_tag = str(language_tag or "zh-Hans-CN")
+        self._client_locale = normalize_client_locale(client_locale)
+        self._language_tag = str(language_tag or desired_ocr_language_tag(self._client_locale))
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._card_band_roi = card_band_roi or NormalizedRect(0.08, 0.24, 0.84, 0.48)
         self._title_band_roi = title_band_roi or NormalizedRect(0.08, 0.385, 0.84, 0.052)
@@ -361,16 +364,23 @@ class HexVisionWorker:
                 logger.warning("HexVisionWorker WinRT OCR init unavailable: %s", exc)
                 self._ocr_engine = None
 
+        use_t2s = bool(getattr(self._ocr_engine, "needs_t2s_matching", False)) if self._ocr_engine is not None else False
         if self._detector is None and self._ocr_engine is not None and self._augments:
             self._detector = AugmentPickerDetector(
                 ocr_engine=self._ocr_engine,
-                matcher=AugmentMatcher(self._augments),
+                matcher=AugmentMatcher(self._augments, use_t2s=use_t2s),
                 card_band_roi=self._card_band_roi,
                 title_band_roi=self._title_band_roi,
+                client_locale=self._client_locale,
             )
 
         if self._transmute_watcher is None and self._ocr_engine is not None and self._augments:
-            self._transmute_watcher = TransmuteRevealWatcher(self._ocr_engine, self._augments)
+            self._transmute_watcher = TransmuteRevealWatcher(
+                self._ocr_engine,
+                self._augments,
+                client_locale=self._client_locale,
+                use_t2s=use_t2s,
+            )
 
     def _ensure_plan_b_matchers(self) -> None:
         if self._item_icon_matcher is None and self._cache_dir is not None:
@@ -851,12 +861,51 @@ class HexVisionWorker:
             self._clear_picker_slot_refs()
             return False
 
+        if cmd == "set_locale":
+            new_locale = normalize_client_locale(payload.get("client_locale"))
+            self._client_locale = new_locale
+            new_tag = desired_ocr_language_tag(new_locale)
+            augs = payload.get("augments")
+            if isinstance(augs, (list, tuple)):
+                self._augments = list(augs)
+            if new_tag != self._language_tag:
+                if self._owns_ocr and self._ocr_engine is not None:
+                    try:
+                        self._ocr_engine.close()
+                    except Exception:
+                        pass
+                    self._ocr_engine = None
+                    self._ocr_init_attempted = False
+                self._language_tag = new_tag
+                if self._owns_ocr:
+                    self._ocr_init_attempted = True
+                    try:
+                        self._ocr_engine = WinRtOcrEngine(self._language_tag)
+                    except Exception as exc:
+                        logger.warning("HexVisionWorker locale OCR switch (%s) failed: %s", self._language_tag, exc)
+                        self._ocr_engine = None
+            use_t2s = bool(getattr(self._ocr_engine, "needs_t2s_matching", False)) if self._ocr_engine is not None else False
+            if self._detector is not None:
+                if self._ocr_engine is not None:
+                    self._detector.ocr = self._ocr_engine
+                self._detector.set_client_locale(self._client_locale)
+                self._detector.matcher.update_catalog(self._augments, use_t2s=use_t2s)
+                self._detector.reset()
+            if self._transmute_watcher is not None:
+                if self._ocr_engine is not None:
+                    self._transmute_watcher.ocr = self._ocr_engine
+                self._transmute_watcher.set_locale(self._client_locale, use_t2s=use_t2s)
+                self._transmute_watcher.update_catalog(self._augments)
+            self._clear_picker_slot_refs()
+            return False
+
         if cmd == "update_catalog":
             augs = payload.get("augments")
             if isinstance(augs, (list, tuple)):
                 self._augments = list(augs)
+                use_t2s = bool(getattr(self._ocr_engine, "needs_t2s_matching", False)) if self._ocr_engine is not None else False
                 if self._detector is not None:
-                    self._detector.matcher.update_catalog(self._augments)
+                    self._detector.matcher.update_catalog(self._augments, use_t2s=use_t2s)
                 if self._transmute_watcher is not None:
                     self._transmute_watcher.update_catalog(self._augments)
             return False

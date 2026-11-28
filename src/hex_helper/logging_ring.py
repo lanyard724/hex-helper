@@ -382,28 +382,30 @@ class MatchLogRing:
         """Start a new match log bucket (or re-attach if the latest match shares match_key)."""
         clean_key = (match_key or "").strip()
         with self._lock:
-            # Re-attach to latest match if the app restarted mid-match with identical match_key
+            # Re-attach only to an active (non-ended) matching session of the same champion
             if clean_key and self._matches and self._matches[-1].match_key == clean_key:
                 existing = self._matches[-1]
-                self._active_seq = existing.seq
-                if hero_id:
-                    existing.hero_id = hero_id
-                if hero_name:
-                    existing.hero_name = hero_name
-                if dataset_patch:
-                    existing.dataset_patch = dataset_patch
-                if dataset_mode:
-                    existing.dataset_mode = dataset_mode
-                existing.ended_at = ""
-                self._append_to_file_locked(
-                    self.root_dir / existing.file_name,
-                    f"--- REATTACHED MATCH #{existing.seq:05d} | {_utc_now_iso()} | hero={existing.hero_name or existing.hero_id or '-'} ---",
-                    max_bytes=self.max_match_bytes,
-                    entry=existing,
-                    levelno=logging.INFO,
-                )
-                self._save_index_locked()
-                return existing
+                same_hero = (not existing.hero_id) or (not hero_id) or (existing.hero_id == hero_id)
+                if not existing.ended_at and same_hero:
+                    self._active_seq = existing.seq
+                    if hero_id:
+                        existing.hero_id = hero_id
+                    if hero_name:
+                        existing.hero_name = hero_name
+                    if dataset_patch:
+                        existing.dataset_patch = dataset_patch
+                    if dataset_mode:
+                        existing.dataset_mode = dataset_mode
+                    existing.ended_at = ""
+                    self._append_to_file_locked(
+                        self.root_dir / existing.file_name,
+                        f"--- REATTACHED MATCH #{existing.seq:05d} | {_utc_now_iso()} | hero={existing.hero_name or existing.hero_id or '-'} ---",
+                        max_bytes=self.max_match_bytes,
+                        entry=existing,
+                        levelno=logging.INFO,
+                    )
+                    self._save_index_locked()
+                    return existing
 
             # Close previous active match cleanly if still open
             prev = self._get_active_entry_locked()
@@ -445,6 +447,7 @@ class MatchLogRing:
     def update_match_meta(
         self,
         *,
+        match_key: str | None = None,
         hero_id: str | None = None,
         hero_name: str | None = None,
         dataset_patch: str | None = None,
@@ -455,6 +458,10 @@ class MatchLogRing:
             if entry is None:
                 return
             changed = False
+            clean_mk = (match_key or "").strip() if match_key is not None else ""
+            if clean_mk and clean_mk != entry.match_key:
+                entry.match_key = clean_mk
+                changed = True
             if hero_id and hero_id != entry.hero_id:
                 entry.hero_id = hero_id
                 changed = True

@@ -32,9 +32,10 @@ from hex_helper.scoring.team_comp import (
 )
 from hex_helper.scoring.tier import score_hero_tier
 from hex_helper.ui.resizable_overlay import FramelessResizeController, HextechCornerGrip
-from hex_helper.ui.theme import BASE_OVERLAY_QSS, load_app_pixmap, tier_badge_qss
+from hex_helper.ui.theme import BASE_OVERLAY_QSS, HEXTECH_MENU_QSS, load_app_pixmap, tier_badge_qss
 from hex_helper.ui.win32_window import (
     UiBridgeInvoker,
+    apply_capture_exclusion,
     clamp_to_screen_rect,
     physical_rect_to_logical,
     screen_for_physical_rect,
@@ -209,6 +210,7 @@ class ChampSelectOverlay(QWidget):
         self._last_store: DataStore | None = None
         self._last_analysis: TeamCompAnalysis | None = None
         self._fade_anim: QPropertyAnimation | None = None
+        self._allow_screen_recording: bool = False
         self._custom_w: int | None = None
         self._custom_h: int | None = None
         if initial_size and len(initial_size) == 2:
@@ -794,13 +796,15 @@ class ChampSelectOverlay(QWidget):
 
         portraits: list[tuple[str, str, bool, str, QPixmap | None]] = []
         for hid, hname in zip(bf.hero_ids, bf.hero_names):
+            disp_name = store.display_hero_name(hid, hname) if hasattr(store, "display_hero_name") else hname
             in_team = hid in ally_set
             border_hex = "#C8AA6E" if in_team else "#0AC8B9"
             pm = self._get_portrait(hid, store, border_hex)
-            portraits.append((hid, hname, in_team, border_hex, pm))
+            portraits.append((hid, disp_name, in_team, border_hex, pm))
 
         icon_ready = tuple((hid, pm is not None) for hid, _hname, _in_team, _border, pm in portraits)
-        sig = (bf.hero_ids, bf.hero_names, tuple(sorted(ally_set)), is_narrow, icon_ready)
+        locale_tag = str(getattr(store, "client_locale", "zh_cn") or "zh_cn")
+        sig = (bf.hero_ids, bf.hero_names, locale_tag, tuple(sorted(ally_set)), is_narrow, icon_ready)
         if sig != self._last_best_five_sig:
             while self.best_five_heroes_lay.count():
                 item = self.best_five_heroes_lay.takeAt(0)
@@ -982,7 +986,8 @@ class ChampSelectOverlay(QWidget):
             h = store.get_hero(hid)
             if h is None:
                 return None
-            wr, name, rank, games = h.win_rate, h.name, h.rank, h.games
+            disp_name = store.display_hero_name(hid, h.name) if hasattr(store, "display_hero_name") else h.name
+            wr, name, rank, games = h.win_rate, disp_name, h.rank, h.games
             has_pos_swap = swap_delta is not None and swap_delta >= 1.5
             row = QFrame()
             row.setObjectName("SubCard")
@@ -1286,11 +1291,20 @@ class ChampSelectOverlay(QWidget):
         if cx != self.x() or cy != self.y():
             self.move(cx, cy)
 
+    def set_screen_recording_allowed(self, allowed: bool) -> None:
+        self._allow_screen_recording = bool(allowed)
+        if self.isVisible() or bool(self.internalWinId()):
+            apply_capture_exclusion(self, exclude=not self._allow_screen_recording)
+
     def show_overlay(self) -> None:
         self.ensure_on_screen()
         if self.windowOpacity() < 0.99:
             self.setWindowOpacity(1.0)
-        show_no_activate(self, click_through=False)
+        show_no_activate(
+            self,
+            click_through=False,
+            exclude_from_capture=not self._allow_screen_recording,
+        )
         self._layout_corner_grips()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -1304,6 +1318,7 @@ class ChampSelectOverlay(QWidget):
             return
         if event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
+            menu.setStyleSheet(HEXTECH_MENU_QSS)
             a_reset_size = QAction("恢复默认尺寸", menu)
             a_reset_size.triggered.connect(self.reset_default_size)
             a_hide = QAction("隐藏选人悬浮窗", menu)

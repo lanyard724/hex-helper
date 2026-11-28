@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from hex_helper.data.provider import ItemStaticInfo
 from hex_helper.data.special_builds import SpecialAugmentBuild, get_special_augment_db
-from hex_helper.data.store import DataStore
+from hex_helper.data.store import SIX_DIGIT_ITEM_ALIASES, DataStore, _MAYHEM_ITEM_PREFIXES
 
 # Normalized item upgrade aliases (ARAM/tear items -> base legendary equivalents)
 ITEM_EQUIVALENCE: dict[str, str] = {
@@ -17,10 +17,11 @@ ITEM_EQUIVALENCE: dict[str, str] = {
 }
 
 
-def normalize_item_id(item_id: str) -> str:
-    s = str(item_id)
-    # Strip 12xxxx / 22xxxx / 32xxxx / 44xxxx / 77xxxx Arena/Mayhem variant prefixes if base 4-digit exists
-    if len(s) == 6 and s[:2] in ("12", "22", "32", "44", "77", "99"):
+def normalize_item_id(item_id: str | int) -> str:
+    s = str(item_id).strip()
+    s = SIX_DIGIT_ITEM_ALIASES.get(s, s)
+    # Strip 12xxxx / 22xxxx / 32xxxx / 44xxxx / 77xxxx / 99xxxx Arena/Mayhem variant prefixes if base 4-digit exists
+    if len(s) == 6 and s[:2] in _MAYHEM_ITEM_PREFIXES:
         s = s[2:]
     return ITEM_EQUIVALENCE.get(s, s)
 
@@ -55,22 +56,40 @@ _EXTRA_TRANSFORMATIVE_KEYWORDS: tuple[str, ...] = (
 def resolve_special_builds(
     store: DataStore | None,
     selected_augment_ids: list[str] | tuple[str, ...],
+    hero_id: str | int | None = None,
+    *,
+    band_mode: str | None = None,
 ) -> list[SpecialAugmentBuild]:
     """Return all SpecialAugmentBuild entries matched by currently selected augments."""
     db = get_special_augment_db()
     out: list[SpecialAugmentBuild] = []
     seen: set[str] = set()
     for aid in selected_augment_ids:
-        entry = db.resolve(store, aid)
+        entry = (
+            db.resolve_for_hero(store, aid, hero_id, band_mode=band_mode)
+            if hero_id is not None
+            else db.resolve(store, aid)
+        )
         if entry is not None and entry.augment_id not in seen:
             seen.add(entry.augment_id)
             out.append(entry)
     return out
 
 
-def is_transformative_augment(store: DataStore, augment_id: str) -> bool:
+def is_transformative_augment(
+    store: DataStore,
+    augment_id: str,
+    hero_id: str | int | None = None,
+    *,
+    band_mode: str | None = None,
+) -> bool:
     """Return True if this augment justifies overhauling an already-committed match build plan."""
-    entry = get_special_augment_db().resolve(store, augment_id)
+    db = get_special_augment_db()
+    entry = (
+        db.resolve_for_hero(store, augment_id, hero_id, band_mode=band_mode)
+        if hero_id is not None
+        else db.resolve(store, augment_id)
+    )
     if entry is not None:
         return entry.transformative
     aug = store.get_augment(str(augment_id))

@@ -17,6 +17,13 @@ BUNDLED_HERO_SIG_PATH = Path(__file__).resolve().parents[1] / "assets" / "hero_s
 
 
 @dataclass(frozen=True)
+class AltBuildTemplate:
+    profile: str
+    label: str
+    items: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class HeroSignatureBuild:
     hero_id: str
     name: str
@@ -25,18 +32,29 @@ class HeroSignatureBuild:
     signature_items: tuple[str, ...]
     avoid_passive: tuple[str, ...]
     note: str
+    alt_templates: tuple[AltBuildTemplate, ...] = ()
 
     def to_coach_dict(self, store: Any | None = None) -> dict[str, Any]:
         fmt = lambda ids: [
             f"{store.get_item_info(i).name}({i})" if store is not None else i for i in ids
         ]
-        return {
+        out: dict[str, Any] = {
             "archetype": self.archetype,
             "starter_items": fmt(self.starter_items),
             "signature_items": fmt(self.signature_items),
             "avoid_passive": fmt(self.avoid_passive),
             "note": self.note,
         }
+        if self.alt_templates:
+            out["alt_templates"] = [
+                {
+                    "profile": tpl.profile,
+                    "label": tpl.label,
+                    "items": fmt(tpl.items),
+                }
+                for tpl in self.alt_templates
+            ]
+        return out
 
 
 class HeroSignatureDatabase:
@@ -65,6 +83,15 @@ class HeroSignatureDatabase:
         for item in raw.get("heroes") or []:
             if not isinstance(item, dict):
                 continue
+            parsed_alts: list[AltBuildTemplate] = []
+            for raw_alt in item.get("alt_templates") or []:
+                if not isinstance(raw_alt, dict):
+                    continue
+                prof = str(raw_alt.get("profile", "")).strip().upper()
+                alt_items = tuple(str(x).strip() for x in (raw_alt.get("items") or []) if str(x).strip())
+                if prof in ("AP", "AD", "TANK", "SUPPORT", "HYBRID") and alt_items:
+                    lbl = str(raw_alt.get("label", "")).strip() or prof
+                    parsed_alts.append(AltBuildTemplate(profile=prof, label=lbl, items=alt_items))
             entry = HeroSignatureBuild(
                 hero_id=str(item.get("hero_id", "")),
                 name=str(item.get("name", "")),
@@ -73,6 +100,7 @@ class HeroSignatureDatabase:
                 signature_items=tuple(str(x) for x in (item.get("signature_items") or []) if str(x).strip()),
                 avoid_passive=tuple(str(x) for x in (item.get("avoid_passive") or []) if str(x).strip()),
                 note=str(item.get("note", "")),
+                alt_templates=tuple(parsed_alts),
             )
             if entry.hero_id:
                 self._by_id[entry.hero_id] = entry

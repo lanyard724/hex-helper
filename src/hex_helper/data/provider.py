@@ -70,10 +70,17 @@ class DestinyItemEntry:
     games: int
     wins: int
     low_sample: bool = False
+    control_games: int = 0
+    control_wins: int = 0
+    style: str = ""
 
     @property
     def win_rate(self) -> float:
         return self.wins / self.games if self.games > 0 else 0.0
+
+    @property
+    def control_win_rate(self) -> float | None:
+        return self.control_wins / self.control_games if self.control_games > 0 else None
 
 
 @dataclass(frozen=True)
@@ -118,6 +125,7 @@ class ItemStaticInfo:
     has_grievous: bool = False
     has_shield_break: bool = False
     components: tuple[str, ...] = field(default_factory=tuple)
+    aram_available: bool = True
 
 
 class StatsProvider(Protocol):

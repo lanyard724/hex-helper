@@ -532,3 +532,9 @@ def detect_primary_lol_install(
         cache_ttl_s=cache_ttl_s,
     )
     return installs[0] if installs else None
+
+
+def is_riot_overseas_lockfile(lockfile_path: str | Path | None) -> bool:
+    """Return True when lockfile points to a Riot Games client installation rather than WeGame/Tencent."""
+    norm = str(lockfile_path or "").strip().lower().replace("/", "\\")
+    return bool(norm and "riot games" in norm and "wegame" not in norm and "tencent" not in norm)

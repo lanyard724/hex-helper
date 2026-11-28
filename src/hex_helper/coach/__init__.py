@@ -1,19 +1,17 @@
-"""Coach prompt payload builder and item-grounding helpers for HexHelper."""
+"""Direct Gemini API Coach integration (decoupled from external Antigravity relay)."""
 
-from .gemini_coach import (
-    COACH_SYSTEM_INSTRUCTION,
-    PICKER_FAST_SYSTEM_INSTRUCTION,
+from hex_helper.coach.gemini_coach import (
     GeminiCallStats,
+    GeminiCoachClient,
+    GeminiCoachWorker,
     build_coach_prompt_payload,
-    build_picker_fast_prompt_payload,
     ground_coach_advice,
 )
 
 __all__ = [
-    "COACH_SYSTEM_INSTRUCTION",
-    "PICKER_FAST_SYSTEM_INSTRUCTION",
     "GeminiCallStats",
+    "GeminiCoachClient",
+    "GeminiCoachWorker",
     "build_coach_prompt_payload",
-    "build_picker_fast_prompt_payload",
     "ground_coach_advice",
 ]

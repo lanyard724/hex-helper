@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -27,6 +28,7 @@ from hex_helper.cloud.client import CloudAdviseStats, CloudCoachError, CloudCoac
 from hex_helper.cloud.session_store import DpapiSessionStore
 from hex_helper.cloud.updater import UpdateInfo, check_for_update, launch_update_installer, parse_update_info
 from hex_helper.config import (
+    DATA_BAND_MODES,
     AppConfig,
     NormalizedRect,
     format_display_patch,
@@ -39,17 +41,23 @@ from hex_helper.config import (
 from hex_helper.data.aramhex_sync import AramHexSyncer
 from hex_helper.data.hero_signatures import get_hero_signature_db
 from hex_helper.data.provider import DatasetDescriptor
+from hex_helper.data.locale_pack import (
+    CLIENT_LOCALE_LABELS,
+    desired_ocr_language_tag,
+    normalize_client_locale,
+)
 from hex_helper.data.special_builds import get_special_augment_db
 from hex_helper.data.static_assets import StaticAssetsManager
 from hex_helper.data.store import DataStore
 from hex_helper.edition import APP_VERSION, is_commercial_edition, is_devlab_allowed
-from hex_helper.setup.preflight import extract_bundled_seed_cache
+from hex_helper.setup.preflight import check_locale_ocr_readiness, extract_bundled_seed_cache
 
 if TYPE_CHECKING:
     from hex_helper.coach.gemini_coach import GeminiCallStats
 from hex_helper.game.action_tracker import MatchActionTracker
 from hex_helper.game.lcu_client import LcuClient
 from hex_helper.game.live_client import LiveClientReader
+from hex_helper.game.lol_locator import is_riot_overseas_lockfile
 from hex_helper.game.lobby_scout import LobbyScoutSnapshot, scout_lobby_readonly
 from hex_helper.game.models import ChampSelectState, LiveMatchSnapshot
 from hex_helper.logging_ring import install_match_log_handler
@@ -57,24 +65,31 @@ from hex_helper.scoring.augment_combo import (
     ComboPlan,
     PickerComboVerdict,
     build_combo_plan,
+    effective_augment_round,
+    estimate_effective_crit_chance,
     evaluate_picker_combos,
     export_combo_coach_context,
 )
 from hex_helper.scoring.build_synergy import is_transformative_augment, item_is_owned, normalize_item_id
-from hex_helper.scoring.destiny import DESTINY_AUGMENT_ID, rank_destiny_items
+from hex_helper.scoring.destiny import DESTINY_AUGMENT_ID, rank_destiny_items, summarize_destiny_card_hint
 from hex_helper.scoring.matchup_optimizer import (
     TIER2_BOOT_IDS,
     TRINKET_AND_FREE_ITEM_IDS,
     DynamicItemRec,
     MatchupThreatProfile,
     NextBuyPlan,
+    _infer_static_default_profile,
+    analyze_matchup_threats,
     build_next_buy_plan,
     canonicalize_item_id,
+    get_hero_build_templates,
     infer_hero_profile,
+    infer_unified_hero_profile,
     is_valid_plan_item,
     optimize_next_items,
     reconcile_match_build_plan,
     reconcile_match_build_plan_with_trace,
+    resolve_item_id_by_name,
 )
 from hex_helper.scoring.team_comp import TeamCompAnalysis, analyze_champ_select_pool
 from hex_helper.scoring.tier import AugmentScore, rank_picker_cards, score_hero_augment, score_hero_tier
@@ -91,6 +106,7 @@ from hex_helper.ui.match_recap_card import (
     MatchRecapDialog,
     compute_match_rating,
     normalize_final_stats,
+    normalize_recap_template,
 )
 from hex_helper.ui.theme import load_app_icon
 from hex_helper.ui.win32_window import (
@@ -98,6 +114,7 @@ from hex_helper.ui.win32_window import (
     UiBridgeInvoker,
     normalize_hotkey,
     physical_rect_to_logical,
+    restore_foreground_window,
     screen_for_physical_rect,
 )
 from hex_helper.vision.augment_icon_matcher import AugmentIconMatcher, IconMatchResult
@@ -107,6 +124,7 @@ from hex_helper.vision.capture import (
     find_game_window,
     find_lcu_window,
     get_primary_screen_rect,
+    is_game_or_overlay_foreground,
     is_hwnd_foreground,
 )
 from hex_helper.vision.click_tracker import ClickTracker, build_slot_hit_boxes
@@ -125,7 +143,10 @@ from hex_helper.vision.worker import HexVisionWorker, VisionFrameOutput, VisionT
 
 _ORIG_SCREEN_CAPTURER = ScreenCapturer
 _ORIG_WINRT_OCR_ENGINE = WinRtOcrEngine
-_STAT_ANVIL_IDS: frozenset[str] = frozenset({"1402", "1403", "1404", "3171"})
+MAX_AUGMENT_SLOTS: int = 6
+_STAT_ANVIL_IDS: frozenset[str] = frozenset({"1402", "1403", "1404"})
+_BONUS_EVENT_CHOICE_IDS: frozenset[str] = frozenset({"3170", "3171", "3172", "3173"})
+_NON_AUGMENT_CHOICE_IDS: frozenset[str] = _STAT_ANVIL_IDS | _BONUS_EVENT_CHOICE_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +255,9 @@ class StateStepEffects:
     death_detected: bool = False
     enemy_sig_changed: bool = False
     death_skip_reason: str = ""
+    is_bonus_event_offer: bool = False
+    phantom_rolled_back_id: str = ""
+    phantom_rollback_elapsed_s: float = 0.0
 
 
 class HexStateMachine:
@@ -246,6 +270,8 @@ class HexStateMachine:
     VISUAL_ITEM_SUPPRESS_TTL_S = 45.0
     PRE_DEATH_WARMUP_COOLDOWN_S = 90.0
     PRE_DEATH_WARMUP_GOLD_THRESHOLD = 1400.0
+    PHANTOM_ROLLBACK_WINDOW_S = 45.0
+    MAX_AUGMENT_SLOTS = MAX_AUGMENT_SLOTS
 
     def __init__(self, store: DataStore | None = None) -> None:
         self._store: DataStore | None = store
@@ -263,17 +289,24 @@ class HexStateMachine:
         self.locked_next_item: str = ""
         self.allow_plan_overhaul: bool = False
         self.plan_overhaul_reason: str = ""
+        self.manual_profile_override: str = ""
         self.active_cards: tuple[DetectedCard, ...] = ()
         self.last_offered_cards: tuple[DetectedCard, ...] = ()
         self._active_card_ids: tuple[str, ...] = ()
         self._picker_closed_since: float | None = None
         self._last_clicked_slot: int | None = None
+        self._recent_offered_rounds: deque[tuple[str, ...]] = deque(maxlen=2)
+        self._recent_offered_pool: list[str] = []
+        self._last_auto_commit_snapshot: (
+            tuple[str, frozenset[str], float, list[str], str, bool, str] | None
+        ) = None
         self._was_dead: bool = False
         self._last_enemy_items_sig: str = ""
         self._last_death_coach_mono: float = -999.0
         self._last_warmup_coach_mono: float = -999.0
         self._last_warmup_enemy_sig: str = ""
         self._last_warmup_state_sig: tuple[Any, ...] = ()
+        self._warmed_up_this_life: bool = False
         self._match_started_notified: bool = False
 
     def reset_match(self) -> None:
@@ -289,17 +322,22 @@ class HexStateMachine:
         self.locked_next_item = ""
         self.allow_plan_overhaul = False
         self.plan_overhaul_reason = ""
+        self.manual_profile_override = ""
         self.active_cards = ()
         self.last_offered_cards = ()
         self._active_card_ids = ()
         self._picker_closed_since = None
         self._last_clicked_slot = None
+        self._recent_offered_rounds.clear()
+        self._recent_offered_pool.clear()
+        self._last_auto_commit_snapshot = None
         self._was_dead = False
         self._last_enemy_items_sig = ""
         self._last_death_coach_mono = -999.0
         self._last_warmup_coach_mono = -999.0
         self._last_warmup_enemy_sig = ""
         self._last_warmup_state_sig = ()
+        self._warmed_up_this_life = False
         self._match_started_notified = False
 
     def prune_suppressed_visual_items(self, now_mono: float | None = None) -> set[str]:
@@ -342,10 +380,50 @@ class HexStateMachine:
             return False
         return True
 
+    def _rebuild_recent_offered_pool(self) -> None:
+        selected = set(self.selected_augments)
+        out: list[str] = []
+        seen: set[str] = set()
+        for rnd in reversed(self._recent_offered_rounds):
+            for raw_aid in rnd:
+                aid = str(raw_aid or "").strip()
+                if not aid or aid in seen or aid in selected or aid in _NON_AUGMENT_CHOICE_IDS:
+                    continue
+                seen.add(aid)
+                out.append(aid)
+        self._recent_offered_pool = out
+
+    def _record_recent_offered_round(self, card_ids: tuple[str, ...], *, same_round: bool = False) -> None:
+        cleaned = tuple(
+            dict.fromkeys(
+                str(cid or "").strip()
+                for cid in card_ids
+                if str(cid or "").strip() and str(cid or "").strip() not in _NON_AUGMENT_CHOICE_IDS
+            )
+        )
+        if not cleaned:
+            return
+        if same_round and self._recent_offered_rounds:
+            merged = tuple(dict.fromkeys([*cleaned, *self._recent_offered_rounds[-1]]))
+            self._recent_offered_rounds[-1] = merged
+        elif not self._recent_offered_rounds or self._recent_offered_rounds[-1] != cleaned:
+            self._recent_offered_rounds.append(cleaned)
+        self._rebuild_recent_offered_pool()
+
+    def recent_unrecorded_augments(self) -> list[str]:
+        self._rebuild_recent_offered_pool()
+        return list(self._recent_offered_pool)
+
     def add_selected_augment(self, aug_id: str) -> bool:
-        aid = str(aug_id)
-        if aid and aid not in self.selected_augments and len(self.selected_augments) < 6:
+        aid = str(aug_id or "").strip()
+        if (
+            aid
+            and aid not in _NON_AUGMENT_CHOICE_IDS
+            and aid not in self.selected_augments
+            and len(self.selected_augments) < self.MAX_AUGMENT_SLOTS
+        ):
             self.selected_augments.append(aid)
+            self._rebuild_recent_offered_pool()
             return True
         return False
 
@@ -402,19 +480,23 @@ class HexStateMachine:
             removed = self.selected_augments.pop(index)
             if self.pending_transmute and self.pending_transmute.source_augment_id == removed:
                 self.pending_transmute = None
+            self._last_auto_commit_snapshot = None
+            self._rebuild_recent_offered_pool()
             self.invalidate_build_plan()
             return True
         return False
 
     def replace_last_augment(self, aug_id: str) -> bool:
         aid = str(aug_id)
-        if not aid or aid in self.selected_augments:
+        if not aid or aid in _NON_AUGMENT_CHOICE_IDS or aid in self.selected_augments:
             return False
         if self.selected_augments:
             old = self.selected_augments[-1]
             self.selected_augments[-1] = aid
             if self.pending_transmute and self.pending_transmute.source_augment_id == old:
                 self.pending_transmute = None
+            self._last_auto_commit_snapshot = None
+            self._rebuild_recent_offered_pool()
             self.invalidate_build_plan()
             return True
         return self.add_selected_augment(aid)
@@ -462,9 +544,11 @@ class HexStateMachine:
                 self.add_selected_augment(aid)
             pt.placeholder_replaced = True
         else:
-            if aid not in self.selected_augments and len(self.selected_augments) < 6:
+            if aid not in _NON_AUGMENT_CHOICE_IDS and aid not in self.selected_augments and len(self.selected_augments) < self.MAX_AUGMENT_SLOTS:
                 self.selected_augments.append(aid)
 
+        self._last_auto_commit_snapshot = None
+        self._rebuild_recent_offered_pool()
         pt.resolved_ids.append(aid)
         if len(pt.resolved_ids) >= pt.expected_count:
             self.pending_transmute = None
@@ -499,10 +583,10 @@ class HexStateMachine:
         snap: LiveMatchSnapshot,
         store: DataStore | None = None,
     ) -> str:
-        """Build enemy signature tracking ONLY complete items (>=2200G) and key tactical counters."""
+        """Build enemy signature tracking ONLY major complete items (>=2200G) and tactical counters (excluding Tier-2 boots)."""
         eff_store = store if store is not None else self._store
         return "|".join(
-            f"{e.champion_name}:{','.join(sorted(normalize_item_id(iid) for iid in e.item_ids if is_significant_enemy_item(iid, eff_store)))}"
+            f"{e.champion_name}:{','.join(sorted(normalize_item_id(iid) for iid in e.item_ids if normalize_item_id(iid) not in TIER2_BOOT_IDS and is_significant_enemy_item(iid, eff_store)))}"
             for e in snap.enemies
         )
 
@@ -562,6 +646,7 @@ class HexStateMachine:
         is_dead = bool(snap.my_player and snap.my_player.is_dead)
         if is_dead and not self._was_dead:
             self._last_warmup_state_sig = ()
+            self._warmed_up_this_life = False
             eff.auto_peek_drawer = True
             eff.death_detected = True
             if eff.coach_trigger != "game_start":
@@ -609,8 +694,7 @@ class HexStateMachine:
             and float(snap.game_time or 0.0) >= 90.0
             and owned_complete_count < 6
         ):
-            # WS-3 / v1.5.0 Pre-Death Warmup: pre-fetch low-thinking shop advice while alive
-            # with 90s cooldown + state-signature dedup so unchanged states never spam tokens
+            # WS-3 / v1.5.2 Pre-Death Warmup: single warmup per life unless enemy major items or augments change
             warmup_cd_ok = (
                 (now_mono - self._last_warmup_coach_mono) >= self.PRE_DEATH_WARMUP_COOLDOWN_S
                 and (now_mono - self._last_death_coach_mono) >= self.PRE_DEATH_WARMUP_COOLDOWN_S
@@ -625,18 +709,83 @@ class HexStateMachine:
                     enemy_sig,
                     tuple(sorted(owned_complete_ids)),
                     tuple(self.selected_augments),
-                    int(my_gold // 600),
                 )
-                if (
-                    (my_gold >= self.PRE_DEATH_WARMUP_GOLD_THRESHOLD or warmup_enemy_changed)
-                    and cur_warmup_sig != self._last_warmup_state_sig
-                ):
+                first_this_life = not self._warmed_up_this_life
+                augs_changed_since_warmup = (
+                    bool(self._last_warmup_state_sig)
+                    and len(self._last_warmup_state_sig) >= 3
+                    and tuple(self.selected_augments) != self._last_warmup_state_sig[2]
+                )
+                should_warmup = (
+                    first_this_life
+                    and (my_gold >= self.PRE_DEATH_WARMUP_GOLD_THRESHOLD or warmup_enemy_changed)
+                ) or (
+                    not first_this_life
+                    and (warmup_enemy_changed or augs_changed_since_warmup)
+                )
+                if should_warmup and cur_warmup_sig != self._last_warmup_state_sig:
                     self._last_warmup_coach_mono = now_mono
                     self._last_warmup_enemy_sig = enemy_sig
                     self._last_warmup_state_sig = cur_warmup_sig
+                    self._warmed_up_this_life = True
                     eff.coach_trigger = "pre_death_warmup"
         self._was_dead = is_dead
         return eff
+
+    def _is_stat_anvil_offer(self, cards: tuple[DetectedCard, ...] | list[DetectedCard]) -> bool:
+        if not cards:
+            return False
+        unique_ids = {c.augment.augment_id for c in cards}
+        if len(unique_ids) < 2:
+            return True
+        if "1404" in unique_ids and len(unique_ids) < len(cards):
+            return True
+        anvil_cnt = sum(1 for c in cards if c.augment.augment_id in _STAT_ANVIL_IDS)
+        return anvil_cnt >= 2 or (len(self.selected_augments) >= 4 and anvil_cnt >= 1)
+
+    @staticmethod
+    def _is_bonus_event_offer(cards: tuple[DetectedCard, ...] | list[DetectedCard]) -> bool:
+        return bool(cards) and any(str(c.augment.augment_id) in _BONUS_EVENT_CHOICE_IDS for c in cards)
+
+    def _maybe_apply_phantom_rollback(
+        self,
+        new_ids: tuple[str, ...],
+        *,
+        now_mono: float,
+        eff: StateStepEffects,
+    ) -> None:
+        snap = self._last_auto_commit_snapshot
+        self._last_auto_commit_snapshot = None
+        if snap is None:
+            return
+        (
+            snap_aid,
+            snap_offered,
+            snap_mono,
+            snap_plan,
+            snap_lock,
+            snap_allow_overhaul,
+            snap_overhaul_reason,
+        ) = snap
+        new_id_set = frozenset(str(x) for x in new_ids if x)
+        elapsed_s = max(0.0, float(now_mono) - float(snap_mono))
+        if (
+            elapsed_s <= self.PHANTOM_ROLLBACK_WINDOW_S
+            and snap_aid in new_id_set
+            and len(new_id_set & snap_offered) >= 2
+            and self.selected_augments
+            and self.selected_augments[-1] == snap_aid
+        ):
+            self.selected_augments.pop()
+            if self.pending_transmute and self.pending_transmute.source_augment_id == snap_aid:
+                self.pending_transmute = None
+            self.committed_plan = list(snap_plan)
+            self.locked_next_item = snap_lock
+            self.allow_plan_overhaul = bool(snap_allow_overhaul)
+            self.plan_overhaul_reason = snap_overhaul_reason
+            eff.phantom_rolled_back_id = snap_aid
+            eff.phantom_rollback_elapsed_s = elapsed_s
+            self._rebuild_recent_offered_pool()
 
     def on_picker_result(
         self,
@@ -652,26 +801,33 @@ class HexStateMachine:
             self._last_clicked_slot = clicked_slot
 
         if result.picker_visible and result.stable and result.cards:
-            # Ignore non-augment Stat Anvil popups (duplicate IDs, 1404 with dupes, >=2 anvil cards, or any anvil when 4 augs owned)
-            unique_ids = {c.augment.augment_id for c in result.cards}
-            if len(unique_ids) < 2:
+            # Ignore non-augment Stat Anvil popups (1402/1403/1404 & duplicate IDs)
+            if self._is_stat_anvil_offer(result.cards):
                 return eff
-            if "1404" in unique_ids and len(unique_ids) < len(result.cards):
-                return eff
-            anvil_cnt = sum(1 for c in result.cards if c.augment.augment_id in _STAT_ANVIL_IDS)
-            if anvil_cnt >= 2 or (len(self.selected_augments) >= 4 and anvil_cnt >= 1):
+            # Isolate bonus event choices (e.g. 3170-3173 Pentakill bonus) from augment state/selection/pools
+            if self._is_bonus_event_offer(result.cards):
+                eff.is_bonus_event_offer = True
                 return eff
             self._picker_closed_since = None
             new_ids = tuple(c.augment.augment_id for c in result.cards)
-            if self.state != GameState.AUGMENT_PICKING:
+            prev_active_ids = self._active_card_ids
+            was_already_picking = self.state == GameState.AUGMENT_PICKING
+            if not was_already_picking:
+                self._maybe_apply_phantom_rollback(new_ids, now_mono=now_mono, eff=eff)
                 self.state = GameState.AUGMENT_PICKING
                 self._last_clicked_slot = None
                 eff.state_changed = True
-            if new_ids != self._active_card_ids or result.rerolled:
+            if new_ids != prev_active_ids or result.rerolled:
                 self.active_cards = result.cards
                 self.last_offered_cards = result.cards
                 self._active_card_ids = new_ids
                 self._last_clicked_slot = None
+                same_round = bool(
+                    was_already_picking
+                    and prev_active_ids
+                    and (set(prev_active_ids) & set(new_ids))
+                )
+                self._record_recent_offered_round(new_ids, same_round=same_round)
                 eff.coach_trigger = "augment_picking"
             return eff
 
@@ -680,30 +836,44 @@ class HexStateMachine:
                 self._picker_closed_since = now_mono
                 return eff
             if (now_mono - self._picker_closed_since) >= self.PICKER_CLOSE_DEBOUNCE_S:
-                # Commit clicked augment if tracked (never auto-commit Stat Anvils 1402/1403/1404 or post-4-slot 3171!)
                 chosen_id = ""
                 if self._last_clicked_slot is not None:
                     for c in self.active_cards:
                         if c.slot_index == self._last_clicked_slot:
                             chosen_id = c.augment.augment_id
                             break
-                if chosen_id in ("1402", "1403", "1404") or (
-                    chosen_id == "3171" and len(self.selected_augments) >= 4
-                ):
+                if chosen_id in _NON_AUGMENT_CHOICE_IDS:
                     chosen_id = ""
+                prev_plan = list(self.committed_plan)
+                prev_lock = self.locked_next_item
+                prev_allow_overhaul = bool(self.allow_plan_overhaul)
+                prev_overhaul_reason = str(self.plan_overhaul_reason or "")
+                offered_id_set = frozenset(c.augment.augment_id for c in self.active_cards if c.augment.augment_id)
                 if chosen_id and self.add_selected_augment(chosen_id):
                     eff.newly_selected_augment = chosen_id
+                    self._last_auto_commit_snapshot = (
+                        chosen_id,
+                        offered_id_set,
+                        float(now_mono),
+                        prev_plan,
+                        prev_lock,
+                        prev_allow_overhaul,
+                        prev_overhaul_reason,
+                    )
                     if is_transmute_augment(chosen_id):
                         fading = tuple(c.augment.augment_id for c in self.active_cards if c.augment.augment_id != chosen_id)
                         self.start_transmute_if_applicable(chosen_id, now_mono=now_mono, fading_ids=fading)
                         eff.transmute_started = True
                     else:
                         eff.coach_trigger = "augment_selected"
+                else:
+                    self._last_auto_commit_snapshot = None
                 self.state = GameState.IN_GAME
                 self.active_cards = ()
                 self._active_card_ids = ()
                 self._picker_closed_since = None
                 self._last_clicked_slot = None
+                self._rebuild_recent_offered_pool()
                 eff.state_changed = True
         return eff
 
@@ -870,22 +1040,39 @@ class HexHelperController:
     """Main desktop runtime integrating data sync, telemetry, WinRT OCR, UI overlays, and AI coach."""
 
     PICKER_COACH_DEBOUNCE_MS = 600
-    PICKER_COACH_REROLL_DEBOUNCE_MS = 900
-    DEATH_COACH_DEFER_MS = 2500
+    PICKER_COACH_REROLL_DEBOUNCE_MS = 1400
+    DEATH_COACH_DEFER_MS = 4000
+    AUGMENT_REMOVE_DEFER_MS = 2500
     GAME_START_SCOUT_WAIT_MS = 2500
     ICON_VERIFY_DELAY_MS = 850
     ICON_VERIFY_CONF_THRESHOLD = 0.65
     SMART_PICKER_GATE_DELTA_GAP = 0.012
     SMART_PICKER_GATE_DECISIVE_DELTA = 0.025
     MANUAL_F6_DEDUP_WINDOW_S = 10.0
+    AUGMENT_SELECTED_DEDUP_WINDOW_S = 15.0
     TELEMETRY_MIN_DURATION_S = 180
     PENDING_EOG_TIMEOUT_S = 18.0
     LIVE_DISCONNECT_DEBOUNCE_FAILS = 3
     LCU_2999_DEGRADED_GRACE_FAILURES = 12
-    WARMUP_COVERS_DEATH_WINDOW_S = 75.0
+    WARMUP_COVERS_DEATH_WINDOW_S = 120.0
+    WARMUP_INFLIGHT_REUSE_WINDOW_S = 15.0
 
     # Safe class-level defaults for lightweight unit tests instantiating via __new__
     _commercial: bool = False
+    _cached_non_overlay_hwnds: tuple[int, ...] = ()
+    _match_session_seq: int = 0
+    _last_cs_game_id: int = 0
+    _last_cs_queue_id: int = 0
+    _last_finished_game_id: int = 0
+    _last_picker_partial_open: bool = False
+    _last_picker_expected_slots: int = 0
+    _hud_wide_diag_saved_this_match: bool = False
+    _death_defer_superseded_by_picker: bool = False
+    _death_superseded_req_id: str = ""
+    _match_last_skin_id: int = 0
+    _match_last_skin_name: str = ""
+    _skin_splash_fetching: Any = None
+    _skin_prefetched_keys: Any = None
     _devlab_active: bool = False
     _devlab_roi_enabled: bool = False
     _devlab_debug_enabled: bool = False
@@ -907,6 +1094,11 @@ class HexHelperController:
     _last_manual_f6_mono: float = 0.0
     _last_warmup_advice_mono: float = 0.0
     _last_warmup_advice_enemy_sig: str = ""
+    _last_warmup_dispatched_mono: float = 0.0
+    _last_warmup_dispatched_enemy_sig: str = ""
+    _last_augment_selected_sig: tuple[Any, ...] | None = None
+    _last_augment_selected_mono: float = 0.0
+    _augment_remove_coach_timer: QTimer | None = None
     _pending_manual_f6_after_plan_b: bool = False
     _hotkey_conflict_toast_shown: bool = False
     _vision_window_start_mono: float = 0.0
@@ -1017,7 +1209,10 @@ class HexHelperController:
         else:
             self.static_assets = StaticAssetsManager(self.data_dir / "cache", proxy_url=self.cfg.proxy_url)
             self.syncer = AramHexSyncer(self.data_dir / "cache", proxy_url=self.cfg.proxy_url)
+        self.cfg.client_locale = normalize_client_locale(getattr(self.cfg, "client_locale", "zh_cn"))
         self.store = DataStore(self.static_assets)
+        self.store.set_client_locale(self.cfg.client_locale)
+        self._applied_client_locale: str = self.cfg.client_locale
         self.sm = HexStateMachine(store=self.store)
         self.datasets: list[DatasetDescriptor] = []
 
@@ -1029,6 +1224,7 @@ class HexHelperController:
         self._last_threat: MatchupThreatProfile | None = None
         self._last_dyn_recs: list[DynamicItemRec] = []
         self._last_next_plan: NextBuyPlan | None = None
+        self._applied_data_band_mode: str = self._current_data_band_mode()
         self._overlays_hidden_by_user = False
 
         # Vision (WS-1: offload ScreenCapturer/WinRT OCR/Plan B onto persistent MTA HexVisionWorker)
@@ -1074,17 +1270,29 @@ class HexHelperController:
         self._vision_window_start_mono: float = time.monotonic()
         self._vision_window_total_frames: int = 0
         self._vision_window_idle_dual_frames: int = 0
+        req_lang = desired_ocr_language_tag(self.cfg.client_locale)
         if self._is_mocked_vision:
             try:
-                self.ocr_engine = WinRtOcrEngine("zh-Hans-CN")
+                try:
+                    self.ocr_engine = WinRtOcrEngine(req_lang)
+                except TypeError:
+                    self.ocr_engine = WinRtOcrEngine()
                 if self.ocr_engine is not None:
+                    use_t2s = bool(getattr(self.ocr_engine, "needs_t2s_matching", False))
+                    self.matcher.update_catalog([], use_t2s=use_t2s)
                     self.detector = AugmentPickerDetector(
                         ocr_engine=self.ocr_engine,
                         matcher=self.matcher,
                         card_band_roi=self.cfg.card_band_roi,
                         title_band_roi=self.cfg.title_band_roi,
+                        client_locale=self.cfg.client_locale,
                     )
-                    self.transmute_watcher = TransmuteRevealWatcher(self.ocr_engine, [])
+                    self.transmute_watcher = TransmuteRevealWatcher(
+                        self.ocr_engine,
+                        [],
+                        client_locale=self.cfg.client_locale,
+                        use_t2s=use_t2s,
+                    )
             except Exception as exc:
                 logger.error("WinRT OCR initialization failed: %s", exc)
         else:
@@ -1093,12 +1301,13 @@ class HexHelperController:
                     lambda o=out: self._on_vision_worker_output(o)
                 ),
                 prefer_dxcam=True,
-                language_tag="zh-Hans-CN",
+                client_locale=self.cfg.client_locale,
+                language_tag=req_lang,
                 cache_dir=self.data_dir / "cache",
                 card_band_roi=self.cfg.card_band_roi,
                 title_band_roi=self.cfg.title_band_roi,
                 find_window_fn=lambda: find_game_window(),
-                is_foreground_fn=lambda hwnd: is_hwnd_foreground(hwnd),
+                is_foreground_fn=lambda hwnd: self._is_game_or_overlay_fg_worker(hwnd),
                 primary_rect_fn=lambda: get_primary_screen_rect(),
             )
 
@@ -1152,6 +1361,28 @@ class HexHelperController:
                 ),
                 on_error=lambda rid, err: self.ui_invoker.invoke.emit(lambda r=rid, e=err: self._on_cloud_error(r, e)),
             )
+        else:
+            from hex_helper.bridge.agent_bridge import AgentBridgeServer
+            from hex_helper.coach.gemini_coach import GeminiCoachClient, GeminiCoachWorker
+
+            self._gemini_client = GeminiCoachClient()
+            self.gemini_coach = GeminiCoachWorker(
+                on_advice=lambda adv, st: self.ui_invoker.invoke.emit(lambda a=adv, s=st: self._on_gemini_advice(a, s)),
+                on_error=lambda rid, err: self.ui_invoker.invoke.emit(lambda r=rid, e=err: self._on_gemini_error(r, e)),
+                on_superseded=lambda req, st: self.ui_invoker.invoke.emit(
+                    lambda r=req, s=st: self._on_gemini_coach_superseded(r, s)
+                ),
+                client=self._gemini_client,
+                max_workers=2,
+            )
+            self.bridge = AgentBridgeServer(
+                bridge_dir=self.data_dir / "bridge",
+                port=self.cfg.bridge_port,
+                on_advice=lambda adv: self.ui_invoker.invoke.emit(lambda: self._on_coach_advice(adv)),
+                on_online_changed=lambda ok: self.ui_invoker.invoke.emit(lambda: self._on_coach_online(ok)),
+                dev_events_provider=(self._devlab.get_recent_events if self._devlab_active else None),
+                dev_vision_provider=(self._devlab.get_recent_vision_traces if self._devlab_active else None),
+            )
 
         self._latest_advice: CoachAdvicePayload | None = None
         self._latest_request_id: str = ""
@@ -1191,6 +1422,10 @@ class HexHelperController:
         self._last_manual_f6_mono: float = 0.0
         self._last_warmup_advice_mono: float = 0.0
         self._last_warmup_advice_enemy_sig: str = ""
+        self._last_warmup_dispatched_mono: float = 0.0
+        self._last_warmup_dispatched_enemy_sig: str = ""
+        self._last_augment_selected_sig: tuple[Any, ...] | None = None
+        self._last_augment_selected_mono: float = 0.0
         self._pending_manual_f6_after_plan_b: bool = False
         self._hotkey_conflict_toast_shown: bool = False
         self._port_2999_conflict_detected: bool = False
@@ -1204,6 +1439,20 @@ class HexHelperController:
         self._last_recap_data: MatchRecapData | None = None
         self._active_recap_dialog: MatchRecapDialog | None = None
         self._recap_icon_fetching: set[tuple[str, str]] = set()
+        self._cached_non_overlay_hwnds: tuple[int, ...] = ()
+        self._match_session_seq: int = 0
+        self._last_cs_game_id: int = 0
+        self._last_cs_queue_id: int = 0
+        self._last_finished_game_id: int = 0
+        self._last_picker_partial_open: bool = False
+        self._last_picker_expected_slots: int = 0
+        self._hud_wide_diag_saved_this_match: bool = False
+        self._death_defer_superseded_by_picker: bool = False
+        self._death_superseded_req_id: str = ""
+        self._match_last_skin_id: int = 0
+        self._match_last_skin_name: str = ""
+        self._skin_splash_fetching: set[tuple[str, int]] = set()
+        self._skin_prefetched_keys: set[tuple[str, int]] = set()
         self._pending_icon_verify_candidates: tuple[str, ...] = ()
         self._pending_icon_verify_committed_id: str = ""
         self._pending_icon_verify_slot_hint: int | None = None
@@ -1268,10 +1517,12 @@ class HexHelperController:
             on_closed_by_user=self._on_combo_closed_by_user,
             on_geometry_changed=self._on_overlay_geometry_changed,
             on_subcard_action=lambda card, act, meta: self._on_overlay_subcard_action("combo_overlay", card, act, meta),
+            on_toggle_screen_recording=self._on_toggle_screen_recording,
             initial_pos=self.cfg.combo_drawer_pos,
             initial_size=self.cfg.combo_drawer_size,
             initial_scale=self.cfg.combo_drawer_scale,
         )
+        self.combo_overlay.set_locale_store(self.store)
         self.edge_drawer = EdgeBuildDrawer(
             on_select_augment=self._on_manual_add_augment,
             on_remove_augment=self._on_manual_remove_augment,
@@ -1281,6 +1532,7 @@ class HexHelperController:
             on_call_coach=lambda: self.trigger_coach_request("manual_f6"),
             on_switch_dataset=self._on_switch_dataset,
             on_manual_hero=self._on_manual_hero,
+            on_select_archetype=self._on_select_archetype,
             on_closed_by_user=self._on_drawer_closed_by_user,
             on_switch_tier=self._on_switch_tier,
             on_recharge_click=self.open_recharge_dialog,
@@ -1293,6 +1545,8 @@ class HexHelperController:
             on_manual_add_item=self._on_manual_add_item,
             on_manual_remove_item=self._on_manual_remove_item,
             on_plan_b_rescan=self._on_plan_b_rescan,
+            on_toggle_screen_recording=self._on_toggle_screen_recording,
+            on_request_restore_game_focus=self._restore_game_focus,
             initial_tier=self.cfg.coach_tier,
             initial_pos=self.cfg.drawer_pos,
             initial_size=self.cfg.drawer_size,
@@ -1419,6 +1673,11 @@ class HexHelperController:
         self._death_coach_defer_timer.setInterval(self.DEATH_COACH_DEFER_MS)
         self._death_coach_defer_timer.timeout.connect(self._on_death_coach_defer_timeout)
 
+        self._augment_remove_coach_timer = QTimer()
+        self._augment_remove_coach_timer.setSingleShot(True)
+        self._augment_remove_coach_timer.setInterval(self.AUGMENT_REMOVE_DEFER_MS)
+        self._augment_remove_coach_timer.timeout.connect(self._on_augment_remove_coach_timeout)
+
         self._game_start_coach_defer_timer = QTimer()
         self._game_start_coach_defer_timer.setSingleShot(True)
         self._game_start_coach_defer_timer.setInterval(self.GAME_START_SCOUT_WAIT_MS)
@@ -1429,8 +1688,199 @@ class HexHelperController:
         self._icon_verify_timer.setInterval(self.ICON_VERIFY_DELAY_MS)
         self._icon_verify_timer.timeout.connect(self._on_delayed_icon_verify)
 
+        self._sync_screen_recording_overlays(bool(getattr(self.cfg, "allow_screen_recording_overlays", False)))
+
         if show_lookup_on_start:
             self.lookup_window.show()
+        self._refresh_non_overlay_hwnds_cache()
+
+    # ------------------------------------------------------------------
+    # Screen Recording Toggle, Overlay Foreground & Skin Splash Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collect_widget_hwnd(w: Any) -> int | None:
+        if w is None:
+            return None
+        try:
+            vis_fn = getattr(w, "isVisible", None)
+            if callable(vis_fn) and not vis_fn():
+                return None
+            wid_fn = getattr(w, "internalWinId", None)
+            if callable(wid_fn):
+                wid = wid_fn()
+            else:
+                win_id_fn = getattr(w, "winId", None)
+                wid = win_id_fn() if callable(win_id_fn) else None
+            if not wid:
+                return None
+            val = int(wid)
+            return val if val > 0 else None
+        except Exception:
+            return None
+
+    def _non_overlay_hwnds(self) -> set[int]:
+        hwnds: set[int] = set()
+        for attr in ("lookup_window", "_active_recap_dialog", "_hotkey_dlg", "_feedback_dlg"):
+            val = self._collect_widget_hwnd(getattr(self, attr, None))
+            if val is not None:
+                hwnds.add(val)
+        try:
+            modal = QApplication.activeModalWidget()
+        except Exception:
+            modal = None
+        if modal is not None:
+            val = self._collect_widget_hwnd(modal)
+            if val is not None:
+                hwnds.add(val)
+        return hwnds
+
+    def _refresh_non_overlay_hwnds_cache(self) -> tuple[int, ...]:
+        cached = tuple(sorted(self._non_overlay_hwnds()))
+        self._cached_non_overlay_hwnds = cached
+        return cached
+
+    def _is_game_or_overlay_foreground(self, game_hwnd: int) -> bool:
+        excl = self._refresh_non_overlay_hwnds_cache()
+        if is_hwnd_foreground(game_hwnd):
+            return True
+        return bool(is_game_or_overlay_foreground(game_hwnd, exclude_hwnds=excl))
+
+    def _is_game_or_overlay_fg_worker(self, game_hwnd: int) -> bool:
+        if is_hwnd_foreground(game_hwnd):
+            return True
+        excl = tuple(getattr(self, "_cached_non_overlay_hwnds", ()) or ())
+        return bool(is_game_or_overlay_foreground(game_hwnd, exclude_hwnds=excl))
+
+    def _sync_screen_recording_overlays(self, allowed: bool) -> None:
+        val = bool(allowed)
+        for ov_attr in ("champ_overlay", "augment_overlay", "combo_overlay", "edge_drawer"):
+            ov = getattr(self, ov_attr, None)
+            if ov is None:
+                continue
+            fn = getattr(ov, "set_screen_recording_allowed", None)
+            if callable(fn):
+                try:
+                    fn(val)
+                except Exception:
+                    pass
+        lw = getattr(self, "lookup_window", None)
+        if lw is not None:
+            sync_fn = getattr(lw, "sync_screen_recording_checkbox", None)
+            if callable(sync_fn):
+                try:
+                    sync_fn(val)
+                except Exception:
+                    pass
+
+    def _on_toggle_screen_recording(self, allowed: bool) -> None:
+        val = bool(allowed)
+        self.cfg.allow_screen_recording_overlays = val
+        save_config(self.cfg)
+        self._sync_screen_recording_overlays(val)
+
+    def _restore_game_focus(self) -> None:
+        try:
+            game_rect = find_game_window()
+        except Exception:
+            game_rect = None
+        if game_rect is not None and int(getattr(game_rect, "hwnd", 0) or 0) > 0:
+            restore_foreground_window(int(game_rect.hwnd))
+
+    def _push_recent_unrecorded_augments(self) -> None:
+        drawer = getattr(self, "edge_drawer", None)
+        sm = getattr(self, "sm", None)
+        if drawer is None or sm is None:
+            return
+        setter = getattr(drawer, "set_recent_unrecorded_augments", None)
+        pool_fn = getattr(sm, "recent_unrecorded_augments", None)
+        if callable(setter) and callable(pool_fn):
+            try:
+                setter(pool_fn())
+            except Exception:
+                pass
+
+    @staticmethod
+    def _should_fetch_skin_variants(static: Any) -> bool:
+        """Skip loading/center variant fetches when tests stub ensure_skin_splash on a live instance without variants."""
+        inst_dict = getattr(static, "__dict__", None)
+        if isinstance(inst_dict, dict) and "ensure_skin_splash" in inst_dict:
+            return "ensure_skin_loading" in inst_dict or "ensure_skin_center" in inst_dict
+        return True
+
+    def _prefetch_my_skin_splash(self, hero_id: str, skin_id: int) -> None:
+        hid = str(hero_id or "").strip()
+        sid = int(skin_id or 0)
+        if not hid or getattr(self._stop_event, "is_set", lambda: False)():
+            return
+        store = getattr(self, "store", None)
+        static = getattr(store, "static", None) if store is not None else None
+        if static is None:
+            return
+        fetching = getattr(self, "_skin_splash_fetching", None)
+        if not isinstance(fetching, set):
+            fetching = set()
+            self._skin_splash_fetching = fetching
+        prefetched = getattr(self, "_skin_prefetched_keys", None)
+        if not isinstance(prefetched, set):
+            prefetched = set()
+            self._skin_prefetched_keys = prefetched
+        key = (hid, sid)
+        if key in prefetched or key in fetching:
+            return
+        allow_variants = self._should_fetch_skin_variants(static)
+        has_splash = False
+        resolve_fn = getattr(static, "resolve_cached_skin_splash", None)
+        if callable(resolve_fn):
+            try:
+                cached_path, _ = resolve_fn(hid, sid)
+                has_splash = bool(cached_path and Path(cached_path).is_file())
+            except Exception:
+                has_splash = False
+
+        has_variants = not allow_variants
+        if allow_variants:
+            resolve_vars_fn = getattr(static, "resolve_cached_skin_variants", None)
+            if callable(resolve_vars_fn):
+                try:
+                    c_load, c_cent = resolve_vars_fn(hid, sid)
+                    has_variants = bool(c_load and Path(c_load).is_file()) and bool(c_cent and Path(c_cent).is_file())
+                except Exception:
+                    has_variants = False
+
+        if has_splash and has_variants:
+            prefetched.add(key)
+            return
+
+        ensure_fn = getattr(static, "ensure_skin_splash", None)
+        ensure_load_fn = getattr(static, "ensure_skin_loading", None) if allow_variants else None
+        ensure_cent_fn = getattr(static, "ensure_skin_center", None) if allow_variants else None
+        if not callable(ensure_fn) and not callable(ensure_load_fn) and not callable(ensure_cent_fn):
+            return
+        fetching.add(key)
+
+        def _worker() -> None:
+            try:
+                if not has_splash and callable(ensure_fn):
+                    ensure_fn(hid, sid)
+                if allow_variants:
+                    if callable(ensure_load_fn):
+                        try:
+                            ensure_load_fn(hid, sid)
+                        except Exception:
+                            pass
+                    if callable(ensure_cent_fn):
+                        try:
+                            ensure_cent_fn(hid, sid)
+                        except Exception:
+                            pass
+                prefetched.add(key)
+            except Exception:
+                pass
+            finally:
+                fetching.discard(key)
+
+        threading.Thread(target=_worker, name="HexSkinSplashPrefetch", daemon=True).start()
 
     # ------------------------------------------------------------------
     # DevLab Lazy Mounting, Telemetry Helpers & Tray Actions
@@ -2185,6 +2635,7 @@ class HexHelperController:
     def _toggle_lookup_hotkey(self) -> None:
         if self.lookup_window.isVisible() and not self.lookup_window.isMinimized():
             self.lookup_window.hide()
+            self._refresh_non_overlay_hwnds_cache()
         else:
             self._show_lookup()
 
@@ -2199,6 +2650,7 @@ class HexHelperController:
         self.lookup_window.show()
         self.lookup_window.raise_()
         self.lookup_window.activateWindow()
+        self._refresh_non_overlay_hwnds_cache()
         self._refresh_devlab_badge_if_visible()
 
     def _toggle_drawer_from_tray(self) -> None:
@@ -2400,12 +2852,12 @@ class HexHelperController:
             desc, ddir = cached
             self.store.load_from_dir(desc, ddir, band=self.cfg.dataset_band)
             self._preload_first_prismatic_from_cache(desc, ddir)
-            all_augs = self.store.all_augments()
-            self.matcher.update_catalog(all_augs)
+            ocr_augs = self.store.build_ocr_augments(self.cfg.client_locale)
+            self.matcher.update_catalog(ocr_augs)
             if self.transmute_watcher is not None:
-                self.transmute_watcher.update_catalog(all_augs)
+                self.transmute_watcher.update_catalog(ocr_augs)
             if getattr(self, "_vision_worker", None) is not None:
-                self._vision_worker.enqueue_command("update_catalog", {"augments": all_augs})
+                self._vision_worker.enqueue_command("update_catalog", {"augments": ocr_augs})
                 self._vision_worker.enqueue_command("reload_icons")
             self.lookup_window.bind_store(self.store)
             self.edge_drawer.populate_catalogs(self.store, [desc])
@@ -2467,7 +2919,7 @@ class HexHelperController:
                     self._reload_icon_matcher_templates()
                     if self.item_icon_matcher is not None:
                         self.item_icon_matcher.reload_cached_icons()
-                    all_augs = self.store.all_augments()
+                    all_augs = self.store.build_ocr_augments(self.cfg.client_locale)
                     self.matcher.update_catalog(all_augs)
                     if self.transmute_watcher is not None:
                         self.transmute_watcher.update_catalog(all_augs)
@@ -2496,6 +2948,8 @@ class HexHelperController:
         self.start_async_sync()
 
     def _on_save_settings(self, cfg: AppConfig) -> None:
+        prev_band_mode = getattr(self, "_applied_data_band_mode", "all")
+        prev_locale = normalize_client_locale(getattr(self, "_applied_client_locale", "zh_cn"))
         if self._commercial:
             cfg.proxy_url = ""
             cfg.bridge_enabled = False
@@ -2504,7 +2958,14 @@ class HexHelperController:
             cfg.devlab_debug_log = False
             if cfg.coach_mode != "off":
                 cfg.coach_mode = "cloud"
+        raw_band = str(getattr(cfg, "data_band_mode", "all") or "all").strip().lower()
+        cfg.data_band_mode = raw_band if raw_band in DATA_BAND_MODES else "all"
+        band_mode_changed = cfg.data_band_mode != prev_band_mode
+        cfg.client_locale = normalize_client_locale(getattr(cfg, "client_locale", "zh_cn"))
+        locale_changed = cfg.client_locale != prev_locale
         self.cfg = cfg
+        self._applied_data_band_mode = cfg.data_band_mode
+        self._applied_client_locale = cfg.client_locale
         save_config(cfg)
         self.syncer.proxy_url = "" if self._commercial else cfg.proxy_url
         self.static_assets.proxy_url = "" if self._commercial else cfg.proxy_url
@@ -2517,6 +2978,62 @@ class HexHelperController:
             self._preload_first_prismatic_from_cache(self.store.descriptor, self.store.dataset_dir)
         elif self._auto_switched_first_prismatic:
             self._restore_configured_dataset_mode()
+        if locale_changed:
+            self.store.set_client_locale(cfg.client_locale)
+            ocr_augs = self.store.build_ocr_augments(cfg.client_locale)
+            if self._is_mocked_vision:
+                req_lang = desired_ocr_language_tag(cfg.client_locale)
+                try:
+                    if hasattr(self.ocr_engine, "close"):
+                        self.ocr_engine.close()
+                except Exception:
+                    pass
+                try:
+                    self.ocr_engine = WinRtOcrEngine(req_lang)
+                except TypeError:
+                    try:
+                        self.ocr_engine = WinRtOcrEngine()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.warning("Mocked WinRT OCR locale switch (%s) failed: %s", req_lang, exc)
+                use_t2s = bool(getattr(self.ocr_engine, "needs_t2s_matching", False)) if self.ocr_engine is not None else False
+                self.matcher.update_catalog(ocr_augs, use_t2s=use_t2s)
+                if self.detector is not None:
+                    if self.ocr_engine is not None:
+                        self.detector.ocr = self.ocr_engine
+                    self.detector.set_client_locale(cfg.client_locale)
+                    self.detector.reset()
+                if self.transmute_watcher is not None:
+                    if self.ocr_engine is not None:
+                        self.transmute_watcher.ocr = self.ocr_engine
+                    self.transmute_watcher.set_locale(cfg.client_locale, use_t2s=use_t2s)
+                    self.transmute_watcher.update_catalog(ocr_augs)
+            elif getattr(self, "_vision_worker", None) is not None:
+                self._vision_worker.enqueue_command(
+                    "set_locale",
+                    {"client_locale": cfg.client_locale, "augments": ocr_augs},
+                )
+            self.lookup_window.bind_store(self.store)
+            self.edge_drawer.populate_catalogs(self.store, self.datasets)
+            if hasattr(self.combo_overlay, "set_locale_store"):
+                self.combo_overlay.set_locale_store(self.store)
+            if self._last_cs is not None and self.champ_overlay.isVisible():
+                self.champ_overlay.update_state(self._last_cs, self.store)
+            if self.sm.is_degraded_2999:
+                self._refresh_degraded_sync_bar()
+        if band_mode_changed or locale_changed:
+            self._last_drawer_refresh_sig = None
+            if hasattr(self.lookup_window, "_refresh_data_band_hint"):
+                self.lookup_window._refresh_data_band_hint()
+            self._refresh_drawer_view()
+            if (
+                self.sm.state == GameState.AUGMENT_PICKING
+                and self.sm.active_cards
+                and not self._overlays_hidden_by_user
+                and not self._is_full_locked()
+            ):
+                self._render_augment_badges(self.sm.active_cards)
         if not cfg.combo_overlay_enabled:
             self.combo_overlay.exit_picker_mode()
             if self.combo_overlay.isVisible():
@@ -2527,9 +3044,11 @@ class HexHelperController:
             and not self._combo_hidden_by_user
             and not self._is_full_locked()
         ):
-            self._refresh_combo_plan_view()
+            if not band_mode_changed:
+                self._refresh_combo_plan_view()
             if not self.combo_overlay.isVisible():
                 self.combo_overlay.show_overlay()
+        self._sync_screen_recording_overlays(bool(getattr(cfg, "allow_screen_recording_overlays", False)))
         self._reload_hotkeys()
         self._refresh_coach_online_ui()
         self._refresh_diagnostics()
@@ -2582,13 +3101,49 @@ class HexHelperController:
 
     def _on_manual_hero(self, hero_id: str) -> None:
         self.sm.manual_hero_override = hero_id
+        self.sm.manual_profile_override = ""
         self._rollback_plan_and_advice_for_augment_correction()
         self._refresh_drawer_view()
 
+    def _on_select_archetype(self, profile: str) -> None:
+        prof = str(profile or "").strip().upper()
+        hid = self._active_hero_id()
+        band_mode = self._current_data_band_mode()
+        prev_pref = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+        if prev_pref and prev_pref == prof:
+            self.sm.manual_profile_override = ""
+            reason = "流派自动适配"
+        else:
+            self.sm.manual_profile_override = prof
+            templates = (
+                get_hero_build_templates(self.store, hid, data_band_mode=band_mode)
+                if (hid and self.store.is_loaded)
+                else []
+            )
+            lbl = next((t.label for t in templates if t.profile == prof), prof)
+            reason = f"手动流派：{lbl}"
+        self.sm.invalidate_build_plan(reason=reason)
+        self._latest_advice = None
+        self._latest_request_id = f"arch-{uuid.uuid4().hex[:8]}"
+        self.edge_drawer.set_coach_advice(None)
+        self._last_drawer_refresh_sig = None
+        self._save_match_state()
+        self._refresh_drawer_view()
+        if (
+            self.sm.state in (GameState.IN_GAME, GameState.AUGMENT_PICKING)
+            and hid
+            and self._is_any_coach_online()
+            and self._last_live is not None
+            and self._last_live.enemies
+        ):
+            self.trigger_coach_request("archetype_switched")
+
     def _recompute_overhaul_reason_from_selected(self) -> str:
         """Derive active overhaul label strictly from currently owned augments (drops removed/corrected ones)."""
+        hid = self._active_hero_id()
+        band_mode = self._current_data_band_mode()
         for aid in reversed(self.sm.selected_augments):
-            if is_transformative_augment(self.store, aid):
+            if is_transformative_augment(self.store, aid, hero_id=hid, band_mode=band_mode):
                 aug = self.store.get_augment(aid)
                 return f"海克斯变阵：{aug.name if aug else aid}"
         return ""
@@ -2602,7 +3157,20 @@ class HexHelperController:
         self.edge_drawer.set_coach_advice(None)
 
     def _flag_if_transformative_augment(self, aug_id: str) -> None:
-        if is_transformative_augment(self.store, aug_id):
+        hid = self._active_hero_id()
+        band_mode = self._current_data_band_mode()
+        last_live = getattr(self, "_last_live", None)
+        my_items_now = last_live.my_player.item_ids if (last_live and last_live.my_player) else ()
+        owned_complete_cnt = (
+            sum(
+                1
+                for iid in my_items_now
+                if (self.store.get_item_info(iid).category == "complete_equipment" or self.store.get_item_info(iid).gold >= 2200)
+            )
+            if self.store.is_loaded
+            else 0
+        )
+        if is_transformative_augment(self.store, aug_id, hero_id=hid, band_mode=band_mode):
             aug = self.store.get_augment(aug_id)
             reason = f"海克斯变阵：{aug.name if aug else aug_id}"
             self.sm.invalidate_build_plan(reason=reason)
@@ -2610,7 +3178,9 @@ class HexHelperController:
             self._latest_request_id = f"rollback-{uuid.uuid4().hex[:8]}"
             self.edge_drawer.set_coach_advice(None)
             logger.info("Transformative augment acquired -> rolling build plan overhaul: %s", reason)
-        elif str(aug_id) == DESTINY_AUGMENT_ID or get_special_augment_db().resolve(self.store, aug_id) is not None:
+        elif str(aug_id) == DESTINY_AUGMENT_ID or (
+            get_special_augment_db().resolve_for_hero(self.store, aug_id, hid, band_mode=band_mode) is not None
+        ):
             # WS-4: Non-transformative special synergy augment may re-order slots 2-5 via allow_plan_overhaul,
             # but MUST NOT unconditionally wipe locked_next_item so >=800G committed components at slot 1 stay protected!
             self.sm.allow_plan_overhaul = True
@@ -2620,6 +3190,33 @@ class HexHelperController:
                 "Special synergy augment acquired -> soft plan reorder preserving >=800G slot-1 lock (aug=%s)",
                 aug_id,
             )
+        elif owned_complete_cnt == 0 and hid and self.store.is_loaded and not getattr(self.sm, "manual_profile_override", ""):
+            templates = get_hero_build_templates(self.store, hid, data_band_mode=band_mode)
+            new_prof = infer_unified_hero_profile(
+                hid,
+                self.store,
+                my_items=my_items_now,
+                selected_augments=self.sm.selected_augments,
+                data_band_mode=band_mode,
+            )
+            default_prof = _infer_static_default_profile(self.store, hid, data_band_mode=band_mode)
+            if len(templates) >= 2 and new_prof != default_prof:
+                aug = self.store.get_augment(aug_id)
+                reason = f"海克斯变阵：{aug.name if aug else aug_id}"
+                self.sm.invalidate_build_plan(reason=reason)
+                self._latest_advice = None
+                self._latest_request_id = f"rollback-{uuid.uuid4().hex[:8]}"
+                self.edge_drawer.set_coach_advice(None)
+                logger.info(
+                    "Round-1 multi-archetype pivot (%s -> %s) -> build plan overhaul: %s",
+                    default_prof,
+                    new_prof,
+                    reason,
+                )
+            elif len(self.sm.selected_augments) <= 1:
+                self.sm.allow_plan_overhaul = True
+                self._last_drawer_refresh_sig = None
+                logger.info("Round-1 augment acquired at 0 complete items -> allow_plan_overhaul=True (aug=%s)", aug_id)
 
     def _is_direct_gemini_active(self) -> bool:
         if self._commercial:
@@ -3729,6 +4326,7 @@ class HexHelperController:
         self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
         self._save_match_state()
         self._refresh_drawer_view()
+        self._push_recent_unrecorded_augments()
         self.edge_drawer.flash_new_augment(new_aug_id)
         if completed and self.cfg.auto_trigger_coach and self._is_any_coach_online():
             self.trigger_coach_request("augment_selected")
@@ -3742,6 +4340,7 @@ class HexHelperController:
             self.trigger_coach_request("augment_selected")
 
     def _on_manual_add_augment(self, aug_id: str) -> None:
+        self._cancel_augment_remove_coach_defer("manual_add_augment")
         self.sm.suppressed_visual_augments.discard(str(aug_id))
         if self.sm.add_selected_augment(aug_id):
             src_map = getattr(self, "_aug_source_by_id", None)
@@ -3764,11 +4363,13 @@ class HexHelperController:
                 self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
                 self._save_match_state()
                 self._refresh_drawer_view()
+                self._push_recent_unrecorded_augments()
                 self._push_vision_context()
                 return
             self._flag_if_transformative_augment(aug_id)
             self._save_match_state()
             self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
             self._push_vision_context()
             if self.cfg.auto_trigger_coach and self._is_any_coach_online():
                 self.trigger_coach_request("augment_selected")
@@ -3804,11 +4405,17 @@ class HexHelperController:
             self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
             self._save_match_state()
             self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
             self._push_vision_context()
             if self.cfg.auto_trigger_coach and self._is_any_coach_online():
-                self.trigger_coach_request("augment_selected")
+                rem_timer = getattr(self, "_augment_remove_coach_timer", None)
+                if rem_timer is not None:
+                    rem_timer.start(self.AUGMENT_REMOVE_DEFER_MS)
+                else:
+                    self.trigger_coach_request("augment_selected")
 
     def _on_replace_last_augment(self, aug_id: str) -> None:
+        self._cancel_augment_remove_coach_defer("manual_replace_augment")
         old_id = str(self.sm.selected_augments[-1]) if self.sm.selected_augments else ""
         if self.sm.replace_last_augment(aug_id):
             self.user_swapped_this_match = getattr(self, "user_swapped_this_match", 0) + 1
@@ -3838,6 +4445,7 @@ class HexHelperController:
                 self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
                 self._save_match_state()
                 self._refresh_drawer_view()
+                self._push_recent_unrecorded_augments()
                 return
             if self.transmute_watcher is not None:
                 self.transmute_watcher.reset()
@@ -3845,6 +4453,7 @@ class HexHelperController:
             self._flag_if_transformative_augment(aug_id)
             self._save_match_state()
             self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
             if self.cfg.auto_trigger_coach and self._is_any_coach_online():
                 self.trigger_coach_request("augment_selected")
 
@@ -3876,6 +4485,11 @@ class HexHelperController:
         self._last_manual_f6_mono = 0.0
         self._last_warmup_advice_mono = 0.0
         self._last_warmup_advice_enemy_sig = ""
+        self._last_warmup_dispatched_mono = 0.0
+        self._last_warmup_dispatched_enemy_sig = ""
+        self._last_augment_selected_sig = None
+        self._last_augment_selected_mono = 0.0
+        self._cancel_augment_remove_coach_defer("reset")
         self._pending_manual_f6_after_plan_b = False
         self._port_2999_conflict_detected = False
         self._port_2999_conflict_probed = False
@@ -3950,7 +4564,8 @@ class HexHelperController:
         pairs: list[tuple[str, str]] = []
         for iid in eff_items:
             info = self.store.static.items.get(iid)
-            pairs.append((iid, info.name if info is not None and info.name else f"装备#{iid}"))
+            fb = info.name if info is not None and info.name else f"装备#{iid}"
+            pairs.append((iid, self.store.display_item_name(iid, fb)))
         if not status_hint:
             if getattr(self, "_port_2999_conflict_detected", False):
                 status_hint = "2999端口被其它程序(如Clash代理)占用 · 重启代理可恢复精准同步，当前Plan B护航"
@@ -3976,6 +4591,7 @@ class HexHelperController:
             self._save_match_state()
             self._refresh_degraded_sync_bar()
             self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
             self._push_vision_context()
             if getattr(self, "_devlab_active", False):
                 self._emit_devlab(
@@ -3992,6 +4608,7 @@ class HexHelperController:
             self._save_match_state()
             self._refresh_degraded_sync_bar()
             self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
             self._push_vision_context()
             if getattr(self, "_devlab_active", False):
                 self._emit_devlab(
@@ -4032,7 +4649,7 @@ class HexHelperController:
                     self.sm.visual_owned_items = new_visual
                     changed = True
 
-        if len(self.sm.selected_augments) < 4 and self._aug_vote_tracker is not None and (aug_hits or force_confirm):
+        if len(self.sm.selected_augments) < MAX_AUGMENT_SLOTS and self._aug_vote_tracker is not None and (aug_hits or force_confirm):
             aug_slot_map = {
                 h.hud_slot_index: str(h.augment_id)
                 for h in aug_hits
@@ -4068,6 +4685,7 @@ class HexHelperController:
             self._save_match_state()
             self._refresh_degraded_sync_bar()
             self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
             self._push_vision_context()
             if getattr(self, "_devlab_active", False):
                 self._emit_devlab(
@@ -4109,8 +4727,8 @@ class HexHelperController:
                     hud_scale=self._hud_scale,
                 )
 
-        # 2. Scan 4 bottom-HUD augment slots whenever slots are missing (2999 down or mid-game restart)
-        if len(self.sm.selected_augments) < 4 and self.icon_matcher is not None and self.icon_matcher.template_count > 0:
+        # 2. Scan bottom-HUD augment slots whenever slots are missing (2999 down or mid-game restart)
+        if len(self.sm.selected_augments) < MAX_AUGMENT_SLOTS and self.icon_matcher is not None and self.icon_matcher.template_count > 0:
             aug_hits = self.icon_matcher.scan_all_hud_augments(
                 frame_bgr,
                 game_rect,
@@ -4176,20 +4794,34 @@ class HexHelperController:
         trig_reason = str(req_meta.get("trigger_reason") or getattr(self, "_latest_request_trigger", "") or "")
         grounding_stats = dict(getattr(stats, "grounding_stats", None) or {}) if stats is not None else {}
 
-        # Timeline sync guard: ignore late replies belonging to superseded requests!
-        if self._latest_request_id and advice.request_id and advice.request_id != self._latest_request_id:
+        eff_latency_ms = int(latency_ms or getattr(stats, "latency_ms", 0) or 0)
+        if eff_latency_ms <= 0 and isinstance(req_meta, dict) and req_meta.get("dispatched_mono"):
+            eff_latency_ms = max(
+                1,
+                int(round((time.monotonic() - float(req_meta["dispatched_mono"])) * 1000.0)),
+            )
+        eff_model = str(getattr(stats, "model", "") or getattr(advice, "model", "") or "")
+        if not eff_model and str(getattr(getattr(self, "cfg", None), "coach_mode", "") or "") == "antigravity":
+            eff_model = "agent_bridge"
+
+        # Timeline sync guard + late picker close guard: drop superseded or post-close picker replies!
+        is_superseded = bool(self._latest_request_id and advice.request_id and advice.request_id != self._latest_request_id)
+        is_late_picker = bool(trig_reason == "augment_picking" and self.sm.state != GameState.AUGMENT_PICKING)
+        if is_superseded or is_late_picker:
             logger.info(
-                "Dropping stale coach advice for %s (latest=%s)",
+                "Dropping stale coach advice for %s (latest=%s, trigger=%s, state=%s)",
                 advice.request_id,
                 self._latest_request_id,
+                trig_reason,
+                self.sm.state.value,
             )
             if devlab_on:
                 stale_payload: dict[str, Any] = {
                     "request_id": str(advice.request_id or ""),
                     "trigger_reason": trig_reason,
-                    "model": str(getattr(stats, "model", "") or ""),
+                    "model": eff_model,
                     "thinking_level": str(getattr(stats, "thinking_level", "") or ""),
-                    "latency_ms": int(latency_ms or getattr(stats, "latency_ms", 0) or 0),
+                    "latency_ms": eff_latency_ms,
                     "input_tokens": int(getattr(stats, "input_tokens", 0) or 0),
                     "output_tokens": int(getattr(stats, "output_tokens", 0) or 0),
                     "thought_tokens": int(getattr(stats, "thought_tokens", 0) or 0),
@@ -4209,27 +4841,32 @@ class HexHelperController:
         for it in advice.next_items:
             iid = canonicalize_item_id(it.item_id) if it.item_id else ""
             if (not iid or not is_valid_plan_item(self.store, iid)) and it.name:
-                for k, info in self.store.static.items.items():
-                    if info.name == it.name:
-                        iid = canonicalize_item_id(k)
-                        break
+                iid = resolve_item_id_by_name(self.store, it.name, require_valid_plan=True)
             if iid and iid not in proposed_ids and is_valid_plan_item(self.store, iid):
                 proposed_ids.append(iid)
                 shown_next_ids.append(normalize_item_id(iid))
         if shown_next_ids and hasattr(self, "ai_recommended_item_ids_shown"):
             self.ai_recommended_item_ids_shown.update(shown_next_ids)
         for nm in advice.build_path:
-            for k, info in self.store.static.items.items():
-                if info.name == nm:
-                    nk = canonicalize_item_id(k)
-                    if nk not in proposed_ids and is_valid_plan_item(self.store, nk):
-                        proposed_ids.append(nk)
-                    break
+            nk = resolve_item_id_by_name(self.store, nm, require_valid_plan=True)
+            if nk and nk not in proposed_ids and is_valid_plan_item(self.store, nk):
+                proposed_ids.append(nk)
 
         if proposed_ids and self.store.is_loaded:
             # First real coach plan of the match or transformative-augment overhaul is allowed to lock/pivot the plan
             first_coach_lock = self._latest_advice is None
             is_tx_overhaul = bool(self.sm.allow_plan_overhaul and self.sm.plan_overhaul_reason)
+            hid_active = self._active_hero_id() or ""
+            band_mode = self._current_data_band_mode()
+            gt_now = float(self._current_game_time_s() or 0.0)
+            pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+            active_prof = pref_prof or infer_unified_hero_profile(
+                hid_active or None,
+                self.store,
+                my_items=my_items,
+                selected_augments=self.sm.selected_augments,
+                data_band_mode=band_mode,
+            )
             if devlab_on:
                 prev_lock = self.sm.locked_next_item
                 new_lock, new_plan, trace = reconcile_match_build_plan_with_trace(
@@ -4239,16 +4876,18 @@ class HexHelperController:
                     locked_next_item=self.sm.locked_next_item,
                     proposed_ids=proposed_ids,
                     allow_overhaul=self.sm.allow_plan_overhaul or first_coach_lock,
-                    hero_id=self._active_hero_id() or "",
+                    hero_id=hid_active,
                     selected_augments=self.sm.selected_augments,
                     transformative_overhaul=is_tx_overhaul,
+                    active_profile=active_prof,
+                    game_time=gt_now,
                 )
                 if trace.get("overridden") and self._action_tracker is not None:
                     tr_copy = dict(trace)
                     tr_copy["old_locked_item"] = prev_lock
                     tr_copy["new_locked_item"] = new_lock
                     tr_copy["source"] = "coach"
-                    self._action_tracker.record_plan_override(float(self._current_game_time_s() or 0.0), tr_copy)
+                    self._action_tracker.record_plan_override(gt_now, tr_copy)
             else:
                 new_lock, new_plan = reconcile_match_build_plan(
                     store=self.store,
@@ -4257,7 +4896,11 @@ class HexHelperController:
                     locked_next_item=self.sm.locked_next_item,
                     proposed_ids=proposed_ids,
                     allow_overhaul=self.sm.allow_plan_overhaul or first_coach_lock,
+                    hero_id=hid_active,
+                    selected_augments=self.sm.selected_augments,
                     transformative_overhaul=is_tx_overhaul,
+                    active_profile=active_prof,
+                    game_time=gt_now,
                 )
             self.sm.locked_next_item = new_lock
             self.sm.committed_plan = new_plan
@@ -4265,10 +4908,13 @@ class HexHelperController:
                 self.sm.allow_plan_overhaul = False
             self._save_match_state()
 
+        if len(self.sm.selected_augments) >= 4 and getattr(advice, "next_augment_goal", ""):
+            advice = replace(advice, next_augment_goal="")
         self._latest_advice = advice
         self._last_advice_mono = time.monotonic()
         self._last_drawer_refresh_sig = None
         if trig_reason == "pre_death_warmup":
+            self._last_warmup_dispatched_mono = 0.0
             self._last_warmup_advice_mono = self._last_advice_mono
             self._last_warmup_advice_enemy_sig = (
                 self.sm._enemy_build_signature(self._last_live, store=self.store)
@@ -4292,9 +4938,9 @@ class HexHelperController:
             turn_payload: dict[str, Any] = {
                 "request_id": str(advice.request_id or ""),
                 "trigger_reason": trig_reason,
-                "model": str(getattr(stats, "model", "") or ""),
+                "model": eff_model,
                 "thinking_level": str(getattr(stats, "thinking_level", "") or ""),
-                "latency_ms": int(latency_ms or getattr(stats, "latency_ms", 0) or 0),
+                "latency_ms": eff_latency_ms,
                 "input_tokens": int(getattr(stats, "input_tokens", 0) or 0),
                 "output_tokens": int(getattr(stats, "output_tokens", 0) or 0),
                 "thought_tokens": int(getattr(stats, "thought_tokens", 0) or 0),
@@ -4316,8 +4962,27 @@ class HexHelperController:
                     trigger_reason=trig_reason,
                     recommended_item_ids=shown_next_ids,
                     recommended_augment_id=rec_aug_id,
-                    latency_ms=float(latency_ms or getattr(stats, "latency_ms", 0) or 0.0),
+                    latency_ms=float(eff_latency_ms),
                 )
+                req_id_str = str(advice.request_id or "")
+                sup_req_id = str(getattr(self, "_death_superseded_req_id", "") or "")
+                dw = getattr(self._action_tracker, "_death_window", None)
+                if (
+                    req_id_str
+                    and sup_req_id
+                    and req_id_str == sup_req_id
+                    and dw is not None
+                    and not getattr(dw, "coach_arrived", False)
+                ):
+                    dw.coach_triggered = True
+                    dw.coach_skip_reason = ""
+                    dw.coach_arrived = True
+                    dw.coach_request_id = req_id_str
+                    dw.coach_latency_ms = float(eff_latency_ms)
+                    if not getattr(dw, "first_buy_seen", False):
+                        dw.coach_arrived_before_buy = True
+                    self._death_superseded_req_id = ""
+                    self._death_defer_superseded_by_picker = False
 
         if advice.opening_brief:
             self._cancel_game_start_coach_defer("opening_brief received")
@@ -4350,6 +5015,173 @@ class HexHelperController:
 
     def _active_hero_id(self) -> str | None:
         return self.sm.manual_hero_override or self.sm.current_hero_id
+
+    def _current_data_band_mode(self) -> str:
+        cfg = getattr(self, "cfg", None)
+        raw = str(getattr(cfg, "data_band_mode", "all") or "all").strip().lower()
+        return raw if raw in DATA_BAND_MODES else "all"
+
+    def _current_my_stats(self) -> dict[str, float] | None:
+        live = getattr(self, "_last_live", None)
+        live_stats = getattr(live, "my_stats", None) if live is not None else None
+        if isinstance(live_stats, dict) and live_stats:
+            return live_stats
+        cached = getattr(self, "_match_last_my_stats", None)
+        if isinstance(cached, dict) and cached:
+            return cached
+        return None
+
+    def _resolve_hero_from_live_player(self, player: Any) -> Any | None:
+        """Resolve canonical HeroStat prioritizing invariant raw_champion_name before localized champion_name."""
+        if player is None or not self.store.is_loaded:
+            return None
+        raw_nm = str(getattr(player, "raw_champion_name", "") or "").strip()
+        if raw_nm:
+            hero = self.store.find_hero_by_name(raw_nm)
+            if hero is not None:
+                return hero
+        champ_nm = str(getattr(player, "champion_name", "") or "").strip()
+        if champ_nm:
+            return self.store.find_hero_by_name(champ_nm)
+        return None
+
+    def _infer_player_comp_profile(
+        self,
+        player: Any,
+        *,
+        band_mode: str,
+        hero_id_override: str | None = None,
+        selected_augments: tuple[str, ...] | list[str] = (),
+        my_stats: dict[str, float] | None = None,
+    ) -> str:
+        """Infer a player's compact comp profile token for build_combo_plan() team weighting."""
+        p_hid = str(hero_id_override).strip() if hero_id_override else ""
+        if not p_hid and self.store.is_loaded:
+            h_obj = self._resolve_hero_from_live_player(player)
+            if h_obj is not None:
+                p_hid = str(h_obj.hero_id)
+
+        item_ids = tuple(getattr(player, "item_ids", ()) or ())
+        has_known_item = False
+        has_bruiser_item = False
+        has_crit_item = False
+        if self.store.is_loaded and item_ids:
+            for iid in item_ids:
+                info = self.store.get_item_info(iid)
+                st = info.stats or {}
+                if st or (info.name and not info.name.startswith("装备#")):
+                    has_known_item = True
+                ad_v = float(st.get("FlatPhysicalDamageMod", 0.0) or 0.0)
+                hp_v = float(st.get("FlatHPPoolMod", 0.0) or 0.0)
+                arm_v = float(st.get("FlatArmorMod", 0.0) or 0.0)
+                crit_v = float(st.get("FlatCritChanceMod", 0.0) or 0.0)
+                if ad_v >= 20.0 and (hp_v >= 200.0 or arm_v >= 30.0):
+                    has_bruiser_item = True
+                if crit_v > 0.0:
+                    has_crit_item = True
+
+        # Avoid fabricating phantom AD/ranged profiles from synthetic stub players with unknown names and no items
+        if not p_hid and not has_known_item:
+            return ""
+
+        try:
+            prof = infer_unified_hero_profile(
+                p_hid or None,
+                self.store if self.store.is_loaded else None,
+                my_items=item_ids,
+                selected_augments=selected_augments,
+                my_stats=my_stats,
+                data_band_mode=band_mode,
+            )
+        except TypeError:
+            prof = infer_unified_hero_profile(
+                p_hid or None,
+                self.store if self.store.is_loaded else None,
+                my_items=item_ids,
+                selected_augments=selected_augments,
+                my_stats=my_stats,
+            )
+
+        if prof == "AD":
+            if not has_bruiser_item and self.store.is_loaded and p_hid and not item_ids:
+                try:
+                    cbs = self.store.get_core_builds(p_hid, band_mode=band_mode)[:2]
+                except TypeError:
+                    cbs = self.store.get_core_builds(p_hid)[:2]
+                for cb in cbs:
+                    for iid in cb.items:
+                        st = self.store.get_item_info(iid).stats or {}
+                        ad_v = float(st.get("FlatPhysicalDamageMod", 0.0) or 0.0)
+                        hp_v = float(st.get("FlatHPPoolMod", 0.0) or 0.0)
+                        arm_v = float(st.get("FlatArmorMod", 0.0) or 0.0)
+                        if ad_v >= 20.0 and (hp_v >= 200.0 or arm_v >= 30.0):
+                            has_bruiser_item = True
+                            break
+                    if has_bruiser_item:
+                        break
+            spells = tuple(getattr(player, "summoner_spells", ()) or ())
+            has_snowball = any(str(s).strip() in ("雪球", "标记", "Snowball", "Mark") for s in spells)
+            if has_bruiser_item or (has_snowball and not has_crit_item):
+                return "FIGHTER"
+        return prof
+
+    def _current_team_profiles(
+        self,
+        *,
+        band_mode: str | None = None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Derive live (ally_profiles, enemy_profiles) for comp-aware augment planning."""
+        live = getattr(self, "_last_live", None)
+        if live is None:
+            return (), ()
+        bmode = band_mode or self._current_data_band_mode()
+        my_p = getattr(live, "my_player", None)
+        my_hid = self._active_hero_id()
+        my_stats = self._current_my_stats()
+
+        ally_players = list(getattr(live, "allies", ()) or ())
+        if my_p is not None:
+            my_rid = str(getattr(my_p, "riot_id", "") or "").strip()
+            my_cname = str(getattr(my_p, "champion_name", "") or "").strip()
+            has_self = any(
+                (p is my_p)
+                or (my_rid and str(getattr(p, "riot_id", "") or "").strip() == my_rid)
+                or (my_cname and str(getattr(p, "champion_name", "") or "").strip() == my_cname)
+                for p in ally_players
+            )
+            if not has_self:
+                ally_players.insert(0, my_p)
+
+        ally_profs: list[str] = []
+        for p in ally_players:
+            is_self = my_p is not None and (
+                (p is my_p)
+                or (
+                    bool(getattr(my_p, "riot_id", ""))
+                    and getattr(p, "riot_id", "") == getattr(my_p, "riot_id", "")
+                )
+                or (
+                    bool(getattr(my_p, "champion_name", ""))
+                    and getattr(p, "champion_name", "") == getattr(my_p, "champion_name", "")
+                )
+            )
+            prof = self._infer_player_comp_profile(
+                p,
+                band_mode=bmode,
+                hero_id_override=(my_hid if is_self else None),
+                selected_augments=(self.sm.selected_augments if is_self else ()),
+                my_stats=(my_stats if is_self else None),
+            )
+            if prof:
+                ally_profs.append(prof)
+
+        enemy_profs: list[str] = []
+        for p in getattr(live, "enemies", ()) or ():
+            prof = self._infer_player_comp_profile(p, band_mode=bmode)
+            if prof:
+                enemy_profs.append(prof)
+
+        return tuple(ally_profs), tuple(enemy_profs)
 
     def _telemetry_worker_loop(self) -> None:
         """Background daemon polling LCU and 127.0.0.1:2999 with ZERO Qt GUI main-thread blocking."""
@@ -4476,6 +5308,7 @@ class HexHelperController:
                 "committed_plan": list(self.sm.committed_plan),
                 "locked_next_item": self.sm.locked_next_item,
                 "plan_overhaul_reason": self.sm.plan_overhaul_reason,
+                "manual_profile_override": getattr(self.sm, "manual_profile_override", ""),
                 "saved_at": time.time(),
             }
             self._match_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4495,10 +5328,11 @@ class HexHelperController:
             if (time.time() - float(data.get("saved_at") or 0.0)) > 5400.0:
                 return False
             restored_augs = [
-                str(a) for a in (data.get("selected_augments") or []) if str(a) and str(a) not in ("1402", "1403", "1404")
+                str(a) for a in (data.get("selected_augments") or []) if str(a) and str(a) not in _NON_AUGMENT_CHOICE_IDS
             ]
             if restored_augs and not self.sm.selected_augments:
-                self.sm.selected_augments = restored_augs[:6]
+                self.sm.selected_augments = restored_augs[:MAX_AUGMENT_SLOTS]
+                self.sm._rebuild_recent_offered_pool()
             restored_manual_items = [
                 canonicalize_item_id(str(i)) for i in (data.get("manual_owned_items") or []) if str(i).strip()
             ]
@@ -4531,6 +5365,9 @@ class HexHelperController:
             lock_id = canonicalize_item_id(str(data.get("locked_next_item") or ""))
             if lock_id and is_valid_plan_item(self.store, lock_id) and not self.sm.locked_next_item:
                 self.sm.locked_next_item = lock_id
+            restored_prof = str(data.get("manual_profile_override") or "").strip().upper()
+            if restored_prof and not self.sm.manual_profile_override:
+                self.sm.manual_profile_override = restored_prof
             self.sm.plan_overhaul_reason = self._recompute_overhaul_reason_from_selected()
             logger.info(
                 "Restored live match state across restart: augs=%s plan=%s",
@@ -4569,6 +5406,12 @@ class HexHelperController:
         self._active_queue_id = 0
         self._match_is_non_mayhem = False
         self._match_game_mode = ""
+        self._match_session_seq = int(getattr(self, "_match_session_seq", 0) or 0) + 1
+        self._hud_wide_diag_saved_this_match = False
+        self._death_defer_superseded_by_picker = False
+        self._death_superseded_req_id = ""
+        self._match_last_skin_id = 0
+        self._match_last_skin_name = ""
         self._last_offer_rec_snapshot = None
         self._last_offer_emitted_sig = None
         self._pending_reroll_prev_offer = None
@@ -4581,6 +5424,8 @@ class HexHelperController:
         self._active_picker_coach_req_id = ""
         self._active_picker_coach_arrived = False
         self._active_picker_coach_aug_advice = ""
+        self._last_picker_partial_open = False
+        self._last_picker_expected_slots = 0
         for attr in ("_last_ocr_anomaly_mono", "_last_coach_req_meta", "_aug_source_by_id"):
             d = getattr(self, attr, None)
             if isinstance(d, dict):
@@ -4602,7 +5447,15 @@ class HexHelperController:
         return switched
 
     def _maybe_auto_switch_first_prismatic(self, cards: tuple[DetectedCard, ...]) -> bool:
-        """During Round 1 (0 selected augments), if all 3 detected cards are prismatic, switch to first-prismatic."""
+        """During Round 1 (0 selected augments & level < 7 & < 180s), if all 3 detected cards are prismatic, switch to first-prismatic."""
+        cur_lvl = (
+            int(getattr(self._last_live.my_player, "level", 0) or 0)
+            if (getattr(self, "_last_live", None) and self._last_live.my_player)
+            else 0
+        )
+        gt_s = float(self._current_game_time_s() or 0.0) if hasattr(self, "_current_game_time_s") else 0.0
+        if cur_lvl >= 7 or gt_s >= 180.0:
+            return False
         if (
             len(self.sm.selected_augments) == 0
             and len(cards) >= 3
@@ -4649,6 +5502,9 @@ class HexHelperController:
     def _cancel_death_coach_defer(self, reason: str = "") -> None:
         if self._death_coach_defer_timer.isActive():
             self._death_coach_defer_timer.stop()
+            r_low = str(reason or "").lower()
+            if "augment_picking" in r_low or "augment_selected" in r_low or "manual_f6" in r_low:
+                self._death_defer_superseded_by_picker = True
             if self._action_tracker is not None and reason:
                 self._action_tracker.note_death_coach_decision(False, f"deferred_cancelled:{reason}")
             if reason:
@@ -4657,10 +5513,24 @@ class HexHelperController:
     def _on_death_coach_defer_timeout(self) -> None:
         if self.sm.state != GameState.IN_GAME:
             return
+        self._death_defer_superseded_by_picker = False
         if self.cfg.auto_trigger_coach and self._is_any_coach_online():
             if self._action_tracker is not None:
                 self._action_tracker.note_death_coach_decision(True, "")
             self.trigger_coach_request("death_enemy_build_changed")
+
+    def _cancel_augment_remove_coach_defer(self, reason: str = "") -> None:
+        timer = getattr(self, "_augment_remove_coach_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            if reason:
+                logger.info("Cancelled deferred post-remove augment coach call: %s", reason)
+
+    def _on_augment_remove_coach_timeout(self) -> None:
+        if self.sm.state != GameState.IN_GAME:
+            return
+        if self.cfg.auto_trigger_coach and self._is_any_coach_online():
+            self.trigger_coach_request("augment_selected")
 
     def _schedule_game_start_coach_defer(self, match_key: str) -> None:
         self._pending_game_start_match_key = match_key
@@ -4717,13 +5587,14 @@ class HexHelperController:
     def _cancel_inflight_picker_coach(self) -> None:
         """Immediately stop pending picker debounce and cancel dying in-flight augment_picking HTTP calls."""
         self._cancel_picker_coach_debounce()
-        gc = getattr(self, "gemini_coach", None)
-        cancel_fn = getattr(gc, "cancel_pending", None) if gc is not None else None
-        if callable(cancel_fn):
-            try:
-                cancel_fn({"augment_picking"})
-            except Exception:
-                pass
+        for worker_attr in ("gemini_coach", "cloud_coach"):
+            worker = getattr(self, worker_attr, None)
+            cancel_fn = getattr(worker, "cancel_pending", None) if worker is not None else None
+            if callable(cancel_fn):
+                try:
+                    cancel_fn({"augment_picking"})
+                except Exception:
+                    pass
 
     def _on_picker_coach_debounce_timeout(self) -> None:
         if self.sm.state != GameState.AUGMENT_PICKING or not self.sm.active_cards:
@@ -4752,6 +5623,10 @@ class HexHelperController:
             "threshold": self.SMART_PICKER_GATE_DELTA_GAP,
         }
         if not self.cfg.smart_picker_ai_gate or len(cards) < 2:
+            return False, ""
+        exp_slots = int(getattr(self, "_last_picker_expected_slots", 0) or 0)
+        if bool(getattr(self, "_last_picker_partial_open", False)) or (exp_slots >= 3 and len(cards) < exp_slots):
+            self._last_smart_gate_eval["reason"] = "partial_open_incomplete_slots"
             return False, ""
         hid = self._active_hero_id()
         if not hid or not self.store.is_loaded:
@@ -4810,17 +5685,48 @@ class HexHelperController:
         # Check combo verdict contradiction
         if verdict is None:
             my_items = self._last_live.my_player.item_ids if (self._last_live and self._last_live.my_player) else ()
-            verdict = self._last_combo_verdict or evaluate_picker_combos(
-                store=self.store,
-                hero_id=hid,
-                selected_augments=self.sm.selected_augments,
-                my_items=my_items,
-                offered=[(c.slot_index, c.augment) for c in cards],
-                game_time_s=float(self._current_game_time_s() or 0.0),
+            offered_ids = tuple(c.augment.augment_id for c in cards)
+            cached_v = self._last_combo_verdict
+            if cached_v is not None and tuple(vc.augment_id for vc in cached_v.cards) != offered_ids:
+                cached_v = None
+            band_mode = self._current_data_band_mode()
+            my_lvl = (
+                int(getattr(self._last_live.my_player, "level", 0) or 0)
+                if (getattr(self, "_last_live", None) and self._last_live.my_player)
+                else 0
             )
+            my_gold = float(getattr(self._last_live, "current_gold", 0.0) or 0.0) if getattr(self, "_last_live", None) else 0.0
+            pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+            if cached_v is not None:
+                verdict = cached_v
+            else:
+                try:
+                    verdict = evaluate_picker_combos(
+                        store=self.store,
+                        hero_id=hid,
+                        selected_augments=self.sm.selected_augments,
+                        my_items=my_items,
+                        offered=[(c.slot_index, c.augment) for c in cards],
+                        my_stats=self._current_my_stats(),
+                        game_time_s=float(self._current_game_time_s() or 0.0),
+                        data_band_mode=band_mode,
+                        preferred_profile=pref_prof,
+                        my_level=my_lvl,
+                        my_gold=my_gold,
+                    )
+                except TypeError:
+                    verdict = evaluate_picker_combos(
+                        store=self.store,
+                        hero_id=hid,
+                        selected_augments=self.sm.selected_augments,
+                        my_items=my_items,
+                        offered=[(c.slot_index, c.augment) for c in cards],
+                        my_stats=self._current_my_stats(),
+                        game_time_s=float(self._current_game_time_s() or 0.0),
+                    )
         combo_by_slot = {vc.slot_index: vc for vc in verdict.cards}
         top1_combo = combo_by_slot.get(top1_card.slot_index)
-        if top1_combo is not None and top1_combo.verdict == "conflict":
+        if top1_combo is not None and top1_combo.verdict in ("conflict", "round_decay"):
             self._last_smart_gate_eval["reason"] = "combo_conflict"
             return False, ""
         for vc in verdict.cards:
@@ -4841,12 +5747,17 @@ class HexHelperController:
             return False, ""
 
         # Check transformative augment tie (let AI weigh transformative pivot when gap isn't overwhelming)
-        top1_tx = is_transformative_augment(self.store, top1_card.augment.augment_id)
+        band_mode = self._current_data_band_mode()
+        top1_tx = is_transformative_augment(
+            self.store, top1_card.augment.augment_id, hero_id=hid, band_mode=band_mode
+        )
         for other_card, other_sc in scored_cards:
             if other_card.slot_index == top1_card.slot_index:
                 continue
             other_tx = (
-                is_transformative_augment(self.store, other_card.augment.augment_id)
+                is_transformative_augment(
+                    self.store, other_card.augment.augment_id, hero_id=hid, band_mode=band_mode
+                )
                 or is_transmute_augment(other_card.augment.augment_id)
             )
             if other_tx:
@@ -4965,6 +5876,7 @@ class HexHelperController:
             return
         diag_fn = getattr(self.icon_matcher, "last_verify_diagnostics", None)
         vdiag = dict(diag_fn()) if callable(diag_fn) else {}
+        wide_crop = vdiag.pop("hud_wide_diag_crop", None)
         vdiag.setdefault("template_count", int(getattr(self.icon_matcher, "template_count", 0) or 0))
         if vdiag["template_count"] == 0:
             vdiag.setdefault("outcome", "skipped_empty_bank")
@@ -4982,6 +5894,19 @@ class HexHelperController:
         hud_scale = float(getattr(self, "_hud_scale", 1.0) or 1.0)
         vdiag.setdefault("hud_scale", round(hud_scale, 3))
         ev_seq = self._emit_devlab("vision", "vision.icon_verify.outcome", vdiag)
+
+        if (
+            bool(vdiag.get("hud_strip_blind"))
+            and wide_crop is not None
+            and not getattr(self, "_hud_wide_diag_saved_this_match", False)
+            and getattr(self._devlab, "enable_roi_snapshots", False)
+        ):
+            try:
+                enq_res = self._devlab.enqueue_roi_snapshot("hud_wide_diag", wide_crop, ev_seq=ev_seq)
+                if enq_res is not None:
+                    self._hud_wide_diag_saved_this_match = True
+            except Exception:
+                pass
 
         # Capture compact 4x28x28 HUD strip crop on anomaly / low-margin / empty bank / flat patches
         outcome = str(vdiag.get("outcome") or "")
@@ -5363,20 +6288,42 @@ class HexHelperController:
 
         augments: list[tuple[str, str]] = []
         augment_icon_paths: list[str] = []
-        for aid in self.sm.selected_augments[:4]:
+        for aid in self.sm.selected_augments[:MAX_AUGMENT_SLOTS]:
             aug = self.store.get_augment(aid)
             augments.append((aug.name if aug else str(aid), aug.rarity if aug else "gold"))
             augment_icon_paths.append(self._resolve_local_cached_icon("augment", str(aid)))
 
         combo_plan: ComboPlan | None = None
         if self.store.is_loaded and hid:
-            fresh_plan = build_combo_plan(
-                store=self.store,
-                hero_id=hid,
-                selected_augments=self.sm.selected_augments,
-                my_items=self._match_last_my_items,
-                limit=4,
-            )
+            band_mode = self._current_data_band_mode()
+            ally_profiles, enemy_profiles = self._current_team_profiles(band_mode=band_mode)
+            try:
+                fresh_plan = build_combo_plan(
+                    store=self.store,
+                    hero_id=hid,
+                    selected_augments=self.sm.selected_augments,
+                    my_items=self._match_last_my_items,
+                    limit=4,
+                    threat=getattr(self, "_last_threat", None),
+                    ally_profiles=ally_profiles,
+                    enemy_profiles=enemy_profiles,
+                    my_stats=self._current_my_stats(),
+                    game_time_s=float(duration_s),
+                    data_band_mode=band_mode,
+                )
+            except TypeError:
+                fresh_plan = build_combo_plan(
+                    store=self.store,
+                    hero_id=hid,
+                    selected_augments=self.sm.selected_augments,
+                    my_items=self._match_last_my_items,
+                    limit=4,
+                    threat=getattr(self, "_last_threat", None),
+                    ally_profiles=ally_profiles,
+                    enemy_profiles=enemy_profiles,
+                    my_stats=self._current_my_stats(),
+                    game_time_s=float(duration_s),
+                )
             if fresh_plan.active_combos:
                 combo_plan = fresh_plan
             elif self._last_combo_plan is not None and self._last_combo_plan.active_combos:
@@ -5561,6 +6508,27 @@ class HexHelperController:
                 elif top_ally_score > match_score + 0.05:
                     mvp_badge = ""
 
+        skin_id = int(getattr(self, "_match_last_skin_id", 0) or 0)
+        skin_name = str(getattr(self, "_match_last_skin_name", "") or "").strip()
+        skin_splash_path = ""
+        skin_loading_path = ""
+        skin_center_path = ""
+        static_mgr = getattr(self.store, "static", None)
+        resolve_skin_fn = getattr(static_mgr, "resolve_cached_skin_splash", None) if static_mgr is not None else None
+        if hid and callable(resolve_skin_fn):
+            try:
+                skin_splash_path, resolved_skin_name = resolve_skin_fn(hid, skin_id)
+                if not skin_name and resolved_skin_name:
+                    skin_name = str(resolved_skin_name)
+            except Exception:
+                pass
+        resolve_vars_fn = getattr(static_mgr, "resolve_cached_skin_variants", None) if static_mgr is not None else None
+        if hid and callable(resolve_vars_fn):
+            try:
+                skin_loading_path, skin_center_path = resolve_vars_fn(hid, skin_id)
+            except Exception:
+                pass
+
         return MatchRecapData(
             hero_id=str(hid or ""),
             hero_name=hero_name,
@@ -5590,6 +6558,12 @@ class HexHelperController:
             match_score=match_score,
             rating_grade=rating_grade,
             mvp_badge=mvp_badge,
+            skin_id=skin_id,
+            skin_name=skin_name,
+            skin_splash_path=skin_splash_path,
+            skin_loading_path=skin_loading_path,
+            skin_center_path=skin_center_path,
+            hero_alias=hero_alias,
         )
 
     def _prefetch_my_item_icons(self, item_ids: tuple[str, ...]) -> None:
@@ -5630,18 +6604,32 @@ class HexHelperController:
         threading.Thread(target=_worker, name="HexItemIconPrefetch", daemon=True).start()
 
     def _hydrate_recap_icons_async(self, recap: MatchRecapData) -> None:
-        """Download any missing hero/item icons for a recap card and refresh open dialog live."""
+        """Download any missing hero/item/skin assets for a recap card and refresh open dialog live."""
         static = getattr(self.store, "static", None)
         if static is None:
             return
+        allow_variants = self._should_fetch_skin_variants(static)
         need_hero = bool(recap.hero_id) and not (recap.hero_icon_path and Path(recap.hero_icon_path).is_file())
+        need_skin = bool(recap.hero_id) and not (recap.skin_splash_path and Path(recap.skin_splash_path).is_file())
+        need_skin_loading = (
+            allow_variants
+            and bool(recap.hero_id)
+            and callable(getattr(static, "ensure_skin_loading", None))
+            and not (recap.skin_loading_path and Path(recap.skin_loading_path).is_file())
+        )
+        need_skin_center = (
+            allow_variants
+            and bool(recap.hero_id)
+            and callable(getattr(static, "ensure_skin_center", None))
+            and not (recap.skin_center_path and Path(recap.skin_center_path).is_file())
+        )
         missing_item_indices: list[tuple[int, str]] = []
         for idx, (_name, ico_path) in enumerate(recap.item_entries):
             if ico_path and Path(ico_path).is_file():
                 continue
             if idx < len(recap.item_ids) and recap.item_ids[idx]:
                 missing_item_indices.append((idx, recap.item_ids[idx]))
-        if not need_hero and not missing_item_indices:
+        if not need_hero and not need_skin and not need_skin_loading and not need_skin_center and not missing_item_indices:
             return
 
         def _worker() -> None:
@@ -5652,6 +6640,41 @@ class HexHelperController:
                     p = static.ensure_icon("champion", recap.hero_id)
                     if p is not None and p.is_file():
                         new_hero_path = str(p)
+                        changed = True
+                except Exception:
+                    pass
+
+            new_skin_path = recap.skin_splash_path
+            new_skin_name = recap.skin_name
+            skin_arg = int(getattr(recap, "skin_id", 0) or 0)
+            if need_skin and recap.hero_id and hasattr(static, "ensure_skin_splash"):
+                try:
+                    p_skin, fetched_sname = static.ensure_skin_splash(recap.hero_id, skin_arg)
+                    if p_skin is not None and p_skin.is_file():
+                        new_skin_path = str(p_skin)
+                        changed = True
+                    if fetched_sname and not new_skin_name:
+                        new_skin_name = str(fetched_sname)
+                        changed = True
+                except Exception:
+                    pass
+
+            new_loading_path = recap.skin_loading_path
+            if need_skin_loading and recap.hero_id:
+                try:
+                    p_load = static.ensure_skin_loading(recap.hero_id, skin_arg)
+                    if p_load is not None and p_load.is_file():
+                        new_loading_path = str(p_load)
+                        changed = True
+                except Exception:
+                    pass
+
+            new_center_path = recap.skin_center_path
+            if need_skin_center and recap.hero_id:
+                try:
+                    p_cent = static.ensure_skin_center(recap.hero_id, skin_arg)
+                    if p_cent is not None and p_cent.is_file():
+                        new_center_path = str(p_cent)
                         changed = True
                 except Exception:
                     pass
@@ -5676,6 +6699,10 @@ class HexHelperController:
                 recap,
                 hero_icon_path=new_hero_path,
                 item_entries=tuple(new_entries),
+                skin_splash_path=new_skin_path,
+                skin_loading_path=new_loading_path,
+                skin_center_path=new_center_path,
+                skin_name=new_skin_name,
             )
 
             def _apply_on_ui() -> None:
@@ -5736,6 +6763,21 @@ class HexHelperController:
                 logger.debug("Tray recap notification skipped: %s", exc)
         return recap
 
+    def _on_recap_template_changed(self, template_id: str) -> None:
+        tpl = normalize_recap_template(template_id)
+        if self.cfg.recap_template != tpl:
+            self.cfg.recap_template = tpl
+            try:
+                save_config(self.cfg)
+            except Exception as exc:
+                logger.debug("Failed to persist recap_template=%s: %s", tpl, exc)
+        if getattr(self, "_devlab_active", False):
+            self._emit_devlab(
+                "ui",
+                "ui_match_recap_interaction",
+                {"action": "template_change", "ok": True, "template": tpl},
+            )
+
     def _open_last_match_recap(self) -> MatchRecapDialog | None:
         """Open the non-blocking Hextech MatchRecapDialog for the most recently finished match."""
         if self._last_recap_data is None:
@@ -5751,10 +6793,12 @@ class HexHelperController:
         dlg = MatchRecapDialog(
             self._last_recap_data,
             parent=self.lookup_window,
+            template=self.cfg.recap_template,
             lifecycle_state=(self._core_lifecycle.state if (self._commercial and self._core_lifecycle is not None) else None),
             snoozed=bool(self._core_lifecycle.snoozed if self._core_lifecycle is not None else False),
             on_core_action=self._handle_core_action if self._commercial else None,
             on_recap_action=(self._on_recap_action if devlab_on else None),
+            on_template_changed=self._on_recap_template_changed,
         )
         dlg.setModal(False)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
@@ -5763,6 +6807,7 @@ class HexHelperController:
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+        self._refresh_non_overlay_hwnds_cache()
         if devlab_on:
             self._emit_devlab("ui", "ui_match_recap_interaction", {"action": "open", "ok": True})
         return dlg
@@ -5970,7 +7015,13 @@ class HexHelperController:
         return False
 
     def _start_or_attach_match_session(self, live_snap: LiveMatchSnapshot, resolved_hid: str | None) -> None:
-        game_id, queue_id = self._safe_get_lcu_game_id()
+        self._match_session_seq = int(getattr(self, "_match_session_seq", 0) or 0) + 1
+        session_seq = self._match_session_seq
+        last_fin_gid = int(getattr(self, "_last_finished_game_id", 0) or 0)
+        game_id = int(getattr(self, "_last_cs_game_id", 0) or getattr(self, "_active_game_id", 0) or 0)
+        if game_id > 0 and game_id == last_fin_gid:
+            game_id = 0
+        queue_id = int(getattr(self, "_last_cs_queue_id", 0) or getattr(self, "_active_queue_id", 0) or 0)
         self._active_game_id = game_id
         self._active_queue_id = queue_id
         game_mode = str(getattr(live_snap, "game_mode", "") or "").strip()
@@ -5978,21 +7029,22 @@ class HexHelperController:
         self._match_is_non_mayhem = self._is_non_mayhem_mode(game_mode, queue_id)
 
         roster_key = self._compute_match_key(live_snap, resolved_hid)
-        self._active_match_key = f"gid:{game_id}" if game_id > 0 else roster_key
-        self._restore_match_state_if_matching(self._active_match_key)
+        match_key = f"gid:{game_id}" if game_id > 0 else roster_key
+        self._active_match_key = match_key
+        self._restore_match_state_if_matching(match_key)
         _hero_obj = self.store.get_hero(resolved_hid) if resolved_hid else None
         hero_name = _hero_obj.name if _hero_obj is not None else (
             live_snap.my_player.champion_name if live_snap.my_player else ""
         )
         self.log_ring.begin_match(
-            self._active_match_key,
+            match_key,
             hero_id=resolved_hid or "",
             hero_name=hero_name,
             dataset_patch=self.store.descriptor.patch if self.store.descriptor else "",
             dataset_mode=self.store.active_match_mode if self.store.descriptor else "",
         )
         if getattr(self, "_devlab_active", False):
-            raw_hash_src = str(game_id) if game_id > 0 else self._active_match_key
+            raw_hash_src = str(game_id) if game_id > 0 else match_key
             mkh = hashlib.sha256(raw_hash_src.encode("utf-8")).hexdigest()[:16] if raw_hash_src else ""
             self._devlab.begin_match(
                 match_key_hash=mkh,
@@ -6004,68 +7056,149 @@ class HexHelperController:
             )
             if self._action_tracker is not None:
                 self._action_tracker.on_lcu_champ_select("InProgress", None)
-            rune_page = self._safe_get_current_rune_page()
-            live_runes = dict(getattr(live_snap, "active_runes", None) or {})
-            my_p = live_snap.my_player
-            keystone_id = int(
-                live_runes.get("keystone_id")
-                or (getattr(my_p, "keystone_id", 0) if my_p is not None else 0)
-                or 0
-            )
-            primary_style_id = int(
-                rune_page.get("primary_style_id")
-                or live_runes.get("primary_tree_id")
-                or (getattr(my_p, "primary_tree_id", 0) if my_p is not None else 0)
-                or 0
-            )
-            sub_style_id = int(
-                rune_page.get("sub_style_id")
-                or live_runes.get("secondary_tree_id")
-                or (getattr(my_p, "secondary_tree_id", 0) if my_p is not None else 0)
-                or 0
-            )
-            selected_perks = [int(x) for x in (rune_page.get("selected_perk_ids") or []) if int(x or 0) > 0]
-            if not selected_perks and keystone_id > 0:
-                selected_perks = [keystone_id]
-            ally_loadouts = [
-                {
-                    "champion": p.champion_name,
-                    "keystone_id": int(getattr(p, "keystone_id", 0) or 0),
-                    "primary_tree_id": int(getattr(p, "primary_tree_id", 0) or 0),
-                    "spells": list(p.summoner_spells),
-                }
-                for p in live_snap.allies
-            ]
-            enemy_loadouts = [
-                {
-                    "champion": p.champion_name,
-                    "keystone_id": int(getattr(p, "keystone_id", 0) or 0),
-                    "primary_tree_id": int(getattr(p, "primary_tree_id", 0) or 0),
-                    "spells": list(p.summoner_spells),
-                }
-                for p in live_snap.enemies
-            ]
-            self._emit_devlab(
-                "game",
-                "match_runes_and_loadout_locked",
-                {
-                    "primary_style_id": primary_style_id,
-                    "sub_style_id": sub_style_id,
-                    "selected_perk_ids": selected_perks,
-                    "keystone_id": keystone_id,
-                    "keystone_name": str(live_snap.my_keystone or ""),
-                    "my_spells": list(my_p.summoner_spells) if my_p is not None else [],
-                    "ally_loadouts": ally_loadouts,
-                    "enemy_loadouts": enemy_loadouts,
-                    "game_mode": game_mode,
-                    "map_number": int(getattr(live_snap, "map_number", 0) or 0),
-                    "queue_id": queue_id,
-                    "is_non_mayhem": self._match_is_non_mayhem,
-                },
-                game_time_s=float(live_snap.game_time or 0.0),
-            )
             self._refresh_devlab_badge_if_visible()
-        self._maybe_start_lobby_scout(self._active_match_key)
+        self._maybe_start_lobby_scout(match_key)
+
+        if getattr(self._stop_event, "is_set", lambda: False)():
+            return
+
+        devlab_need_runes = bool(getattr(self, "_devlab_active", False))
+
+        def _async_meta_worker() -> None:
+            if getattr(self._stop_event, "is_set", lambda: False)():
+                return
+            try:
+                lcu_gid, lcu_qid = self._safe_get_lcu_game_id()
+            except Exception:
+                lcu_gid, lcu_qid = 0, 0
+            rune_page: dict[str, Any] = {}
+            if devlab_need_runes and not getattr(self._stop_event, "is_set", lambda: False)():
+                try:
+                    rune_page = self._safe_get_current_rune_page() or {}
+                except Exception:
+                    rune_page = {}
+            if getattr(self._stop_event, "is_set", lambda: False)():
+                return
+            try:
+                self.ui_invoker.invoke.emit(
+                    lambda s_seq=session_seq, mk=match_key, ls=live_snap, gid=lcu_gid, qid=lcu_qid, rp=rune_page: (
+                        self._apply_async_match_session_meta(s_seq, mk, ls, gid, qid, rp)
+                    )
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_async_meta_worker, name="HexMatchMeta", daemon=True).start()
+
+    def _apply_async_match_session_meta(
+        self,
+        session_seq: int,
+        expected_match_key: str,
+        live_snap: LiveMatchSnapshot,
+        lcu_game_id: int,
+        lcu_queue_id: int,
+        rune_page: dict[str, Any],
+    ) -> None:
+        if getattr(self._stop_event, "is_set", lambda: False)():
+            return
+        if int(session_seq) != int(getattr(self, "_match_session_seq", 0) or 0):
+            return
+        if self._active_match_key != expected_match_key:
+            return
+        if self.sm.state not in (GameState.IN_GAME, GameState.AUGMENT_PICKING):
+            return
+
+        last_fin_gid = int(getattr(self, "_last_finished_game_id", 0) or 0)
+        lcu_gid_clean = int(lcu_game_id or 0)
+        if lcu_gid_clean > 0 and lcu_gid_clean == last_fin_gid:
+            lcu_gid_clean = 0
+        eff_gid = lcu_gid_clean or int(getattr(self, "_active_game_id", 0) or 0)
+        if eff_gid > 0 and eff_gid == last_fin_gid:
+            eff_gid = 0
+        eff_qid = int(lcu_queue_id or 0) or int(getattr(self, "_active_queue_id", 0) or 0)
+        self._active_game_id = eff_gid
+        self._active_queue_id = eff_qid
+        if eff_gid > 0:
+            new_mk = f"gid:{eff_gid}"
+            if new_mk != self._active_match_key:
+                self._active_match_key = new_mk
+                self.log_ring.update_match_meta(match_key=new_mk)
+        game_mode = str(getattr(live_snap, "game_mode", "") or self._match_game_mode or "").strip()
+        self._match_game_mode = game_mode
+        self._match_is_non_mayhem = self._is_non_mayhem_mode(game_mode, eff_qid)
+
+        if not getattr(self, "_devlab_active", False):
+            return
+
+        upd_kwargs: dict[str, Any] = {"is_non_mayhem": self._match_is_non_mayhem}
+        if eff_gid > 0:
+            upd_kwargs["match_key_hash"] = hashlib.sha256(str(eff_gid).encode("utf-8")).hexdigest()[:16]
+        try:
+            self._devlab.update_match_meta(**upd_kwargs)
+        except Exception:
+            pass
+
+        rp = rune_page if isinstance(rune_page, dict) else {}
+        live_runes = dict(getattr(live_snap, "active_runes", None) or {})
+        my_p = live_snap.my_player
+        keystone_id = int(
+            live_runes.get("keystone_id")
+            or (getattr(my_p, "keystone_id", 0) if my_p is not None else 0)
+            or 0
+        )
+        primary_style_id = int(
+            rp.get("primary_style_id")
+            or live_runes.get("primary_tree_id")
+            or (getattr(my_p, "primary_tree_id", 0) if my_p is not None else 0)
+            or 0
+        )
+        sub_style_id = int(
+            rp.get("sub_style_id")
+            or live_runes.get("secondary_tree_id")
+            or (getattr(my_p, "secondary_tree_id", 0) if my_p is not None else 0)
+            or 0
+        )
+        selected_perks = [int(x) for x in (rp.get("selected_perk_ids") or []) if int(x or 0) > 0]
+        if not selected_perks and keystone_id > 0:
+            selected_perks = [keystone_id]
+        ally_loadouts = [
+            {
+                "champion": p.champion_name,
+                "keystone_id": int(getattr(p, "keystone_id", 0) or 0),
+                "primary_tree_id": int(getattr(p, "primary_tree_id", 0) or 0),
+                "spells": list(p.summoner_spells),
+            }
+            for p in live_snap.allies
+        ]
+        enemy_loadouts = [
+            {
+                "champion": p.champion_name,
+                "keystone_id": int(getattr(p, "keystone_id", 0) or 0),
+                "primary_tree_id": int(getattr(p, "primary_tree_id", 0) or 0),
+                "spells": list(p.summoner_spells),
+            }
+            for p in live_snap.enemies
+        ]
+        self._emit_devlab(
+            "game",
+            "match_runes_and_loadout_locked",
+            {
+                "primary_style_id": primary_style_id,
+                "sub_style_id": sub_style_id,
+                "selected_perk_ids": selected_perks,
+                "keystone_id": keystone_id,
+                "keystone_name": str(live_snap.my_keystone or ""),
+                "my_spells": list(my_p.summoner_spells) if my_p is not None else [],
+                "ally_loadouts": ally_loadouts,
+                "enemy_loadouts": enemy_loadouts,
+                "game_mode": game_mode,
+                "map_number": int(getattr(live_snap, "map_number", 0) or 0),
+                "queue_id": eff_qid,
+                "is_non_mayhem": self._match_is_non_mayhem,
+            },
+            game_time_s=float(live_snap.game_time or 0.0),
+        )
+        self._refresh_devlab_badge_if_visible()
 
     def _apply_live_snapshot(self, live_snap: LiveMatchSnapshot, *, degraded_2999: bool = False) -> None:
         t0 = time.perf_counter()
@@ -6146,9 +7279,7 @@ class HexHelperController:
         self._last_cs = None
         resolved_hid = None
         if live_snap.my_player:
-            h = self.store.find_hero_by_name(live_snap.my_player.champion_name) or self.store.find_hero_by_name(
-                live_snap.my_player.raw_champion_name
-            )
+            h = self._resolve_hero_from_live_player(live_snap.my_player)
             if h is not None:
                 resolved_hid = h.hero_id
         prev_level = int(getattr(self, "_last_live_level", 0) or 0)
@@ -6170,6 +7301,7 @@ class HexHelperController:
             self._last_combo_verdict = None
             self._cancel_inflight_picker_coach()
             self._cancel_death_coach_defer()
+            self._cancel_augment_remove_coach_defer("new match")
             self._cancel_game_start_coach_defer("new match")
             self._cancel_pending_icon_verify()
             self._restore_configured_dataset_mode()
@@ -6218,6 +7350,15 @@ class HexHelperController:
             self._last_kda = (
                 f"{live_snap.my_player.kills}/{live_snap.my_player.deaths}/{live_snap.my_player.assists}"
             )
+            my_sid = int(getattr(live_snap.my_player, "skin_id", 0) or 0)
+            my_sname = str(getattr(live_snap.my_player, "skin_name", "") or "").strip()
+            if my_sid > 0:
+                self._match_last_skin_id = my_sid
+            if my_sname:
+                self._match_last_skin_name = my_sname
+            if not live_snap.my_player.is_dead:
+                self._death_defer_superseded_by_picker = False
+                self._death_superseded_req_id = ""
         if live_snap.my_team_kills or live_snap.enemy_team_kills:
             self._last_team_kills = f"{int(live_snap.my_team_kills)}:{int(live_snap.enemy_team_kills)}"
         active_hid = self._active_hero_id()
@@ -6227,6 +7368,7 @@ class HexHelperController:
             if h_info is not None:
                 self._match_last_hero_name = h_info.name
                 self.log_ring.update_match_meta(hero_id=active_hid, hero_name=h_info.name)
+            self._prefetch_my_skin_splash(active_hid, int(getattr(self, "_match_last_skin_id", 0) or 0))
 
         if devlab_on:
             self._devlab.set_context(
@@ -6255,11 +7397,19 @@ class HexHelperController:
         self._refresh_degraded_sync_bar()
 
         # WS-8: Dirty-signature cache skips redundant Qt drawer/combo rebuilds when live state is unchanged
+        raw_crit_v = 0.0
+        if isinstance(raw_my_stats, dict):
+            try:
+                raw_crit_v = float(raw_my_stats.get("critChance", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                raw_crit_v = 0.0
+        crit_sig_pct = int(round(raw_crit_v if raw_crit_v > 1.5 else raw_crit_v * 100.0))
         drawer_sig = (
             active_hid or "",
             cur_level,
             int(float(live_snap.current_gold or 0.0) // 50.0),
             tuple(live_snap.my_player.item_ids) if live_snap.my_player else (),
+            tuple((a.champion_name, tuple(a.item_ids)) for a in live_snap.allies),
             tuple((e.champion_name, tuple(e.item_ids), e.kills, e.deaths) for e in live_snap.enemies),
             tuple(self.sm.selected_augments),
             tuple(self.sm.committed_plan),
@@ -6269,6 +7419,8 @@ class HexHelperController:
             bool(self.sm.is_degraded_2999),
             str(self._latest_advice.request_id) if self._latest_advice is not None else "",
             str(getattr(self.store, "active_match_mode", "") or ""),
+            self._current_data_band_mode(),
+            crit_sig_pct,
         )
         if eff.state_changed or drawer_sig != getattr(self, "_last_drawer_refresh_sig", None):
             self._last_drawer_refresh_sig = drawer_sig
@@ -6281,7 +7433,7 @@ class HexHelperController:
             if game_scr is not None:
                 self.edge_drawer.set_target_screen(game_scr)
                 self.combo_overlay.set_target_screen(game_scr)
-        game_fg = True if game_rect is None else is_hwnd_foreground(game_rect.hwnd)
+        game_fg = True if game_rect is None else self._is_game_or_overlay_foreground(game_rect.hwnd)
         if not self._overlays_hidden_by_user and game_fg:
             if eff.auto_peek_drawer and self.cfg.auto_peek_on_death:
                 self._mark_overlay_open("edge_drawer", "auto_death_peek")
@@ -6300,13 +7452,14 @@ class HexHelperController:
                 self._mark_overlay_open("combo_overlay", "auto_match_start")
                 self.combo_overlay.show_overlay()
         elif not game_fg:
-            if self.edge_drawer.isVisible():
+            text_input_active = bool(getattr(self.edge_drawer, "_text_input_active", False))
+            if self.edge_drawer.isVisible() and not text_input_active:
                 self._mark_overlay_close("edge_drawer", "game_unfocused")
                 self.edge_drawer.hide()
             if self.augment_overlay.isVisible():
                 self._mark_overlay_close("augment_badges", "game_unfocused")
                 self.augment_overlay.hide()
-            if self.combo_overlay.isVisible():
+            if self.combo_overlay.isVisible() and not text_input_active:
                 self._mark_overlay_close("combo_overlay", "game_unfocused")
                 self.combo_overlay.hide()
 
@@ -6331,6 +7484,20 @@ class HexHelperController:
                     and warmup_age <= float(self.WARMUP_COVERS_DEATH_WINDOW_S)
                     and cur_enemy_sig == getattr(self, "_last_warmup_advice_enemy_sig", "")
                 )
+                inflight_warmup_mono = float(getattr(self, "_last_warmup_dispatched_mono", 0.0) or 0.0)
+                inflight_warmup_age = now_m - inflight_warmup_mono
+                has_active_warmup = any(
+                    w.has_inflight_trigger("pre_death_warmup") is True
+                    for w in (getattr(self, "cloud_coach", None), getattr(self, "gemini_coach", None))
+                    if w is not None and callable(getattr(w, "has_inflight_trigger", None))
+                )
+                warmup_inflight_covers_death = (
+                    not warmup_covers_death
+                    and has_active_warmup
+                    and inflight_warmup_mono > 0.0
+                    and 0.0 <= inflight_warmup_age <= float(self.WARMUP_INFLIGHT_REUSE_WINDOW_S)
+                    and cur_enemy_sig == getattr(self, "_last_warmup_dispatched_enemy_sig", "")
+                )
                 my_gold = float(live_snap.current_gold or 0.0)
                 falling_behind = bool(
                     live_snap.my_player is not None
@@ -6350,6 +7517,23 @@ class HexHelperController:
                             )
                         except TypeError:
                             self._action_tracker.note_death_coach_decision(False, "pre_death_warmup_cached")
+                elif warmup_inflight_covers_death:
+                    logger.info(
+                        "Death-shop reusing in-flight pre_death_warmup (age=%.1fs <= %.0fs)",
+                        inflight_warmup_age,
+                        float(self.WARMUP_INFLIGHT_REUSE_WINDOW_S),
+                    )
+                    if self._latest_advice is None and not self._cloud_ai_cutoff:
+                        self.edge_drawer.set_coach_pending(True, pending_label="⏳ 复用进行中预热推演…")
+                    if self._action_tracker is not None:
+                        try:
+                            self._action_tracker.note_death_coach_decision(
+                                False,
+                                "pre_death_warmup_inflight",
+                                warmup_served=True,
+                            )
+                        except TypeError:
+                            self._action_tracker.note_death_coach_decision(False, "pre_death_warmup_inflight")
                 elif not eff.enemy_sig_changed and my_gold < self.sm.DEATH_SHOPPING_GOLD_THRESHOLD and not falling_behind:
                     logger.info(
                         "Skipping death_enemy_build_changed: neither significant enemy item change nor gold>=%dG nor falling behind",
@@ -6395,6 +7579,13 @@ class HexHelperController:
         waited_ms: float = 0.0,
     ) -> None:
         resolved_won = self._match_won_result
+        fin_gid = int(
+            (eog_snap.get("game_id") if isinstance(eog_snap, dict) else 0)
+            or getattr(self, "_active_game_id", 0)
+            or 0
+        )
+        if fin_gid > 0:
+            self._last_finished_game_id = fin_gid
         if isinstance(eog_snap, dict):
             if resolved_won not in (0, 1) and int(eog_snap.get("won", -1)) in (0, 1):
                 resolved_won = int(eog_snap["won"])
@@ -6405,6 +7596,26 @@ class HexHelperController:
                 self._last_kda = str(eog_snap["kda"])
             if int(eog_snap.get("duration_s") or 0) > self._match_max_game_time_s:
                 self._match_max_game_time_s = float(eog_snap["duration_s"])
+            probed_raw = [
+                str(int(a))
+                for a in (eog_snap.get("eog_augments_probed") or [])
+                if str(a).lstrip("-").isdigit() and int(a) > 0
+            ]
+            if len(probed_raw) > len(self.sm.selected_augments):
+                if len(self.sm.selected_augments) > 0:
+                    missing_head = len(probed_raw) - len(self.sm.selected_augments)
+                    backfilled: list[str] = []
+                    for p_aid in probed_raw[:missing_head]:
+                        if p_aid not in self.sm.selected_augments and p_aid not in backfilled:
+                            backfilled.append(p_aid)
+                    if backfilled:
+                        self.sm.selected_augments = (backfilled + list(self.sm.selected_augments))[:MAX_AUGMENT_SLOTS]
+                else:
+                    self.sm.selected_augments = probed_raw[:MAX_AUGMENT_SLOTS]
+                if self.sm.selected_augments and self.store.is_loaded:
+                    first_aug = self.store.get_augment(self.sm.selected_augments[0])
+                    if first_aug is not None:
+                        self._match_is_first_prismatic = first_aug.rarity == "prismatic"
 
         devlab_on = bool(getattr(self, "_devlab_active", False))
         if devlab_on:
@@ -6492,10 +7703,13 @@ class HexHelperController:
         self._last_live_level = 0
         self._cancel_inflight_picker_coach()
         self._cancel_death_coach_defer()
+        self._cancel_augment_remove_coach_defer("match ended")
         self._cancel_game_start_coach_defer("match ended")
         self._cancel_pending_icon_verify()
         self.sm.on_live_snapshot(None, None, time.monotonic())
         self._restore_configured_dataset_mode()
+        self._active_game_id = 0
+        self._last_cs_game_id = 0
         self._reset_match_telemetry_counters()
         self._reset_plan_b_trackers(clear_sm_visual=True)
         self._clear_match_state()
@@ -6641,6 +7855,10 @@ class HexHelperController:
         if self.sm.state == GameState.CHAMP_SELECT and cs is not None:
             if prev_sm_state != GameState.CHAMP_SELECT:
                 self._reset_plan_b_trackers(clear_sm_visual=True)
+                self._match_last_skin_id = 0
+                self._match_last_skin_name = ""
+                self._last_cs_game_id = 0
+                self._last_cs_queue_id = 0
                 # WS-5: Automatically hide Lobby-leftover edge_drawer & combo_overlay when entering ChampSelect
                 if self.edge_drawer.isVisible():
                     self._mark_overlay_close("edge_drawer", "champ_select_enter")
@@ -6648,6 +7866,20 @@ class HexHelperController:
                 if self.combo_overlay.isVisible():
                     self._mark_overlay_close("combo_overlay", "champ_select_enter")
                     self.combo_overlay.hide()
+            last_fin_gid = int(getattr(self, "_last_finished_game_id", 0) or 0)
+            cs_gid_val = int(getattr(cs, "game_id", 0) or 0)
+            if cs_gid_val > 0 and cs_gid_val == last_fin_gid:
+                cs_gid_val = 0
+            cs_qid_val = int(getattr(cs, "queue_id", 0) or 0)
+            if cs_gid_val > 0:
+                self._last_cs_game_id = cs_gid_val
+            if cs_qid_val > 0:
+                self._last_cs_queue_id = cs_qid_val
+            cs_skin_id = int(getattr(cs, "my_skin_id", 0) or 0)
+            if cs_skin_id > 0:
+                self._match_last_skin_id = cs_skin_id
+                if cs.my_hero_id:
+                    self._prefetch_my_skin_splash(str(cs.my_hero_id), cs_skin_id)
             comp_analysis: TeamCompAnalysis | None = None
             if self.store.is_loaded:
                 try:
@@ -6663,8 +7895,7 @@ class HexHelperController:
                     comp_analysis = None
 
             if devlab_on:
-                cs_gid = int(getattr(cs, "game_id", 0) or 0)
-                cs_mkh = hashlib.sha256(str(cs_gid).encode("utf-8")).hexdigest()[:16] if cs_gid > 0 else ""
+                cs_mkh = hashlib.sha256(str(cs_gid_val).encode("utf-8")).hexdigest()[:16] if cs_gid_val > 0 else ""
                 self._devlab.begin_champ_select(
                     match_key_hash=cs_mkh,
                     hero_id=str(cs.my_hero_id or ""),
@@ -7093,7 +8324,7 @@ class HexHelperController:
             if not force:
                 return
             game_rect = get_primary_screen_rect()
-        elif not force and not is_hwnd_foreground(game_rect.hwnd):
+        elif not force and not self._is_game_or_overlay_foreground(game_rect.hwnd):
             return
 
         t_tick0 = time.perf_counter()
@@ -7207,7 +8438,7 @@ class HexHelperController:
                 tr_fn = getattr(self.transmute_watcher, "last_trace_diagnostics", None)
                 if callable(tr_fn):
                     transmute_trace = dict(tr_fn())
-            elif len(self.sm.selected_augments) < 4:
+            elif len(self.sm.selected_augments) < MAX_AUGMENT_SLOTS:
                 t_hov0 = time.perf_counter()
                 passive_hover_hit = self.transmute_watcher.scan_passive_hud_hover(
                     cap.frame_bgr,
@@ -7249,7 +8480,7 @@ class HexHelperController:
                         min_margin=0.03,
                         hud_scale=self._hud_scale,
                     )
-            if len(self.sm.selected_augments) < 4 and self.icon_matcher is not None and self.icon_matcher.template_count > 0:
+            if len(self.sm.selected_augments) < MAX_AUGMENT_SLOTS and self.icon_matcher is not None and self.icon_matcher.template_count > 0:
                 plan_b_aug_hits = self.icon_matcher.scan_all_hud_augments(
                     cap.frame_bgr,
                     game_rect,
@@ -7377,10 +8608,94 @@ class HexHelperController:
                                 continue
                             enq_cnt += 1
 
-        # Freeze click / cursor-dwell selection AT THE EXACT FIRST FRAME cards vanish (before cursor moves to lane!)
-        old_cards_by_slot = {c.slot_index: c.augment.augment_id for c in self.sm.active_cards}
+        # P0-2: Disjoint back-to-back augment rounds (e.g. 3094 double-offer):
+        # Resolve & commit Round A cleanly and reset transient picker runtime BEFORE Round B opens.
+        old_cards = self.sm.active_cards
+        old_cards_by_slot = {c.slot_index: c.augment.augment_id for c in old_cards}
         prev_closed_since = self.sm._picker_closed_since
         resolved_slot: int | None = None
+        if (
+            was_picking
+            and old_cards
+            and res.picker_visible
+            and res.stable
+            and res.cards
+            and not self.sm._is_stat_anvil_offer(res.cards)
+            and not self.sm._is_bonus_event_offer(res.cards)
+        ):
+            old_ids_set = {c.augment.augment_id for c in old_cards if c.augment.augment_id}
+            new_ids_set = {c.augment.augment_id for c in res.cards if c.augment.augment_id}
+            if len(old_ids_set) >= 2 and len(new_ids_set) >= 2 and not (old_ids_set & new_ids_set):
+                prev_slot = self._frozen_pick_slot
+                prev_source = self._frozen_pick_source
+                prev_conf = self._frozen_pick_confidence
+                if prev_slot is None:
+                    prev_valid_slots = {c.slot_index for c in old_cards}
+                    fallback_close = max(self._last_cards_seen_mono, now_mono - 0.14) if self._last_cards_seen_mono > 0 else now_mono
+                    est_close = self._visual_vanish_mono if self._visual_vanish_mono is not None else fallback_close
+                    vanish_diffs = getattr(self, "_last_fast_vanish_diffs", None) or None
+                    try:
+                        prev_slot, prev_source = self.click_tracker.resolve_selection(
+                            close_ts=est_close,
+                            valid_slots=prev_valid_slots,
+                            rerolled_slot=self._last_rerolled_slot,
+                            reroll_ts=self._last_reroll_mono,
+                            game_rect=game_rect,
+                            fast_vanish_diffs=vanish_diffs,
+                            reroll_y_threshold=getattr(self, "_last_picker_reroll_y", None),
+                        )
+                    except TypeError:
+                        prev_slot, prev_source = self.click_tracker.resolve_selection(
+                            close_ts=est_close,
+                            valid_slots=prev_valid_slots,
+                            rerolled_slot=self._last_rerolled_slot,
+                            reroll_ts=self._last_reroll_mono,
+                        )
+                    prev_conf = float(getattr(self.click_tracker, "last_resolve_confidence", 0.0))
+                    if prev_slot is None:
+                        lc_slot = getattr(self.click_tracker, "last_clicked_slot", None)
+                        if lc_slot in prev_valid_slots:
+                            prev_slot = lc_slot
+                            prev_source = prev_source or "click"
+                            prev_conf = max(prev_conf, 0.85)
+                self.sm._picker_closed_since = now_mono - self.sm.PICKER_CLOSE_DEBOUNCE_S - 0.01
+                close_eff = self.sm.on_picker_result(
+                    PickerDetectionResult(
+                        picker_visible=False,
+                        stable=False,
+                        rerolled=False,
+                        cards=(),
+                        cards_seen_on_frame=False,
+                    ),
+                    clicked_slot=prev_slot,
+                    now_mono=now_mono,
+                )
+                self._finalize_picker_close_commit(
+                    eff=close_eff,
+                    resolved_slot=prev_slot,
+                    pick_conf=prev_conf,
+                    pick_source=prev_source or ("click" if prev_slot is not None else "none"),
+                    res_str=res_str,
+                    now_mono=now_mono,
+                    back_to_back=True,
+                )
+                if close_eff.newly_selected_augment:
+                    self._last_drawer_refresh_sig = None
+                    self._refresh_drawer_view()
+                if close_eff.coach_trigger and self.cfg.auto_trigger_coach and self._is_any_coach_online():
+                    self.trigger_coach_request(close_eff.coach_trigger)
+                was_picking = False
+                old_cards_by_slot = {}
+                prev_closed_since = None
+                self._frozen_pick_slot = None
+                self._frozen_pick_source = ""
+                self._frozen_pick_confidence = 0.0
+                self._last_offer_rec_snapshot = None
+                self._last_offer_emitted_sig = None
+                self._pending_reroll_prev_offer = None
+                self._pending_reroll_slots = None
+
+        # Freeze click / cursor-dwell selection AT THE EXACT FIRST FRAME cards vanish (before cursor moves to lane!)
         if was_picking and self.sm.active_cards:
             if res.picker_visible and res.cards_seen_on_frame:
                 self._last_cards_seen_mono = now_mono
@@ -7432,14 +8747,47 @@ class HexHelperController:
 
         eff = self.sm.on_picker_result(res, clicked_slot=resolved_slot, now_mono=now_mono)
 
+        if eff.phantom_rolled_back_id:
+            src_map = getattr(self, "_aug_source_by_id", None)
+            if isinstance(src_map, dict):
+                src_map.pop(str(eff.phantom_rolled_back_id), None)
+            if self.transmute_watcher is not None and self.sm.pending_transmute is None:
+                self.transmute_watcher.reset()
+            self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
+            self._last_drawer_refresh_sig = None
+            self._save_match_state()
+            self._refresh_drawer_view()
+            self._push_recent_unrecorded_augments()
+            if devlab_on:
+                self._emit_devlab(
+                    "vision",
+                    "vision.pick.phantom_rollback",
+                    {
+                        "rolled_back_augment_id": str(eff.phantom_rolled_back_id),
+                        "elapsed_s": round(float(eff.phantom_rollback_elapsed_s), 3),
+                        "restored_plan": list(self.sm.committed_plan),
+                        "restored_locked_item": str(self.sm.locked_next_item or ""),
+                        "remaining_selected_count": len(self.sm.selected_augments),
+                    },
+                )
+            logger.info(
+                "Phantom picker rollback reverted augment %s (%.1fs <= %.0fs); restored plan=%s",
+                eff.phantom_rolled_back_id,
+                eff.phantom_rollback_elapsed_s,
+                self.sm.PHANTOM_ROLLBACK_WINDOW_S,
+                self.sm.committed_plan,
+            )
+
         # WS-3: On the very first frame _picker_closed_since activates, cancel picker debounce & dying augment_picking HTTP call!
         if prev_closed_since is None and self.sm._picker_closed_since is not None:
             self._cancel_inflight_picker_coach()
 
         if self.sm.state == GameState.AUGMENT_PICKING and self.sm.active_cards:
             self._cancel_death_coach_defer("AUGMENT_PICKING opened")
+            self._cancel_augment_remove_coach_defer("AUGMENT_PICKING opened")
             self._cancel_pending_icon_verify()
             if not was_picking:
+                self._push_recent_unrecorded_augments()
                 self._last_cards_seen_mono = now_mono
                 self._picker_opened_mono = now_mono
                 self._picker_opened_since_level = True
@@ -7487,6 +8835,9 @@ class HexHelperController:
                     self.edge_drawer.set_expanded(False)
                 else:
                     self._pre_picker_drawer_expanded = None
+                layout_open_s = str(diag.get("chosen_layout") or "")
+                self._last_picker_expected_slots = 4 if "4" in layout_open_s else (3 if layout_open_s else 0)
+                self._last_picker_partial_open = bool(diag.get("partial_open", False))
                 if devlab_on:
                     self._devlab.set_context(game_state=self.sm.state.value)
                     if self._action_tracker is not None:
@@ -7544,6 +8895,9 @@ class HexHelperController:
                 note_reroll_fn = getattr(self.click_tracker, "note_reroll_event", None)
                 if callable(note_reroll_fn):
                     note_reroll_fn(ts_mono=now_mono, slot=self._last_rerolled_slot)
+                layout_reroll_s = str(diag.get("chosen_layout") or "")
+                self._last_picker_expected_slots = 4 if "4" in layout_reroll_s else (3 if layout_reroll_s else 0)
+                self._last_picker_partial_open = bool(diag.get("partial_open", False))
                 if devlab_on:
                     self._pending_reroll_prev_offer = self._last_offer_rec_snapshot
                     self._pending_reroll_slots = list(changed_slots)
@@ -7581,6 +8935,7 @@ class HexHelperController:
                     "Augment picker rerolled: %s",
                     [(c.slot_index, c.augment.name) for c in self.sm.active_cards],
                 )
+                self._push_recent_unrecorded_augments()
                 self._push_vision_context()
             self._maybe_auto_switch_first_prismatic(self.sm.active_cards)
             if not self._overlays_hidden_by_user and not self._is_full_locked():
@@ -7591,6 +8946,12 @@ class HexHelperController:
                     self.augment_overlay.hide()
                 if self.combo_overlay.mode == "picker":
                     self.combo_overlay.exit_picker_mode()
+        elif eff.is_bonus_event_offer and res.cards:
+            if not self._overlays_hidden_by_user and not self._is_full_locked():
+                self._render_augment_badges(res.cards, game_rect)
+            elif self.augment_overlay.isVisible():
+                self._mark_overlay_close("augment_badges", "hidden_or_locked")
+                self.augment_overlay.hide()
         else:
             if self._click_timer.isActive():
                 self._click_timer.stop()
@@ -7603,167 +8964,25 @@ class HexHelperController:
                 self._mark_overlay_close("augment_badges", "auto_picker_close")
                 self.augment_overlay.hide()
             if was_picking:
-                self._cancel_inflight_picker_coach()
-                pick_conf = self._frozen_pick_confidence
-                pick_source = self._frozen_pick_source or ("click" if resolved_slot is not None else "none")
-                click_gap_ms = float(getattr(self, "_click_max_gap_ms_in_picker", 0.0) or 0.0)
-                picker_dur_ms = (
-                    round((now_mono - float(getattr(self, "_picker_opened_mono", 0.0) or 0.0)) * 1000.0, 1)
-                    if float(getattr(self, "_picker_opened_mono", 0.0) or 0.0) > 0.0
-                    else 0.0
+                self._finalize_picker_close_commit(
+                    eff=eff,
+                    resolved_slot=resolved_slot,
+                    pick_conf=self._frozen_pick_confidence,
+                    pick_source=self._frozen_pick_source or ("click" if resolved_slot is not None else "none"),
+                    res_str=res_str,
+                    now_mono=now_mono,
+                    back_to_back=False,
                 )
-                self._last_combo_verdict = None
-                self.combo_overlay.exit_picker_mode()
-                self.edge_drawer.set_picker_active(False)
-                if self._pre_picker_drawer_expanded is not None:
-                    restore_dr = self._pre_picker_drawer_expanded
-                    self._pre_picker_drawer_expanded = None
-                    if restore_dr and not self._overlays_hidden_by_user:
-                        self._mark_overlay_open("edge_drawer", "auto_picker_restore")
-                        self.edge_drawer.set_expanded(True)
-
-                if devlab_on:
-                    self._devlab.set_context(game_state=self.sm.state.value)
-                    self._emit_devlab(
-                        "vision",
-                        "vision.picker.transition",
-                        {
-                            "transition": "close",
-                            "is_open": False,
-                            "duration_ms": picker_dur_ms,
-                            "committed_augment_id": str(eff.newly_selected_augment or ""),
-                            "resolved_slot": resolved_slot,
-                            "resolution": res_str,
-                        },
-                    )
-                    diag_fn = getattr(self.click_tracker, "last_resolve_diagnostics", None)
-                    click_diag = dict(diag_fn()) if callable(diag_fn) else {}
-                    click_diag.setdefault("source", pick_source)
-                    click_diag.setdefault("confidence", round(float(pick_conf), 3))
-                    click_diag["committed_augment_id"] = str(eff.newly_selected_augment or "")
-                    click_diag["resolved_slot"] = resolved_slot
-                    click_diag["resolution"] = res_str
-                    click_diag["click_timer_max_gap_ms"] = round(click_gap_ms, 1)
-                    self._emit_devlab("vision", "vision.click.selection_resolved", click_diag)
-                    if eff.newly_selected_augment and isinstance(getattr(self, "_aug_source_by_id", None), dict):
-                        self._aug_source_by_id[str(eff.newly_selected_augment)] = {
-                            "source": str(click_diag.get("source") or pick_source),
-                            "confidence": round(float(pick_conf), 3),
-                            "ms_since_last_reroll": click_diag.get("ms_since_last_reroll"),
-                            "cursor_zone": "reroll" if click_diag.get("in_reroll_zone") else "picker_card",
-                        }
-                    snap_offer = getattr(self, "_last_offer_rec_snapshot", None)
-                    if isinstance(snap_offer, dict):
-                        cards_list = list(snap_offer.get("cards") or [])
-                        top1_id = str(snap_offer.get("top1_augment_id") or "")
-                        picked_id = str(eff.newly_selected_augment or "")
-                        top1_card = next((x for x in cards_list if str(x.get("augment_id")) == top1_id), None)
-                        picked_card = next((x for x in cards_list if str(x.get("augment_id")) == picked_id), None)
-                        top1_hex = float(top1_card.get("hex_score", 0.0)) if isinstance(top1_card, dict) else 0.0
-                        picked_hex = float(picked_card.get("hex_score", 0.0)) if isinstance(picked_card, dict) else 0.0
-                        top1_wrd = float(top1_card.get("wr_delta", 0.0)) if isinstance(top1_card, dict) else 0.0
-                        picked_wrd = float(picked_card.get("wr_delta", 0.0)) if isinstance(picked_card, dict) else 0.0
-                        coach_aug = str(getattr(self, "_active_picker_coach_aug_advice", "") or "")
-                        local_vs_coach_disagreed = bool(coach_aug and top1_id and coach_aug != top1_id)
-                        if not picked_id:
-                            sided_with = "unresolved"
-                        elif local_vs_coach_disagreed:
-                            if picked_id == coach_aug:
-                                sided_with = "coach"
-                            elif picked_id == top1_id:
-                                sided_with = "local"
-                            else:
-                                sided_with = "other"
-                        else:
-                            sided_with = "both" if picked_id == top1_id else "other"
-                        picker_req_id = str(getattr(self, "_active_picker_coach_req_id", "") or "")
-                        arrived_before_pick_val: bool | None = (
-                            bool(getattr(self, "_active_picker_coach_arrived", False))
-                            if picker_req_id
-                            else None
-                        )
-                        self._emit_devlab(
-                            "rec",
-                            "augment_pick_decision_delta",
-                            {
-                                "picked_augment_id": picked_id,
-                                "top1_augment_id": top1_id,
-                                "matched_top1": bool(picked_id and picked_id == top1_id),
-                                "hex_score_regret": round(top1_hex - picked_hex, 2) if (picked_id and top1_card and picked_card) else 0.0,
-                                "wr_delta_regret": round(top1_wrd - picked_wrd, 4) if (picked_id and top1_card and picked_card) else 0.0,
-                                "combo_flipped": bool(snap_offer.get("combo_flipped", False)),
-                                "is_stat_anvil": bool(snap_offer.get("is_stat_anvil", False)),
-                                "source": str(click_diag.get("source") or pick_source),
-                                "confidence": round(float(pick_conf), 3),
-                                "ai_advice_arrived_before_pick": arrived_before_pick_val,
-                                "coach_request_id": picker_req_id,
-                                "coach_recommended_augment_id": coach_aug,
-                                "local_vs_coach_disagreed": local_vs_coach_disagreed,
-                                "sided_with": sided_with,
-                                "duration_ms": picker_dur_ms,
-                            },
-                        )
-                    if click_gap_ms >= 90.0:
-                        self._emit_devlab(
-                            "vision",
-                            "vision.pipeline.latency_spike",
-                            {
-                                "click_timer_max_gap_ms": round(click_gap_ms, 1),
-                                "in_augment_picking": True,
-                                "picker_open": True,
-                                "resolution": res_str,
-                            },
-                        )
-
-                if eff.newly_selected_augment:
-                    self._flag_if_transformative_augment(eff.newly_selected_augment)
-                    self._save_match_state()
-                    self.edge_drawer.flash_new_augment(eff.newly_selected_augment)
-                    aug = self.store.get_augment(eff.newly_selected_augment)
-                    logger.info(
-                        "Augment auto-committed (%s, conf=%.2f): %s (%d/4)",
-                        self._frozen_pick_source or "click",
-                        pick_conf,
-                        aug.name if aug else eff.newly_selected_augment,
-                        len(self.sm.selected_augments),
-                    )
-                    if eff.transmute_started and self.sm.pending_transmute is not None:
-                        if self.transmute_watcher is not None:
-                            self.transmute_watcher.reset()
-                        self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
-                        logger.info(
-                            "Transmute secondary OCR armed: source=%s expected=%d rarity=%s",
-                            self.sm.pending_transmute.source_name,
-                            self.sm.pending_transmute.expected_count,
-                            self.sm.pending_transmute.target_rarity or "any",
-                        )
-                    # WS-6: Pass click confidence so high-conf (>=0.90) swap bar auto-dismisses after 15s!
-                    self.edge_drawer.set_recent_offered(
-                        [c.augment for c in self.sm.last_offered_cards],
-                        auto_committed_id=eff.newly_selected_augment,
-                        confidence=float(pick_conf),
-                    )
-                elif self.sm.last_offered_cards:
-                    logger.info(
-                        "Augment picker closed without cursor/click inside cards; surfacing 1-click chips"
-                    )
-                    self.edge_drawer.set_recent_offered([c.augment for c in self.sm.last_offered_cards])
                 if (
-                    (resolved_slot is None or pick_conf < self.ICON_VERIFY_CONF_THRESHOLD)
-                    and self.sm.last_offered_cards
-                    and not eff.transmute_started
+                    not eff.newly_selected_augment
+                    and getattr(self, "_death_defer_superseded_by_picker", False)
+                    and self._last_live is not None
+                    and self._last_live.my_player is not None
+                    and self._last_live.my_player.is_dead
                 ):
-                    self._schedule_delayed_icon_verify(
-                        committed_id=eff.newly_selected_augment,
-                        pick_confidence=pick_conf,
-                    )
-                self._frozen_pick_slot = None
-                self._frozen_pick_source = ""
-                self._frozen_pick_confidence = 0.0
-                self._active_picker_coach_req_id = ""
-                self._active_picker_coach_arrived = False
-                self._active_picker_coach_aug_advice = ""
-                self._push_vision_context()
+                    self._death_defer_superseded_by_picker = False
+                    if self.cfg.auto_trigger_coach and self._is_any_coach_online():
+                        self._on_death_coach_defer_timeout()
 
         # Secondary OCR + visual icon matching loop for Transmute / Pandora augments
         if self.sm.state == GameState.IN_GAME and self.sm.pending_transmute is not None:
@@ -7790,7 +9009,7 @@ class HexHelperController:
             and self.sm.pending_transmute is None
             and not res.picker_visible
             and len(res.cards) == 0
-            and len(self.sm.selected_augments) < 4
+            and len(self.sm.selected_augments) < MAX_AUGMENT_SLOTS
         ):
             if devlab_on and (passive_hover_hit is not None or transmute_trace.get("matched_ids")):
                 td = dict(transmute_trace)
@@ -7809,11 +9028,13 @@ class HexHelperController:
                 self._flag_if_transformative_augment(passive_hover_hit.augment.augment_id)
                 self._save_match_state()
                 logger.info(
-                    "Augment auto-synced via passive HUD hover: %s (%d/4)",
+                    "Augment auto-synced via passive HUD hover: %s (%d/%d)",
                     passive_hover_hit.augment.name,
                     len(self.sm.selected_augments),
+                    MAX_AUGMENT_SLOTS,
                 )
                 self._refresh_drawer_view()
+                self._push_recent_unrecorded_augments()
                 self.edge_drawer.flash_new_augment(passive_hover_hit.augment.augment_id)
                 self._push_vision_context()
                 if self.cfg.auto_trigger_coach and self._is_any_coach_online():
@@ -7903,6 +9124,182 @@ class HexHelperController:
                     },
                 )
 
+    def _finalize_picker_close_commit(
+        self,
+        *,
+        eff: StateStepEffects,
+        resolved_slot: int | None,
+        pick_conf: float,
+        pick_source: str,
+        res_str: str,
+        now_mono: float,
+        back_to_back: bool = False,
+    ) -> None:
+        devlab_on = bool(getattr(self, "_devlab_active", False))
+        self._cancel_inflight_picker_coach()
+        click_gap_ms = float(getattr(self, "_click_max_gap_ms_in_picker", 0.0) or 0.0)
+        picker_dur_ms = (
+            round((now_mono - float(getattr(self, "_picker_opened_mono", 0.0) or 0.0)) * 1000.0, 1)
+            if float(getattr(self, "_picker_opened_mono", 0.0) or 0.0) > 0.0
+            else 0.0
+        )
+        self._last_combo_verdict = None
+        self.combo_overlay.exit_picker_mode()
+        self.edge_drawer.set_picker_active(False)
+        if not back_to_back and self._pre_picker_drawer_expanded is not None:
+            restore_dr = self._pre_picker_drawer_expanded
+            self._pre_picker_drawer_expanded = None
+            if restore_dr and not self._overlays_hidden_by_user:
+                self._mark_overlay_open("edge_drawer", "auto_picker_restore")
+                self.edge_drawer.set_expanded(True)
+
+        if devlab_on:
+            self._devlab.set_context(game_state=self.sm.state.value)
+            close_payload: dict[str, Any] = {
+                "transition": "close",
+                "is_open": False,
+                "duration_ms": picker_dur_ms,
+                "committed_augment_id": str(eff.newly_selected_augment or ""),
+                "resolved_slot": resolved_slot,
+                "resolution": res_str,
+            }
+            if back_to_back:
+                close_payload["back_to_back"] = True
+            self._emit_devlab("vision", "vision.picker.transition", close_payload)
+            diag_fn = getattr(self.click_tracker, "last_resolve_diagnostics", None)
+            click_diag = dict(diag_fn()) if callable(diag_fn) else {}
+            click_diag.setdefault("source", pick_source)
+            click_diag.setdefault("confidence", round(float(pick_conf), 3))
+            click_diag["committed_augment_id"] = str(eff.newly_selected_augment or "")
+            click_diag["resolved_slot"] = resolved_slot
+            click_diag["resolution"] = res_str
+            click_diag["click_timer_max_gap_ms"] = round(click_gap_ms, 1)
+            self._emit_devlab("vision", "vision.click.selection_resolved", click_diag)
+            if eff.newly_selected_augment and isinstance(getattr(self, "_aug_source_by_id", None), dict):
+                self._aug_source_by_id[str(eff.newly_selected_augment)] = {
+                    "source": str(click_diag.get("source") or pick_source),
+                    "confidence": round(float(pick_conf), 3),
+                    "ms_since_last_reroll": click_diag.get("ms_since_last_reroll"),
+                    "cursor_zone": "reroll" if click_diag.get("in_reroll_zone") else "picker_card",
+                }
+            snap_offer = getattr(self, "_last_offer_rec_snapshot", None)
+            if isinstance(snap_offer, dict):
+                cards_list = list(snap_offer.get("cards") or [])
+                top1_id = str(snap_offer.get("top1_augment_id") or "")
+                picked_id = str(eff.newly_selected_augment or "")
+                top1_card = next((x for x in cards_list if str(x.get("augment_id")) == top1_id), None)
+                picked_card = next((x for x in cards_list if str(x.get("augment_id")) == picked_id), None)
+                top1_hex = float(top1_card.get("hex_score", 0.0)) if isinstance(top1_card, dict) else 0.0
+                picked_hex = float(picked_card.get("hex_score", 0.0)) if isinstance(picked_card, dict) else 0.0
+                top1_wrd = float(top1_card.get("wr_delta", 0.0)) if isinstance(top1_card, dict) else 0.0
+                picked_wrd = float(picked_card.get("wr_delta", 0.0)) if isinstance(picked_card, dict) else 0.0
+                coach_aug = str(getattr(self, "_active_picker_coach_aug_advice", "") or "")
+                local_vs_coach_disagreed = bool(coach_aug and top1_id and coach_aug != top1_id)
+                if not picked_id:
+                    sided_with = "unresolved"
+                elif local_vs_coach_disagreed:
+                    if picked_id == coach_aug:
+                        sided_with = "coach"
+                    elif picked_id == top1_id:
+                        sided_with = "local"
+                    else:
+                        sided_with = "other"
+                else:
+                    sided_with = "both" if picked_id == top1_id else "other"
+                picker_req_id = str(getattr(self, "_active_picker_coach_req_id", "") or "")
+                arrived_before_pick_val: bool | None = (
+                    bool(getattr(self, "_active_picker_coach_arrived", False))
+                    if picker_req_id
+                    else None
+                )
+                self._emit_devlab(
+                    "rec",
+                    "augment_pick_decision_delta",
+                    {
+                        "picked_augment_id": picked_id,
+                        "top1_augment_id": top1_id,
+                        "matched_top1": bool(picked_id and picked_id == top1_id),
+                        "hex_score_regret": round(top1_hex - picked_hex, 2) if (picked_id and top1_card and picked_card) else 0.0,
+                        "wr_delta_regret": round(top1_wrd - picked_wrd, 4) if (picked_id and top1_card and picked_card) else 0.0,
+                        "combo_flipped": bool(snap_offer.get("combo_flipped", False)),
+                        "is_stat_anvil": bool(snap_offer.get("is_stat_anvil", False)),
+                        "source": str(click_diag.get("source") or pick_source),
+                        "confidence": round(float(pick_conf), 3),
+                        "ai_advice_arrived_before_pick": arrived_before_pick_val,
+                        "coach_request_id": picker_req_id,
+                        "coach_recommended_augment_id": coach_aug,
+                        "local_vs_coach_disagreed": local_vs_coach_disagreed,
+                        "sided_with": sided_with,
+                        "duration_ms": picker_dur_ms,
+                    },
+                )
+            if not back_to_back and click_gap_ms >= 90.0:
+                self._emit_devlab(
+                    "vision",
+                    "vision.pipeline.latency_spike",
+                    {
+                        "click_timer_max_gap_ms": round(click_gap_ms, 1),
+                        "in_augment_picking": True,
+                        "picker_open": True,
+                        "resolution": res_str,
+                    },
+                )
+
+        if eff.newly_selected_augment:
+            self._flag_if_transformative_augment(eff.newly_selected_augment)
+            self._save_match_state()
+            self.edge_drawer.flash_new_augment(eff.newly_selected_augment)
+            aug = self.store.get_augment(eff.newly_selected_augment)
+            logger.info(
+                "Augment auto-committed (%s, conf=%.2f): %s (%d/%d)",
+                pick_source or "click",
+                pick_conf,
+                aug.name if aug else eff.newly_selected_augment,
+                len(self.sm.selected_augments),
+                MAX_AUGMENT_SLOTS,
+            )
+            if eff.transmute_started and self.sm.pending_transmute is not None:
+                if self.transmute_watcher is not None:
+                    self.transmute_watcher.reset()
+                self.edge_drawer.set_pending_transmute(self.sm.pending_transmute, self.store)
+                logger.info(
+                    "Transmute secondary OCR armed: source=%s expected=%d rarity=%s",
+                    self.sm.pending_transmute.source_name,
+                    self.sm.pending_transmute.expected_count,
+                    self.sm.pending_transmute.target_rarity or "any",
+                )
+            # WS-6: Pass click confidence so high-conf (>=0.90) swap bar auto-dismisses after 15s!
+            self.edge_drawer.set_recent_offered(
+                [c.augment for c in self.sm.last_offered_cards],
+                auto_committed_id=eff.newly_selected_augment,
+                confidence=float(pick_conf),
+            )
+        elif self.sm.last_offered_cards:
+            logger.info(
+                "Augment picker closed without cursor/click inside cards; surfacing 1-click chips"
+            )
+            self.edge_drawer.set_recent_offered([c.augment for c in self.sm.last_offered_cards])
+        self._push_recent_unrecorded_augments()
+        if (
+            not back_to_back
+            and (resolved_slot is None or pick_conf < self.ICON_VERIFY_CONF_THRESHOLD)
+            and self.sm.last_offered_cards
+            and not eff.transmute_started
+        ):
+            self._schedule_delayed_icon_verify(
+                committed_id=eff.newly_selected_augment,
+                pick_confidence=pick_conf,
+            )
+        self._frozen_pick_slot = None
+        self._frozen_pick_source = ""
+        self._frozen_pick_confidence = 0.0
+        self._active_picker_coach_req_id = ""
+        self._active_picker_coach_arrived = False
+        self._active_picker_coach_aug_advice = ""
+        self._last_picker_partial_open = False
+        self._last_picker_expected_slots = 0
+        self._push_vision_context()
+
     def _render_augment_badges(self, cards: tuple[DetectedCard, ...], game_rect=None) -> None:
         t0 = time.perf_counter()
         devlab_on = bool(getattr(self, "_devlab_active", False))
@@ -7946,19 +9343,62 @@ class HexHelperController:
             return
 
         # Evaluate independent combo verdict first so we know if any card has jackpot/gamble upside
+        is_bonus_offer = self.sm._is_bonus_event_offer(cards)
         my_items = self._last_live.my_player.item_ids if (self._last_live and self._last_live.my_player) else ()
-        gt_s = float(self._current_game_time_s() or 0.0)
-        round_idx = min(4, len(self.sm.selected_augments) + 1)
-        verdict = evaluate_picker_combos(
-            store=self.store,
-            hero_id=hid,
-            selected_augments=self.sm.selected_augments,
-            my_items=my_items,
-            offered=[(c.slot_index, c.augment) for c in cards],
-            game_time_s=gt_s,
+        my_stats = self._current_my_stats()
+        my_lvl = (
+            int(getattr(self._last_live.my_player, "level", 0) or 0)
+            if (self._last_live and self._last_live.my_player)
+            else 0
         )
-        self._last_combo_verdict = verdict
-        combo_by_slot = {vc.slot_index: vc for vc in verdict.cards}
+        my_gold_val = float(getattr(self._last_live, "current_gold", 0.0) or 0.0) if self._last_live else 0.0
+        gt_s = float(self._current_game_time_s() or 0.0)
+        band_mode = self._current_data_band_mode()
+        pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+        round_idx = effective_augment_round(len(self.sm.selected_augments), my_lvl)
+        if is_bonus_offer:
+            verdict = None
+            combo_by_slot: dict[int, Any] = {}
+        else:
+            try:
+                verdict = evaluate_picker_combos(
+                    store=self.store,
+                    hero_id=hid,
+                    selected_augments=self.sm.selected_augments,
+                    my_items=my_items,
+                    offered=[(c.slot_index, c.augment) for c in cards],
+                    my_stats=my_stats,
+                    game_time_s=gt_s,
+                    data_band_mode=band_mode,
+                    preferred_profile=pref_prof,
+                    my_level=my_lvl,
+                    my_gold=my_gold_val,
+                    round_index=round_idx,
+                )
+            except TypeError:
+                try:
+                    verdict = evaluate_picker_combos(
+                        store=self.store,
+                        hero_id=hid,
+                        selected_augments=self.sm.selected_augments,
+                        my_items=my_items,
+                        offered=[(c.slot_index, c.augment) for c in cards],
+                        my_stats=my_stats,
+                        game_time_s=gt_s,
+                        data_band_mode=band_mode,
+                    )
+                except TypeError:
+                    verdict = evaluate_picker_combos(
+                        store=self.store,
+                        hero_id=hid,
+                        selected_augments=self.sm.selected_augments,
+                        my_items=my_items,
+                        offered=[(c.slot_index, c.augment) for c in cards],
+                        my_stats=my_stats,
+                        game_time_s=gt_s,
+                    )
+            self._last_combo_verdict = verdict
+            combo_by_slot = {vc.slot_index: vc for vc in verdict.cards}
 
         decisions, reroll_banner = rank_picker_cards(
             [(c.slot_index, sc) for c, sc in scored_cards],
@@ -7967,10 +9407,10 @@ class HexHelperController:
             round_index=round_idx,
         )
         any_valid_sample = any(sc.games >= 30 for _c, sc in scored_cards)
-        if not reroll_banner and not any_valid_sample and verdict.reroll_advice:
+        if not reroll_banner and not any_valid_sample and verdict is not None and verdict.reroll_advice:
             reroll_banner = verdict.reroll_advice
 
-        if devlab_on:
+        if devlab_on and not is_bonus_offer:
             offer_cards: list[dict[str, Any]] = []
             top1_aug_id = ""
             combo_flipped = False
@@ -8059,14 +9499,54 @@ class HexHelperController:
                 self._pending_reroll_slots = None
 
         sp_db = get_special_augment_db()
+        band_mode = self._current_data_band_mode()
+        pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+        hero_prof = (
+            infer_unified_hero_profile(
+                hid,
+                self.store,
+                my_items=my_items,
+                selected_augments=self.sm.selected_augments,
+                my_stats=my_stats,
+                data_band_mode=band_mode,
+                preferred_profile=pref_prof,
+            )
+            if (hid and self.store.is_loaded)
+            else ""
+        )
         render_items: list[AugmentBadgeRenderItem] = []
         for (c, sc), dec in zip(scored_cards, decisions):
             aid = c.augment.augment_id
-            d_items = tuple(rank_destiny_items(self.store, hid, limit=2)) if (hid and aid == DESTINY_AUGMENT_ID) else ()
-            sp = sp_db.get_by_id(aid)
+            raw_d_items = (
+                list(rank_destiny_items(self.store, hid, limit=2, profile=hero_prof))
+                if (hid and aid == DESTINY_AUGMENT_ID)
+                else []
+            )
+            d_items = tuple(
+                replace(d, name=self.store.display_item_name(d.item_id, d.name))
+                for d in raw_d_items
+            )
+            d_card_hint = (
+                summarize_destiny_card_hint(
+                    self.store,
+                    hid,
+                    aug_delta=sc.delta,
+                    profile=hero_prof,
+                )
+                if (hid and aid == DESTINY_AUGMENT_ID)
+                else None
+            )
+            d_hint_txt = d_card_hint.hint_line if d_card_hint is not None else ""
+            if d_hint_txt and raw_d_items and normalize_client_locale(self.cfg.client_locale) != "zh_cn":
+                top_raw = raw_d_items[0]
+                top_disp = self.store.display_item_name(top_raw.item_id, top_raw.name)
+                if top_raw.name and top_disp and top_disp != top_raw.name:
+                    d_hint_txt = d_hint_txt.replace(top_raw.name, top_disp, 1)
+            d_warn_txt = d_card_hint.warning_line if d_card_hint is not None else ""
+            sp = sp_db.resolve_for_hero(self.store, aid, hid, band_mode=band_mode)
             arch_hint = ""
             if sp is not None:
-                key_items = [self.store.get_item_info(iid).name for iid in (sp.force_items or sp.core_items)[:2]]
+                key_items = [self.store.display_item_name(iid) for iid in (sp.force_items or sp.core_items)[:2]]
                 key_items = [n for n in key_items if n and not n.startswith("装备#")]
                 short_arch = sp.archetype[:10]
                 arch_hint = f"{short_arch} · {'+'.join(n[:4] for n in key_items)}" if key_items else short_arch
@@ -8081,6 +9561,8 @@ class HexHelperController:
                     archetype_hint=arch_hint,
                     is_transmute=is_transmute_augment(aid),
                     unified=dec,
+                    destiny_hint=d_hint_txt,
+                    destiny_warning=d_warn_txt,
                 )
             )
 
@@ -8105,7 +9587,8 @@ class HexHelperController:
         )
 
         if (
-            self.cfg.combo_overlay_enabled
+            not is_bonus_offer
+            and self.cfg.combo_overlay_enabled
             and not self._combo_hidden_by_user
             and not self._overlays_hidden_by_user
             and not self._is_full_locked()
@@ -8126,10 +9609,14 @@ class HexHelperController:
         my_gold = self._last_live.current_gold if self._last_live else 0.0
         allies = self._last_live.allies if self._last_live else ()
         enemies = self._last_live.enemies if self._last_live else ()
+        band_mode = self._current_data_band_mode()
+        pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+        game_time = float(self._current_game_time_s() or 0.0)
 
         threat: MatchupThreatProfile | None = None
         dyn_recs: list[DynamicItemRec] = []
         next_plan: NextBuyPlan | None = None
+        active_prof = pref_prof
         if hid and self.store.is_loaded:
             try:
                 threat, dyn_recs = optimize_next_items(
@@ -8145,30 +9632,104 @@ class HexHelperController:
                     locked_next_item=self.sm.locked_next_item,
                     my_player=self._last_live.my_player if self._last_live else None,
                     collect_breakdown=devlab_on,
+                    data_band_mode=band_mode,
+                    preferred_profile=pref_prof,
+                    game_time=game_time,
                 )
             except TypeError:
-                threat, dyn_recs = optimize_next_items(
+                try:
+                    threat, dyn_recs = optimize_next_items(
+                        store=self.store,
+                        hero_id=hid,
+                        my_items=my_items,
+                        my_gold=my_gold,
+                        selected_augments=self.sm.selected_augments,
+                        allies=allies,
+                        enemies=enemies,
+                        limit=4,
+                        committed_plan=self.sm.committed_plan,
+                        locked_next_item=self.sm.locked_next_item,
+                        my_player=self._last_live.my_player if self._last_live else None,
+                        collect_breakdown=devlab_on,
+                        data_band_mode=band_mode,
+                    )
+                except TypeError:
+                    try:
+                        threat, dyn_recs = optimize_next_items(
+                            store=self.store,
+                            hero_id=hid,
+                            my_items=my_items,
+                            my_gold=my_gold,
+                            selected_augments=self.sm.selected_augments,
+                            allies=allies,
+                            enemies=enemies,
+                            limit=4,
+                            committed_plan=self.sm.committed_plan,
+                            locked_next_item=self.sm.locked_next_item,
+                            my_player=self._last_live.my_player if self._last_live else None,
+                            data_band_mode=band_mode,
+                        )
+                    except TypeError:
+                        threat, dyn_recs = optimize_next_items(
+                            store=self.store,
+                            hero_id=hid,
+                            my_items=my_items,
+                            my_gold=my_gold,
+                            selected_augments=self.sm.selected_augments,
+                            allies=allies,
+                            enemies=enemies,
+                            limit=4,
+                            committed_plan=self.sm.committed_plan,
+                            locked_next_item=self.sm.locked_next_item,
+                            my_player=self._last_live.my_player if self._last_live else None,
+                        )
+            try:
+                next_plan = build_next_buy_plan(
                     store=self.store,
                     hero_id=hid,
                     my_items=my_items,
                     my_gold=my_gold,
+                    dynamic_recs=dyn_recs,
+                    threat=threat,
+                    game_time=game_time,
                     selected_augments=self.sm.selected_augments,
-                    allies=allies,
-                    enemies=enemies,
-                    limit=4,
-                    committed_plan=self.sm.committed_plan,
-                    locked_next_item=self.sm.locked_next_item,
-                    my_player=self._last_live.my_player if self._last_live else None,
+                    data_band_mode=band_mode,
+                    preferred_profile=pref_prof,
                 )
-            next_plan = build_next_buy_plan(
-                store=self.store,
-                hero_id=hid,
-                my_items=my_items,
-                my_gold=my_gold,
-                dynamic_recs=dyn_recs,
-                threat=threat,
-                game_time=self._last_live.game_time if self._last_live else 0.0,
-                selected_augments=self.sm.selected_augments,
+            except TypeError:
+                try:
+                    next_plan = build_next_buy_plan(
+                        store=self.store,
+                        hero_id=hid,
+                        my_items=my_items,
+                        my_gold=my_gold,
+                        dynamic_recs=dyn_recs,
+                        threat=threat,
+                        game_time=game_time,
+                        selected_augments=self.sm.selected_augments,
+                        data_band_mode=band_mode,
+                    )
+                except TypeError:
+                    next_plan = build_next_buy_plan(
+                        store=self.store,
+                        hero_id=hid,
+                        my_items=my_items,
+                        my_gold=my_gold,
+                        dynamic_recs=dyn_recs,
+                        threat=threat,
+                        game_time=game_time,
+                        selected_augments=self.sm.selected_augments,
+                    )
+            active_prof = (
+                pref_prof
+                or (getattr(next_plan, "active_profile", "") if next_plan is not None else "")
+                or infer_unified_hero_profile(
+                    hid,
+                    self.store,
+                    my_items=my_items,
+                    selected_augments=self.sm.selected_augments,
+                    data_band_mode=band_mode,
+                )
             )
             if next_plan is not None:
                 prev_lock, prev_plan = self.sm.locked_next_item, list(self.sm.committed_plan)
@@ -8184,6 +9745,8 @@ class HexHelperController:
                         hero_id=hid or "",
                         selected_augments=self.sm.selected_augments,
                         transformative_overhaul=is_tx_overhaul,
+                        active_profile=active_prof,
+                        game_time=game_time,
                     )
                     if trace.get("overridden") and self._action_tracker is not None:
                         tr_copy = dict(trace)
@@ -8199,7 +9762,11 @@ class HexHelperController:
                         locked_next_item=self.sm.locked_next_item,
                         proposed_ids=list(next_plan.remaining_build_ids),
                         allow_overhaul=self.sm.allow_plan_overhaul and not self._is_any_coach_online(),
+                        hero_id=hid or "",
+                        selected_augments=self.sm.selected_augments,
                         transformative_overhaul=is_tx_overhaul,
+                        active_profile=active_prof,
+                        game_time=game_time,
                     )
                 self.sm.locked_next_item = new_lock
                 self.sm.committed_plan = new_plan
@@ -8210,10 +9777,27 @@ class HexHelperController:
         self._last_threat = threat
         self._last_dyn_recs = dyn_recs
         self._last_next_plan = next_plan
+        if (
+            len(self.sm.selected_augments) >= 4
+            and self._latest_advice is not None
+            and getattr(self._latest_advice, "next_augment_goal", "")
+        ):
+            self._latest_advice = replace(self._latest_advice, next_augment_goal="")
+            self.edge_drawer.set_coach_advice(self._latest_advice, allow_auto_expand=False)
         self.edge_drawer.set_committed_plan(
             self.sm.committed_plan,
             self.sm.locked_next_item,
             self.sm.plan_overhaul_reason,
+        )
+        arch_templates = (
+            get_hero_build_templates(self.store, hid, data_band_mode=band_mode)
+            if (hid and self.store.is_loaded)
+            else []
+        )
+        self.edge_drawer.set_archetype_options(
+            arch_templates,
+            active_prof,
+            is_manual=bool(pref_prof and any(t.profile == pref_prof for t in arch_templates)),
         )
         self.edge_drawer.refresh_match_view(
             store=self.store,
@@ -8240,7 +9824,14 @@ class HexHelperController:
                     }
                     for r in dyn_recs[:4]
                 ]
-                hero_prof = infer_hero_profile(self.store, hid, my_items, self.sm.selected_augments)
+                hero_prof = infer_unified_hero_profile(
+                    hid,
+                    self.store,
+                    my_items=my_items,
+                    selected_augments=self.sm.selected_augments,
+                    my_stats=self._current_my_stats(),
+                    data_band_mode=band_mode,
+                )
                 combo_prof = (
                     str(combo_plan.profile.primary_profile or "")
                     if (combo_plan is not None and getattr(combo_plan, "profile", None) is not None)
@@ -8261,18 +9852,68 @@ class HexHelperController:
             except Exception as exc:
                 logger.debug("DevLab local build rec snapshot skipped: %s", exc)
 
+    def _set_combo_overlay_plan(self, plan: ComboPlan, selected_count: int) -> None:
+        overlay = getattr(self, "combo_overlay", None)
+        if overlay is None:
+            return
+        try:
+            overlay.set_plan(plan, selected_count=selected_count)
+        except TypeError:
+            overlay.set_plan(plan)
+
     def _refresh_combo_plan_view(self) -> ComboPlan:
         hid = self._active_hero_id()
         my_items = self._last_live.my_player.item_ids if (self._last_live and self._last_live.my_player) else ()
-        plan = build_combo_plan(
-            store=self.store,
-            hero_id=hid,
-            selected_augments=self.sm.selected_augments,
-            my_items=my_items,
-            limit=4,
-        )
+        my_stats = self._current_my_stats()
+        gt_s = float(self._current_game_time_s() or 0.0)
+        band_mode = self._current_data_band_mode()
+        pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+        ally_profiles, enemy_profiles = self._current_team_profiles(band_mode=band_mode)
+        try:
+            plan = build_combo_plan(
+                store=self.store,
+                hero_id=hid,
+                selected_augments=self.sm.selected_augments,
+                my_items=my_items,
+                limit=4,
+                threat=getattr(self, "_last_threat", None),
+                ally_profiles=ally_profiles,
+                enemy_profiles=enemy_profiles,
+                my_stats=my_stats,
+                game_time_s=gt_s,
+                data_band_mode=band_mode,
+                preferred_profile=pref_prof,
+            )
+        except TypeError:
+            try:
+                plan = build_combo_plan(
+                    store=self.store,
+                    hero_id=hid,
+                    selected_augments=self.sm.selected_augments,
+                    my_items=my_items,
+                    limit=4,
+                    threat=getattr(self, "_last_threat", None),
+                    ally_profiles=ally_profiles,
+                    enemy_profiles=enemy_profiles,
+                    my_stats=my_stats,
+                    game_time_s=gt_s,
+                    data_band_mode=band_mode,
+                )
+            except TypeError:
+                plan = build_combo_plan(
+                    store=self.store,
+                    hero_id=hid,
+                    selected_augments=self.sm.selected_augments,
+                    my_items=my_items,
+                    limit=4,
+                    threat=getattr(self, "_last_threat", None),
+                    ally_profiles=ally_profiles,
+                    enemy_profiles=enemy_profiles,
+                    my_stats=my_stats,
+                    game_time_s=gt_s,
+                )
         self._last_combo_plan = plan
-        self.combo_overlay.set_plan(plan)
+        self._set_combo_overlay_plan(plan, len(self.sm.selected_augments))
         return plan
 
     def trigger_coach_request(
@@ -8356,6 +9997,7 @@ class HexHelperController:
                 tuple(c.augment.augment_id for c in self.sm.active_cards),
                 enemy_sig_now,
                 int(my_gold_now // 300.0),
+                getattr(self.sm, "manual_profile_override", ""),
             )
             now_m = time.monotonic()
             if (
@@ -8371,9 +10013,39 @@ class HexHelperController:
             self._last_manual_f6_sig = f6_sig
             self._last_manual_f6_mono = now_m
 
+        # WS-3 / v1.5.2: 15s same-state dedup on back-to-back augment_selected triggers
+        if (
+            reason == "augment_selected"
+            and self._last_live is not None
+            and self.sm.state in (GameState.IN_GAME, GameState.AUGMENT_PICKING)
+        ):
+            my_items_sel = self._last_live.my_player.item_ids if (self._last_live and self._last_live.my_player) else ()
+            aug_sel_sig = (
+                hid or "",
+                tuple(self.sm.selected_augments),
+                tuple(my_items_sel),
+                bool(self.sm.allow_plan_overhaul),
+                str(self.sm.plan_overhaul_reason or ""),
+                getattr(self.sm, "manual_profile_override", ""),
+            )
+            now_m_sel = time.monotonic()
+            if (
+                aug_sel_sig == getattr(self, "_last_augment_selected_sig", None)
+                and (now_m_sel - float(getattr(self, "_last_augment_selected_mono", 0.0) or 0.0))
+                < self.AUGMENT_SELECTED_DEDUP_WINDOW_S
+            ):
+                logger.info(
+                    "Skipping duplicate augment_selected within %.0fs (unchanged match state)",
+                    self.AUGMENT_SELECTED_DEDUP_WINDOW_S,
+                )
+                return None
+            self._last_augment_selected_sig = aug_sel_sig
+            self._last_augment_selected_mono = now_m_sel
+
         # Cancel superseded pending debounce/deferral timers on explicit/newer triggers
         if reason in ("manual_f6", "augment_selected", "augment_picking"):
             self._cancel_death_coach_defer(f"superseded by {reason}")
+            self._cancel_augment_remove_coach_defer(f"superseded by {reason}")
         if reason in ("manual_f6", "augment_selected"):
             self._cancel_inflight_picker_coach()
         if reason in ("manual_f6", "game_start"):
@@ -8477,31 +10149,120 @@ class HexHelperController:
             linfo = self.store.get_item_info(self.sm.locked_next_item)
             locked_item_payload = {"item_id": self.sm.locked_next_item, "name": linfo.name}
 
-        combo_plan = build_combo_plan(
-            store=self.store,
-            hero_id=hid,
-            selected_augments=self.sm.selected_augments,
-            my_items=my_items,
-            limit=4,
-        )
-        self._last_combo_plan = combo_plan
-        picker_verdict = (
-            self._last_combo_verdict
-            or (
-                evaluate_picker_combos(
+        my_stats = self._current_my_stats()
+        gt_s = float(self._current_game_time_s() or 0.0)
+        band_mode = self._current_data_band_mode()
+        pref_prof = str(getattr(self.sm, "manual_profile_override", "") or "").strip().upper()
+        ally_profiles, enemy_profiles = self._current_team_profiles(band_mode=band_mode)
+        threat_ctx = getattr(self, "_last_threat", None)
+        if (
+            threat_ctx is None
+            and self._last_live is not None
+            and self.store.is_loaded
+            and (self._last_live.allies or self._last_live.enemies)
+        ):
+            threat_ctx = analyze_matchup_threats(self.store, self._last_live.allies, self._last_live.enemies)
+        try:
+            combo_plan = build_combo_plan(
+                store=self.store,
+                hero_id=hid,
+                selected_augments=self.sm.selected_augments,
+                my_items=my_items,
+                limit=4,
+                threat=threat_ctx,
+                ally_profiles=ally_profiles,
+                enemy_profiles=enemy_profiles,
+                my_stats=my_stats,
+                game_time_s=gt_s,
+                data_band_mode=band_mode,
+                preferred_profile=pref_prof,
+            )
+        except TypeError:
+            try:
+                combo_plan = build_combo_plan(
                     store=self.store,
                     hero_id=hid,
                     selected_augments=self.sm.selected_augments,
                     my_items=my_items,
-                    offered=[(c.slot_index, c.augment) for c in self.sm.active_cards],
-                    game_time_s=float(self._current_game_time_s() or 0.0),
+                    limit=4,
+                    threat=threat_ctx,
+                    ally_profiles=ally_profiles,
+                    enemy_profiles=enemy_profiles,
+                    my_stats=my_stats,
+                    game_time_s=gt_s,
+                    data_band_mode=band_mode,
                 )
-                if self.sm.active_cards
-                else None
-            )
-            if self.sm.state == GameState.AUGMENT_PICKING
-            else None
-        )
+            except TypeError:
+                combo_plan = build_combo_plan(
+                    store=self.store,
+                    hero_id=hid,
+                    selected_augments=self.sm.selected_augments,
+                    my_items=my_items,
+                    limit=4,
+                    threat=threat_ctx,
+                    ally_profiles=ally_profiles,
+                    enemy_profiles=enemy_profiles,
+                    my_stats=my_stats,
+                    game_time_s=gt_s,
+                )
+        self._last_combo_plan = combo_plan
+        if reason != "augment_picking" and self.sm.state != GameState.AUGMENT_PICKING:
+            self._set_combo_overlay_plan(combo_plan, len(self.sm.selected_augments))
+
+        active_card_ids = tuple(c.augment.augment_id for c in self.sm.active_cards)
+        cached_picker_verdict = self._last_combo_verdict
+        if (
+            cached_picker_verdict is not None
+            and tuple(vc.augment_id for vc in cached_picker_verdict.cards) != active_card_ids
+        ):
+            cached_picker_verdict = None
+        if self.sm.state == GameState.AUGMENT_PICKING and self.sm.active_cards:
+            if cached_picker_verdict is not None:
+                picker_verdict = cached_picker_verdict
+            else:
+                my_lvl_tc = (
+                    int(getattr(self._last_live.my_player, "level", 0) or 0)
+                    if (self._last_live and self._last_live.my_player)
+                    else 0
+                )
+                try:
+                    picker_verdict = evaluate_picker_combos(
+                        store=self.store,
+                        hero_id=hid,
+                        selected_augments=self.sm.selected_augments,
+                        my_items=my_items,
+                        offered=[(c.slot_index, c.augment) for c in self.sm.active_cards],
+                        my_stats=my_stats,
+                        game_time_s=gt_s,
+                        data_band_mode=band_mode,
+                        preferred_profile=pref_prof,
+                        my_level=my_lvl_tc,
+                        my_gold=my_gold,
+                    )
+                except TypeError:
+                    try:
+                        picker_verdict = evaluate_picker_combos(
+                            store=self.store,
+                            hero_id=hid,
+                            selected_augments=self.sm.selected_augments,
+                            my_items=my_items,
+                            offered=[(c.slot_index, c.augment) for c in self.sm.active_cards],
+                            my_stats=my_stats,
+                            game_time_s=gt_s,
+                            data_band_mode=band_mode,
+                        )
+                    except TypeError:
+                        picker_verdict = evaluate_picker_combos(
+                            store=self.store,
+                            hero_id=hid,
+                            selected_augments=self.sm.selected_augments,
+                            my_items=my_items,
+                            offered=[(c.slot_index, c.augment) for c in self.sm.active_cards],
+                            my_stats=my_stats,
+                            game_time_s=gt_s,
+                        )
+        else:
+            picker_verdict = None
 
         my_hero_dict: dict[str, Any] = {
             "hero_id": hid or "",
@@ -8511,6 +10272,17 @@ class HexHelperController:
             "is_dead": bool(self._last_live and self._last_live.my_player and self._last_live.my_player.is_dead),
             "items": [self.store.get_item_info(i).name for i in my_items],
         }
+        eff_crit = estimate_effective_crit_chance(
+            self.store,
+            hid,
+            my_items=my_items,
+            selected_augments=self.sm.selected_augments,
+            my_stats=my_stats,
+            game_time_s=gt_s,
+        )
+        crit_pct = int(round(eff_crit * 100.0))
+        if crit_pct > 0:
+            my_hero_dict["crit_chance_pct"] = crit_pct
         if self._last_live:
             if self._last_live.game_time > 0:
                 my_hero_dict["game_time_s"] = int(self._last_live.game_time)
@@ -8536,12 +10308,35 @@ class HexHelperController:
                 if not item_is_owned(i, my_items)
             ],
             "allow_overhaul": bool(self.sm.allow_plan_overhaul),
+            "transformative_overhaul": bool(self.sm.allow_plan_overhaul and self.sm.plan_overhaul_reason),
             "overhaul_reason": self.sm.plan_overhaul_reason,
         }
         if self._last_next_plan and self._last_next_plan.recommended_boots_name:
             committed_plan_payload["recommended_boots"] = (
                 f"{self._last_next_plan.recommended_boots_name}({self._last_next_plan.recommended_boots_reason})"
             )
+        active_prof_payload = (
+            pref_prof
+            or (self._last_next_plan.active_profile if getattr(self, "_last_next_plan", None) is not None else "")
+            or (
+                infer_unified_hero_profile(
+                    hid,
+                    self.store,
+                    my_items=my_items,
+                    selected_augments=self.sm.selected_augments,
+                    my_stats=my_stats,
+                    data_band_mode=band_mode,
+                )
+                if (hid and self.store.is_loaded)
+                else ""
+            )
+        )
+        if active_prof_payload:
+            committed_plan_payload["selected_archetype"] = active_prof_payload
+        if hid and self.store.is_loaded:
+            arch_templates = get_hero_build_templates(self.store, hid, data_band_mode=band_mode)
+            if len(arch_templates) >= 2:
+                committed_plan_payload["available_archetypes"] = [t.label for t in arch_templates]
 
         patch_disp = format_display_patch(self.store.descriptor.patch) if self.store.descriptor else "未知"
         req = CoachRequestPayload(
@@ -8554,7 +10349,7 @@ class HexHelperController:
             offered_augments=offered_augs,
             allies=allies,
             enemies=enemies,
-            threat_summary=list(self._last_threat.summary_tags) if self._last_threat else [],
+            threat_summary=list(threat_ctx.summary_tags) if threat_ctx else [],
             local_engine_top_items=[
                 {
                     "item_id": r.item_id,
@@ -8579,6 +10374,8 @@ class HexHelperController:
             special_augment_builds=get_special_augment_db().export_coach_context(
                 self.store,
                 [*self.sm.selected_augments, *(c.augment.augment_id for c in self.sm.active_cards)],
+                hero_id=hid,
+                band_mode=band_mode,
             ),
             hero_signature_hint=(
                 sig.to_coach_dict(self.store)
@@ -8660,15 +10457,56 @@ class HexHelperController:
                     self.edge_drawer.set_coach_pending(True)
         if dispatched:
             self.ai_calls_this_match += 1
+            if reason == "pre_death_warmup":
+                self._last_warmup_dispatched_mono = time.monotonic()
+                self._last_warmup_dispatched_enemy_sig = (
+                    self.sm._enemy_build_signature(self._last_live, store=self.store)
+                    if self._last_live is not None
+                    else ""
+                )
             if devlab_on and reason == "augment_picking":
                 self._active_picker_coach_req_id = req.request_id
                 self._active_picker_coach_arrived = False
                 self._active_picker_coach_aug_advice = ""
+            if reason in ("augment_selected", "manual_f6") and getattr(self, "_death_defer_superseded_by_picker", False):
+                is_dead_now = bool(self._last_live and self._last_live.my_player and self._last_live.my_player.is_dead)
+                dw_open = bool(
+                    self._action_tracker is not None
+                    and getattr(self._action_tracker, "_death_window", None) is not None
+                )
+                if is_dead_now or dw_open:
+                    self._death_superseded_req_id = str(req.request_id or "")
+                    if self._action_tracker is not None:
+                        self._action_tracker.note_death_coach_decision(True, "")
         if self.sm.state == GameState.AUGMENT_PICKING and self.sm.active_cards and not self._overlays_hidden_by_user:
             self._render_augment_badges(self.sm.active_cards)
         return req
 
+    def _format_ocr_diag_line(self) -> str:
+        loc = normalize_client_locale(getattr(self.cfg, "client_locale", "zh_cn"))
+        worker_eng = getattr(getattr(self, "_vision_worker", None), "_ocr_engine", None)
+        eng = self.ocr_engine or worker_eng
+        if eng is not None:
+            mode = str(getattr(eng, "effective_ocr_mode", "") or "")
+            actual = str(getattr(eng, "actual_language_tag", "") or getattr(eng, "language_tag", "") or "")
+            if mode == "native_tw":
+                return f"WinRT OCR：就绪 ({actual or 'zh-Hant-TW'} 原生繁中)"
+            if mode == "sc_t2s_fallback":
+                return f"WinRT OCR：就绪 ({actual or 'zh-Hans-CN'} · 简转繁免装兼容)"
+            if mode == "profile_fallback":
+                return f"WinRT OCR：兼容回退 ({actual or 'profile'})"
+            return f"WinRT OCR：就绪 ({actual or 'zh-Hans-CN'})"
+        if getattr(self, "_vision_ocr_ready", False):
+            return f"WinRT OCR：就绪 ({desired_ocr_language_tag(loc)})"
+        readiness = check_locale_ocr_readiness(loc)
+        if readiness.get("ok"):
+            return f"WinRT OCR：{readiness.get('summary', '待机')} ({readiness.get('mode', '')})"
+        return f"WinRT OCR：不可用 ({readiness.get('summary', '')})"
+
     def _refresh_diagnostics(self) -> None:
+        loc_code = normalize_client_locale(getattr(self.cfg, "client_locale", "zh_cn"))
+        loc_label = CLIENT_LOCALE_LABELS.get(loc_code, loc_code)
+        ocr_diag_line = self._format_ocr_diag_line()
         if self._commercial:
             if self.cloud_client is not None and self.cloud_client.is_logged_in:
                 tier_code = _normalize_coach_tier(self.cfg.coach_tier)
@@ -8712,16 +10550,22 @@ class HexHelperController:
                 lcu_err = self.lcu.last_error
             lines = [
                 f"状态机阶段：{self.sm.state.value}",
+                f"客户端语言：{loc_label}",
                 f"当前数据集：{format_display_patch(self.store.descriptor.patch) if self.store.descriptor else '未加载'} / {mode_tag}",
                 f"缓存目录：{self.data_dir}",
                 f"滚动运行日志：{rs['match_count']} / {rs['max_matches']} 局（超出自动覆盖最旧 · 约 {rs['total_bytes'] / 1024:.1f} KB）",
                 f"LCU 连接：{'已连接 port=' + str(lcu_creds.port) + ' (' + lcu_creds.source + ')' if lcu_creds else '未连接 (' + (lcu_err or '等待客户端') + ')'}",
                 f"2999 局内接口：{'活跃' if self._last_live else '未在对局中'}",
                 f"截屏后端：{getattr(self, '_vision_backend', '') or self.capturer.backend}（连续黑帧={getattr(self, '_vision_consec_black', 0) or self.capturer.consecutive_black_frames}）",
-                f"WinRT 中文 OCR：{'就绪 (zh-Hans-CN)' if (self.ocr_engine or getattr(self, '_vision_ocr_ready', False) or getattr(getattr(self, '_vision_worker', None), '_ocr_engine', None)) else '不可用'}",
+                ocr_diag_line,
                 f"云端 AI 参谋：{cloud_state}",
                 f"全局热键：{format_hotkeys_summary(self.cfg.hotkeys)}",
             ]
+            if loc_code == "zh_cn" and (
+                is_riot_overseas_lockfile(self.cfg.lockfile_path)
+                or is_riot_overseas_lockfile(getattr(lcu_creds, "source", ""))
+            ):
+                lines.append("外服客户端提示：检测到 Riot Games 客户端路径，若局内为新加坡简体或台服繁体，请在设置中切换「客户端语言」")
             if self._hotkey_os_occupied:
                 lines.append(f"热键冲突警告：{'；'.join(self._hotkey_os_occupied.values())}")
             self.lookup_window.update_diagnostics(lines)
@@ -8746,17 +10590,23 @@ class HexHelperController:
             lcu_err = self.lcu.last_error
         lines = [
             f"状态机阶段：{self.sm.state.value}",
+            f"客户端语言：{loc_label}",
             f"当前数据集：{format_display_patch(self.store.descriptor.patch) if self.store.descriptor else '未加载'} / {mode_tag}",
             f"缓存目录：{self.data_dir}",
             f"滚动运行日志：{rs['match_count']} / {rs['max_matches']} 局（超出自动覆盖最旧 · 约 {rs['total_bytes'] / 1024:.1f} KB）",
             f"LCU 连接：{'已连接 port=' + str(lcu_creds.port) + ' (' + lcu_creds.source + ')' if lcu_creds else '未连接 (' + (lcu_err or '等待客户端') + ')'}",
             f"2999 局内接口：{'活跃' if self._last_live else '未在对局中'}",
             f"截屏后端：{getattr(self, '_vision_backend', '') or self.capturer.backend}（连续黑帧={getattr(self, '_vision_consec_black', 0) or self.capturer.consecutive_black_frames}）",
-            f"WinRT 中文 OCR：{'就绪 (zh-Hans-CN)' if (self.ocr_engine or getattr(self, '_vision_ocr_ready', False) or getattr(getattr(self, '_vision_worker', None), '_ocr_engine', None)) else '不可用'}",
+            ocr_diag_line,
             f"AI 参谋模式：{self.cfg.coach_mode} | Gemini API：{gemini_state}",
             f"外部参谋桥接（可选）：http://127.0.0.1:{self.bridge.bound_port if self.bridge else 18421}（{'在线' if (self.bridge and self.bridge.is_coach_online()) else '待接入'}）",
             f"全局热键：{format_hotkeys_summary(self.cfg.hotkeys)}",
         ]
+        if loc_code == "zh_cn" and (
+            is_riot_overseas_lockfile(self.cfg.lockfile_path)
+            or is_riot_overseas_lockfile(getattr(lcu_creds, "source", ""))
+        ):
+            lines.append("外服客户端提示：检测到 Riot Games 客户端路径，若局内为新加坡简体或台服繁体，请在设置中切换「客户端语言」")
         if self._hotkey_os_occupied:
             lines.append(f"热键冲突警告：{'；'.join(self._hotkey_os_occupied.values())}")
         if getattr(self, "_devlab_active", False) and not self._commercial:
@@ -8786,6 +10636,7 @@ class HexHelperController:
         self._click_timer.stop()
         self._picker_coach_debounce_timer.stop()
         self._death_coach_defer_timer.stop()
+        self._cancel_augment_remove_coach_defer("shutdown")
         self._cancel_game_start_coach_defer("shutdown")
         self._icon_verify_timer.stop()
         self.hotkeys.unregister_all()
@@ -8858,5 +10709,12 @@ class HexHelperController:
             except Exception:
                 pass
             self._active_recap_dialog = None
+        for attr in ("edge_drawer", "combo_overlay", "champ_overlay", "augment_overlay", "lookup_window"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
         self.tray.hide()
         self.qt_app.quit()

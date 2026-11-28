@@ -320,6 +320,112 @@ def test_lcu_and_lobby_scout_have_zero_write_http_calls_ast() -> None:
                 )
 
 
+def test_server_coach_gateway_surfaces_lobby_scout_callout() -> None:
+    server_root = Path(__file__).resolve().parent.parent / "server"
+    if str(server_root) not in sys.path:
+        sys.path.insert(0, str(server_root))
+
+    from hex_server.coach_gateway import (
+        COACH_SYSTEM_INSTRUCTION as SERVER_SYS_PROMPT,
+        ServerCoachGateway,
+    )
+
+    assert "lobby_scout" in SERVER_SYS_PROMPT
+    assert len(SERVER_SYS_PROMPT) <= int(2219 * 0.65)
+
+    captured_gem: list[dict[str, Any]] = []
+
+    def gem_factory(_key: str, _proxy: str, _timeout: float):
+        class _FakeInter:
+            def create(self, **kwargs: Any):
+                captured_gem.append(kwargs)
+                return SimpleNamespace(
+                    status="completed",
+                    output_text=json.dumps(
+                        {
+                            "augment_pick_advice": "",
+                            "buy_now": "先买守护者之锤",
+                            "build_path": ["三相之力"],
+                            "next_items": [{"item_id": "3078", "name": "三相之力", "priority": "下件必出", "reason": "核心"}],
+                            "tactical_summary": "盯防暗黑元首进场",
+                            "opening_brief": {
+                                "enemy_threat": "敌核心暗黑元首3220分+2黑车队",
+                                "augment_goal": "追技能极速流",
+                                "opening_buy": "1400G守护者之锤",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    usage=SimpleNamespace(total_input_tokens=500, total_output_tokens=120, total_tokens=620),
+                )
+
+        return SimpleNamespace(interactions=_FakeInter(), close=lambda: None)
+
+    gw = ServerCoachGateway(gemini_keys=("k1",), deepseek_keys=(), gemini_client_factory=gem_factory)
+    try:
+        payload = {
+            "dataset_patch": "26.23",
+            "trigger_reason": "game_start",
+            "my_hero": {"hero_id": "120", "name": "战争之影"},
+            "lobby_scout": {
+                "puuid": "leaked-puuid-should-strip",
+                "top_enemy_champion": "暗黑元首",
+                "top_enemy_rating": 3220,
+                "top_enemy_tag": "钻一·WR70%(10场)·7连胜·车队A",
+                "enemy_premades": ["2黑(暗黑元首+不祥之刃)"],
+                "ally_mvp_champion": "战争之影",
+                "ally_mvp_rating": 3940,
+            },
+        }
+        res = gw.advise(payload, "game_start", tier="b")
+        assert res.advice_json["opening_brief"]["enemy_threat"]
+        sent_input = captured_gem[0]["kwargs"]["input"] if "kwargs" in captured_gem[0] else captured_gem[0]["input"]
+        assert "暗黑元首" in sent_input
+        assert "3220" in sent_input
+        assert "2黑(暗黑元首+不祥之刃)" in sent_input
+        assert "开局雷达重点" in sent_input
+        assert "leaked-puuid-should-strip" not in sent_input
+    finally:
+        gw.close()
+
+
+def test_server_coach_gateway_callout_handles_malformed_and_bool_ratings() -> None:
+    server_root = Path(__file__).resolve().parent.parent / "server"
+    if str(server_root) not in sys.path:
+        sys.path.insert(0, str(server_root))
+
+    from hex_server.coach_gateway import _build_lobby_scout_callout
+
+    for bad_val in ("unknown", " ", {}, [], True, False, float("nan"), float("inf"), float("-inf")):
+        callout = _build_lobby_scout_callout(
+            {
+                "lobby_scout": {
+                    "top_enemy_champion": "暗黑元首",
+                    "top_enemy_rating": bad_val,
+                    "ally_mvp_champion": "战争之影",
+                    "ally_mvp_rating": bad_val,
+                }
+            }
+        )
+        assert "估分1" not in callout
+        assert "战争之影(1)" not in callout
+        assert "暗黑元首" in callout
+
+    # Valid numeric string float degrades cleanly without throwing
+    float_str_callout = _build_lobby_scout_callout(
+        {
+            "lobby_scout": {
+                "top_enemy_champion": "暗黑元首",
+                "top_enemy_rating": "3200.5",
+                "ally_mvp_champion": "战争之影",
+                "ally_mvp_rating": "3940.0",
+            }
+        }
+    )
+    assert "估分3200" in float_str_callout
+    assert "战争之影(3940)" in float_str_callout
+
+
 def test_lobby_scout_resilient_to_dirty_game_creation_and_kda_values(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
 

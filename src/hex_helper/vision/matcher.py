@@ -7,14 +7,18 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
+from hex_helper.data.locale_pack import t2s_normalize
 from hex_helper.data.provider import AugmentInfo
 
 _STRIP_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]+")
 NEAR_MISS_MIN_SCORE = 0.42
 
 
-def normalize_ocr_text(text: str) -> str:
-    return _STRIP_RE.sub("", str(text or "")).lower()
+def normalize_ocr_text(text: str, *, use_t2s: bool = False) -> str:
+    raw = str(text or "")
+    if use_t2s and raw:
+        raw = t2s_normalize(raw)
+    return _STRIP_RE.sub("", raw).lower()
 
 
 @dataclass(frozen=True)
@@ -37,22 +41,35 @@ class MatchResult:
 class AugmentMatcher:
     """Fuzzy matcher strictly bounded to the active ARAM Mayhem augment catalog."""
 
-    def __init__(self, augments: list[AugmentInfo]) -> None:
-        self._entries: list[tuple[AugmentInfo, str, set[str]]] = []
-        self.update_catalog(augments)
+    def __init__(self, augments: list[AugmentInfo], *, use_t2s: bool = False) -> None:
+        self._use_t2s: bool = bool(use_t2s)
+        self._entries: list[tuple[AugmentInfo, str, set[str], bool]] = []
+        self._colliding_norms: set[str] = set()
+        self.update_catalog(augments, use_t2s=self._use_t2s)
 
-    def update_catalog(self, augments: list[AugmentInfo]) -> None:
-        entries: list[tuple[AugmentInfo, str, set[str]]] = []
+    @property
+    def use_t2s(self) -> bool:
+        return self._use_t2s
+
+    def update_catalog(self, augments: list[AugmentInfo], *, use_t2s: bool | None = None) -> None:
+        if use_t2s is not None:
+            self._use_t2s = bool(use_t2s)
+        entries: list[tuple[AugmentInfo, str, set[str], bool]] = []
+        norm_counts: dict[str, int] = {}
         for aug in augments:
-            norm = normalize_ocr_text(aug.name)
+            norm = normalize_ocr_text(aug.name, use_t2s=self._use_t2s)
             if norm:
-                entries.append((aug, norm, set(norm)))
+                has_bang = ("!" in aug.name) or ("！" in aug.name)
+                entries.append((aug, norm, set(norm), has_bang))
+                norm_counts[norm] = norm_counts.get(norm, 0) + 1
         self._entries = entries
+        self._colliding_norms = {n for n, cnt in norm_counts.items() if cnt >= 2}
 
     def _scan_candidates(
         self,
         norm: str,
         rarity_hint: str | None = None,
+        raw_text: str = "",
     ) -> tuple[
         AugmentInfo | None,
         float,
@@ -72,14 +89,16 @@ class AugmentMatcher:
         best_sub_hit = False
         best_rarity_boost = False
         norm_chars = set(norm)
+        raw_has_bang = ("!" in raw_text) or ("！" in raw_text)
 
-        for aug, cand_norm, cand_chars in self._entries:
+        for aug, cand_norm, cand_chars, cand_has_bang in self._entries:
             rarity_boost = bool(rarity_hint and aug.rarity == rarity_hint)
             if norm == cand_norm:
                 seq = 1.0
                 jaccard = 1.0
                 sub_hit = False
-                score = 1.0 + (0.05 if rarity_boost else 0.0)
+                bang_bonus = 0.03 if (cand_norm in self._colliding_norms and cand_has_bang == raw_has_bang) else 0.0
+                score = 1.0 + (0.05 if rarity_boost else 0.0) + bang_bonus
             else:
                 # Substring boost strictly restricted to 3+ char names within +4 chars of candidate length
                 # so 2-char names (e.g. 3171 力量 / 1404 属性！) NEVER false-match 力量碎片 / 属性锻造器 / long tooltips
@@ -134,7 +153,7 @@ class AugmentMatcher:
         min_score: float = 0.58,
     ) -> tuple[MatchResult | None, dict[str, Any]]:
         """Evaluate a line once and return both `(MatchResult | None, diagnostics_dict)`."""
-        norm = normalize_ocr_text(raw_text)
+        norm = normalize_ocr_text(raw_text, use_t2s=self._use_t2s)
         if len(norm) < 2:
             return None, {
                 "raw_text": raw_text,
@@ -167,11 +186,11 @@ class AugmentMatcher:
             best_jaccard,
             best_sub_hit,
             best_rarity_boost,
-        ) = self._scan_candidates(norm, rarity_hint=rarity_hint)
+        ) = self._scan_candidates(norm, rarity_hint=rarity_hint, raw_text=raw_text)
 
         clamped_best = min(1.0, best_score) if best_aug is not None else 0.0
         clamped_top2 = min(1.0, second_score) if second_aug is not None else 0.0
-        margin = round(max(0.0, clamped_best - clamped_top2), 4) if best_aug is not None else 0.0
+        margin = round(max(0.0, min(1.0, best_score - second_score)), 4) if best_aug is not None else 0.0
         raw_matched = bool(best_aug is not None and best_score >= min_score)
         # Reject ambiguous 2-char prefix fragments (e.g. cursor covering "献祭" in "升级：献祭" -> "升级")
         # that tie across multiple longer augments, while preserving exact 2-char augments (score == 1.0).

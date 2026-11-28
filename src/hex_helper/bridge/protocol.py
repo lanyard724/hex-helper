@@ -92,10 +92,12 @@ class CoachAdvicePayload:
     updated_at: str = field(default_factory=utc_now_iso)
     source: str = "Antigravity"
     opening_brief: dict[str, str] = field(default_factory=dict)
+    next_augment_goal: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["opening_brief"] = normalize_opening_brief(self.opening_brief)
+        data["next_augment_goal"] = str(self.next_augment_goal or "").strip()
         return data
 
     @classmethod
@@ -116,6 +118,8 @@ class CoachAdvicePayload:
             build_path = [p.strip() for p in raw_path.replace("->", ">").split(">") if p.strip()]
         else:
             build_path = [str(p).strip() for p in raw_path if str(p).strip()]
+        raw_goal = raw.get("next_augment_goal")
+        next_augment_goal = "" if raw_goal is None else str(raw_goal).strip()
         return cls(
             request_id=str(raw.get("request_id", "")),
             next_items=items,
@@ -126,4 +130,5 @@ class CoachAdvicePayload:
             updated_at=str(raw.get("updated_at") or utc_now_iso()),
             source=str(raw.get("source") or "Antigravity"),
             opening_brief=normalize_opening_brief(raw.get("opening_brief")),
+            next_augment_goal=next_augment_goal,
         )

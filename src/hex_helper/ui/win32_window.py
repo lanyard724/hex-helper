@@ -32,6 +32,14 @@ _user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, w
 _user32.RegisterHotKey.restype = wintypes.BOOL
 _user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.UnregisterHotKey.restype = wintypes.BOOL
+_user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+_user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.IsIconic.restype = wintypes.BOOL
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.restype = wintypes.BOOL
 
 _WIN32_HOTKEY_ERROR_DESCS: dict[int, str] = {
     1409: "already registered",
@@ -56,6 +64,8 @@ SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 SW_SHOWNOACTIVATE = 4
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 HWND_TOPMOST = wintypes.HWND(-1)
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
@@ -179,11 +189,30 @@ def get_ex_style(hwnd: int) -> int:
     return int(_user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE))
 
 
+def apply_capture_exclusion(widget: QWidget, exclude: bool = True) -> bool:
+    """Apply or clear WDA_EXCLUDEFROMCAPTURE on a widget's Win32 HWND."""
+    if widget is None or QGuiApplication.platformName() == "offscreen":
+        return False
+    try:
+        hwnd = int(widget.winId())
+    except Exception:
+        return False
+    if not hwnd:
+        return False
+    affinity = WDA_EXCLUDEFROMCAPTURE if exclude else WDA_NONE
+    try:
+        return bool(_user32.SetWindowDisplayAffinity(hwnd, affinity))
+    except Exception as exc:
+        logger.debug("SetWindowDisplayAffinity failed: %s", exc)
+        return False
+
+
 def apply_overlay_styles(
     widget: QWidget,
     click_through: bool = False,
     *,
     force: bool = True,
+    exclude_from_capture: bool | None = None,
 ) -> int:
     """Apply non-activating topmost Win32 overlay styles (and optional full mouse pass-through).
 
@@ -204,6 +233,8 @@ def apply_overlay_styles(
 
     changed = desired != current
     if not force and not changed:
+        if exclude_from_capture is not None:
+            apply_capture_exclusion(widget, exclude=exclude_from_capture)
         return current
 
     if changed:
@@ -218,7 +249,10 @@ def apply_overlay_styles(
         0,
         flags,
     )
-    return get_ex_style(hwnd)
+    style = get_ex_style(hwnd)
+    if exclude_from_capture is not None:
+        apply_capture_exclusion(widget, exclude=exclude_from_capture)
+    return style
 
 
 def screen_for_physical_rect(phys_rect: tuple[int, int, int, int] | None) -> QScreen | None:
@@ -274,18 +308,83 @@ def clamp_to_screen_rect(
     return cx, cy
 
 
-def show_no_activate(widget: QWidget, click_through: bool = False) -> None:
+def show_no_activate(
+    widget: QWidget,
+    click_through: bool = False,
+    *,
+    exclude_from_capture: bool | None = None,
+) -> None:
     """Show a QWidget on top without stealing focus from the game window.
 
     No-ops Win32 frame-change calls when widget is already visible with matching extended styles.
     """
     widget.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
     if widget.isVisible():
-        apply_overlay_styles(widget, click_through=click_through, force=False)
+        apply_overlay_styles(
+            widget,
+            click_through=click_through,
+            force=False,
+            exclude_from_capture=exclude_from_capture,
+        )
         return
     apply_overlay_styles(widget, click_through=click_through, force=False)
     widget.show()
-    apply_overlay_styles(widget, click_through=click_through, force=True)
+    apply_overlay_styles(
+        widget,
+        click_through=click_through,
+        force=True,
+        exclude_from_capture=exclude_from_capture,
+    )
+
+
+def set_allow_keyboard_focus(widget: QWidget, allow: bool) -> bool:
+    """Toggle WS_EX_NOACTIVATE on an overlay so interactive text inputs can gain keyboard focus on demand."""
+    if widget is None or QGuiApplication.platformName() == "offscreen":
+        return False
+    try:
+        hwnd = int(widget.winId())
+    except Exception:
+        return False
+    if not hwnd:
+        return False
+    if allow:
+        try:
+            current = get_ex_style(hwnd)
+            desired = (current & ~WS_EX_NOACTIVATE) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+            _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, desired)
+            _user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
+            )
+            widget.activateWindow()
+            widget.raise_()
+            return True
+        except Exception as exc:
+            logger.debug("set_allow_keyboard_focus(True) failed: %s", exc)
+            return False
+    apply_overlay_styles(widget, click_through=False, force=True)
+    return True
+
+
+def restore_foreground_window(hwnd: int | None) -> bool:
+    """Safely return Win32 foreground focus to a non-minimized valid window handle."""
+    if not hwnd:
+        return False
+    try:
+        target = int(hwnd)
+        if target <= 0:
+            return False
+        if not _user32.IsWindow(target) or _user32.IsIconic(target):
+            return False
+        return bool(_user32.SetForegroundWindow(target))
+    except Exception as exc:
+        logger.debug("restore_foreground_window failed: %s", exc)
+        return False
 
 
 class _MSG(ctypes.Structure):

@@ -369,14 +369,15 @@ def test_smart_picker_gate_skip_vs_close_delta_and_reroll_debounce(
         assert res_tx is not None
         assert submit_spy.call_count == 3
 
-        # D. 0.6s picker debounce timer restarts cleanly on rapid dice clicks
-        assert ctrl._picker_coach_debounce_timer.interval() == 600
+        # D. 600ms initial / 1400ms reroll debounce timer restarts cleanly on rapid dice clicks
+        assert ctrl._picker_coach_debounce_timer.interval() == ctrl.PICKER_COACH_DEBOUNCE_MS == 600
         ctrl.sm.active_cards = close_cards
         ctrl._schedule_picker_coach_trigger()
         assert ctrl._picker_coach_debounce_timer.isActive() is True
         assert submit_spy.call_count == 3  # Not fired immediately!
-        # Simulate rapid reroll restarting timer
-        ctrl._schedule_picker_coach_trigger()
+        # Simulate rapid reroll restarting timer (uses 1400ms reroll debounce)
+        ctrl._schedule_picker_coach_trigger(after_reroll=True)
+        assert ctrl._picker_coach_debounce_timer.interval() == ctrl.PICKER_COACH_REROLL_DEBOUNCE_MS == 1400
         assert ctrl._picker_coach_debounce_timer.isActive() is True
         assert submit_spy.call_count == 3
         # Fire timer expiry -> dispatches ONCE
@@ -402,7 +403,7 @@ def test_death_vs_augment_level_collision_defer_and_cancel(
         assert expected_augment_slots_for_level(7) == 2
         assert expected_augment_slots_for_level(11) == 3
         assert expected_augment_slots_for_level(15) == 4
-        assert ctrl._death_coach_defer_timer.interval() == 2500
+        assert ctrl._death_coach_defer_timer.interval() == 4000
 
         # Enter game alive at level 7 with 1 selected augment
         me_alive = PlayerLiveInfo("me", "阿狸", "Ahri", "ORDER", False, 7, 2, 1, 3, ("6655",))
@@ -692,11 +693,12 @@ def test_icon_matcher_closed_loop_correction_and_transmute(
         qapp.processEvents()
 
 
-def test_match_telemetry_payload_adoption_and_client_submission(
+def test_match_telemetry_payload_adoption_and_server_ingestion(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import json
-    import httpx
+    from fastapi.testclient import TestClient
+    from hex_server.config import ServerSettings
+    from hex_server.main import create_app
 
     ctrl, _submit_spy = _create_controller(qapp, tmp_path, monkeypatch, commercial=True)
     try:
@@ -750,27 +752,30 @@ def test_match_telemetry_payload_adoption_and_client_submission(
         assert record["selected_augments"] == ["1048", "1045"]
         assert len(record["match_key"]) == 32  # SHA-256 hex digest (zero PII)
 
-        # Verify CloudGatewayClient posts sanitized telemetry record cleanly over HTTP
-        from hex_helper.cloud.client import CloudGatewayClient
-
-        captured: list[dict] = []
-
-        def _handler(req: httpx.Request) -> httpx.Response:
-            assert req.method == "POST"
-            assert req.url.path == "/v1/telemetry/match"
-            captured.append(json.loads(req.content.decode("utf-8")))
-            return httpx.Response(200, json={"ok": True})
-
-        client = CloudGatewayClient(
-            base_url="https://api.hexhelper.example.com",
-            http_client_factory=lambda b, t: httpx.Client(
-                base_url=b, timeout=t, transport=httpx.MockTransport(_handler)
-            ),
+        # Verify record passes strict extra='forbid' FastAPI POST /v1/telemetry/match end-to-end!
+        srv_data = tmp_path / "srv_data"
+        settings = ServerSettings(
+            data_dir=srv_data,
+            db_path=srv_data / "hex_server.db",
+            releases_dir=srv_data / "releases",
+            mirror_dir=srv_data / "mirror",
+            uploads_dir=srv_data / "uploads",
+            jwt_secret="telemetry-integration-test-secret-minimum-32-bytes",
+            admin_user="admin",
+            admin_password="TestPassword#2026",
         )
-        assert client.submit_match_telemetry(record) is True
-        assert len(captured) == 1
-        assert captured[0]["hero_id"] == "103"
-        assert captured[0]["ai_recs_adopted"] == 2
+        settings.ensure_dirs()
+        fastapi_app = create_app(settings)
+        with TestClient(fastapi_app) as tc:
+            from hex_helper.cloud.client import CloudGatewayClient
+
+            client = CloudGatewayClient(
+                base_url="http://cloud.test",
+                http_client_factory=lambda _b, _t: tc,
+            )
+            assert client.submit_match_telemetry(record) is True
+            rows = fastapi_app.state.db.get_telemetry_summary()
+            assert rows["total_matches"] == 1
     finally:
         ctrl.shutdown()
         qapp.processEvents()

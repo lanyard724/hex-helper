@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from hex_helper.config import AppConfig
+from hex_helper.data.locale_pack import desired_ocr_language_tag, normalize_client_locale
 from hex_helper.edition import APP_VERSION, is_commercial_edition
 from hex_helper.game.lol_locator import LolInstallInfo, detect_primary_lol_install
 
@@ -117,29 +118,93 @@ def check_vcredist_x64() -> tuple[bool, str]:
     return False, "未检测到 Microsoft VC++ 2015-2022 x64 运行库"
 
 
-def check_winrt_zh_ocr() -> tuple[bool, str]:
-    """Verify Windows WinRT Simplified Chinese (zh-Hans-CN) OCR engine availability."""
+def _normalize_ocr_capability_lang(language_tag: str) -> tuple[str, str, str]:
+    """Map BCP-47 / short language tag -> (winrt_tag, fod_tag, display_label)."""
+    low = str(language_tag or "zh-Hans-CN").strip().lower()
+    if low in ("zh-tw", "zh-hant", "zh-hant-tw", "zh_tw"):
+        return "zh-Hant-TW", "zh-TW", "繁体中文 (zh-Hant-TW)"
+    return "zh-Hans-CN", "zh-CN", "简体中文 (zh-Hans-CN)"
+
+
+def check_winrt_ocr(language_tag: str = "zh-Hans-CN") -> tuple[bool, str]:
+    """Verify Windows WinRT OCR engine availability for `language_tag`."""
+    winrt_tag, _, label = _normalize_ocr_capability_lang(language_tag)
     try:
         from winrt.windows.globalization import Language
         from winrt.windows.media.ocr import OcrEngine
 
-        supported = bool(OcrEngine.is_language_supported(Language("zh-Hans-CN")))
+        supported = bool(OcrEngine.is_language_supported(Language(winrt_tag)))
         if supported:
-            return True, "Windows WinRT 简体中文 OCR (zh-Hans-CN) 已就绪"
-        return False, "系统未安装简体中文 (zh-Hans-CN) WinRT OCR 语言包"
+            return True, f"Windows WinRT {label} OCR 已就绪"
+        return False, f"系统未安装 {label} WinRT OCR 语言包"
     except Exception as exc:
-        return False, f"WinRT zh-Hans-CN OCR 检测失败: {exc}"
+        return False, f"WinRT {winrt_tag} OCR 检测失败: {exc}"
 
 
-def trigger_install_zh_ocr_pack() -> tuple[bool, str]:
-    """Launch Windows elevated DISM/FoD installer for zh-CN OCR, falling back to Language Settings."""
+def check_winrt_zh_ocr() -> tuple[bool, str]:
+    """Verify Windows WinRT Simplified Chinese (zh-Hans-CN) OCR engine availability."""
+    return check_winrt_ocr("zh-Hans-CN")
+
+
+def check_locale_ocr_readiness(client_locale: str = "zh_cn") -> dict[str, Any]:
+    """Return non-blocking OCR readiness status for the chosen LoL client locale."""
+    loc = normalize_client_locale(client_locale)
+    req_tag = desired_ocr_language_tag(loc)
+    sc_ok, sc_detail = check_winrt_ocr("zh-Hans-CN")
+    if loc != "zh_tw":
+        return {
+            "locale": loc,
+            "requested_tag": req_tag,
+            "ok": sc_ok,
+            "mode": "native_cn" if sc_ok else "missing_cn",
+            "native_installed": sc_ok,
+            "can_install_tw": False,
+            "summary": "简体 OCR 已就绪" if sc_ok else sc_detail,
+        }
+
+    tw_ok, tw_detail = check_winrt_ocr("zh-Hant-TW")
+    if tw_ok:
+        return {
+            "locale": loc,
+            "requested_tag": req_tag,
+            "ok": True,
+            "mode": "native_tw",
+            "native_installed": True,
+            "can_install_tw": False,
+            "summary": "原生繁中 OCR 已就绪",
+        }
+    if sc_ok:
+        return {
+            "locale": loc,
+            "requested_tag": req_tag,
+            "ok": True,
+            "mode": "sc_t2s_fallback",
+            "native_installed": False,
+            "can_install_tw": True,
+            "summary": "未装繁体包 · 已启用简转繁免装兼容（可直接使用）",
+        }
+    return {
+        "locale": loc,
+        "requested_tag": req_tag,
+        "ok": False,
+        "mode": "missing_all",
+        "native_installed": False,
+        "can_install_tw": True,
+        "summary": tw_detail,
+    }
+
+
+def trigger_install_ocr_pack(language_tag: str = "zh-CN") -> tuple[bool, str]:
+    """Launch Windows elevated DISM/FoD installer for WinRT OCR capability, falling back to Language Settings."""
     if os.name != "nt":
         return False, "仅支持在 Windows 10/11 上安装 WinRT OCR 语言包"
 
+    _, fod_tag, label = _normalize_ocr_capability_lang(language_tag)
+    cap_name = f"Language.OCR~~~{fod_tag}~0.0.1.0"
     ps_cmd = (
         "-NoProfile -ExecutionPolicy Bypass -Command "
-        "\"Add-WindowsCapability -Online -Name 'Language.OCR~~~zh-CN~0.0.1.0'; "
-        "Write-Host '完成后请关闭此窗口并返回 HexHelper 点击重新扫描'; Pause\""
+        f"\"Add-WindowsCapability -Online -Name '{cap_name}'; "
+        "Write-Host '完成后请关闭此窗口并返回 HexHelper 刷新检查'; Pause\""
     )
     try:
         rc = int(
@@ -153,15 +218,20 @@ def trigger_install_zh_ocr_pack() -> tuple[bool, str]:
             )
         )
         if rc > 32:
-            return True, "已启动管理员安装程序补装 zh-CN OCR，完成后请点击「重新自动扫描 LOL」"
+            return True, f"已启动管理员安装程序补装 {fod_tag} OCR（{label}）"
     except Exception as exc:
-        logger.warning("Elevated WinRT OCR FoD launch failed: %s", exc)
+        logger.warning("Elevated WinRT OCR FoD launch failed (%s): %s", fod_tag, exc)
 
     try:
         os.startfile("ms-settings:regionlanguage")  # type: ignore[attr-defined]
-        return False, "已打开 Windows 语言设置，请添加「中文(简体，中国)」及其基本输入/OCR 功能"
+        return False, f"已打开 Windows 语言设置，请添加 {label} 及其基本输入/OCR 功能"
     except Exception as exc:
         return False, f"无法启动语言包安装：{exc}"
+
+
+def trigger_install_zh_ocr_pack() -> tuple[bool, str]:
+    """Launch Windows elevated DISM/FoD installer for zh-CN OCR, falling back to Language Settings."""
+    return trigger_install_ocr_pack("zh-CN")
 
 
 def extract_bundled_seed_cache(

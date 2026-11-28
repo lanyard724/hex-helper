@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import sys
 import time
 from ctypes import wintypes
@@ -138,6 +139,30 @@ def is_hwnd_foreground(hwnd: int) -> bool:
         return False
     fg = int(_user32.GetForegroundWindow())
     return fg == int(hwnd)
+
+
+def is_game_or_overlay_foreground(
+    game_hwnd: int,
+    *,
+    exclude_hwnds: tuple[int, ...] | set[int] = (),
+) -> bool:
+    """Return True when the game window or a same-process non-excluded overlay is foreground."""
+    try:
+        target = int(game_hwnd or 0)
+        fg = int(_user32.GetForegroundWindow())
+        if target and fg == target:
+            return True
+        if not target or not _user32.IsWindow(target) or _user32.IsIconic(target):
+            return False
+        excluded = {int(h) for h in exclude_hwnds if h}
+        if fg != 0 and fg not in excluded:
+            pid = wintypes.DWORD(0)
+            _user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            if int(pid.value) == os.getpid():
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def is_black_frame(frame_bgr: np.ndarray | None) -> tuple[bool, float]:

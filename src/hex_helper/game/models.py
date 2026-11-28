@@ -30,6 +30,7 @@ class ChampSelectState:
     timer_remaining_ms: int = 0
     game_id: int = 0
     trade_states: list[str] = field(default_factory=list)
+    my_skin_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,8 @@ class PlayerLiveInfo:
     primary_tree_id: int = 0
     secondary_tree_id: int = 0
     item_details: list[dict[str, Any]] = field(default_factory=list)
+    skin_id: int = 0
+    skin_name: str = ""
 
 
 @dataclass(frozen=True)
